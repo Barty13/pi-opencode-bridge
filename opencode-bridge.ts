@@ -211,6 +211,14 @@ async function assertLocal(state: BridgeState, session: string): Promise<void> {
   state.dirs.set(session, dir);
 }
 
+/** Drop every per-thread record, so a deleted id leaves nothing behind in this Pi session. */
+function forget(state: BridgeState, session: string): void {
+  state.local.delete(session);
+  state.known.delete(session);
+  state.lastSend.delete(session);
+  state.dirs.delete(session);
+}
+
 function textOf(parts: unknown): string {
   if (typeof parts === "string") return parts;
   if (!Array.isArray(parts)) return "";
@@ -243,6 +251,17 @@ function money(row: any): string {
 /** A thread that never started a run has neither busy nor idle, so waiting on idle is hopeless. */
 function neverRan(row: any): boolean {
   return !row?.time?.busy && !row?.time?.idle;
+}
+
+/** The service lists every project, and ?directory= is an exact match, so filter here. */
+function underRoot(row: any): boolean {
+  const dir = String(row?.location?.directory ?? "");
+  return dir === ROOT || dir.startsWith(ROOT + "/");
+}
+
+/** A run in flight must not be deleted out from under the model waiting on it. */
+function busy(row: any): boolean {
+  return Boolean(row?.time?.busy) && !row?.time?.idle;
 }
 
 /** Why a thread stopped. Quota and provider failures land here, not on an HTTP status. */
@@ -832,11 +851,6 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
     description: "OpenCode bridge status: mode, service, threads",
     handler: async (_args, context) => {
       ctx = context;
-      // The service lists every project and ?directory= is exact, so filter here.
-      const underRoot = (row: any) => {
-        const dir = String(row?.location?.directory ?? "");
-        return dir === ROOT || dir.startsWith(ROOT + "/");
-      };
       const rows = ((await api<any>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot).slice(0, 8);
       say(
         context,
@@ -876,6 +890,45 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`);
       paneCall(["rm", session]);
       say(context, result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`);
+    },
+  });
+
+  /** Threads pile up from smoke tests and finished briefs. Dry run lists, force deletes. */
+  pi.registerCommand("oc-clean", {
+    description: "Delete finished OpenCode threads under ~/Pi: /oc-clean [force]",
+    handler: async (args, context) => {
+      ctx = context;
+      const rows = ((await api<any>("GET", "/api/session?limit=200")).data ?? []).filter(underRoot);
+      const kept = rows.filter(busy);
+      const done = rows.filter((row) => !busy(row));
+      const line = (row: any) =>
+        `${row.id}  ${row.model?.id ?? "-"}  ${row.outcome ?? "-"}  ${Math.round(
+          (Date.now() - Number(row?.time?.updated ?? 0)) / 60_000,
+        )}m  out ${(row.tokens?.output ?? 0) + (row.tokens?.reasoning ?? 0)}  ${row.title ?? ""}`;
+      if (!done.length) return say(context, `oc-clean: nothing to delete, ${kept.length} busy kept`);
+      if (args.trim() !== "force") {
+        return say(
+          context,
+          [
+            `dry run: ${done.length} under ${ROOT}, ${kept.length} busy kept`,
+            ...done.map(line),
+            "run /oc-clean force to delete these",
+          ].join("\n"),
+        );
+      }
+      let deleted = 0;
+      const failed: string[] = [];
+      for (const row of done) {
+        try {
+          await api("DELETE", `/api/session/${row.id}`);
+          paneCall(["rm", row.id]);
+          forget(state, row.id);
+          deleted++;
+        } catch (error) {
+          failed.push(`${row.id}: ${error instanceof Error ? error.message : error}`);
+        }
+      }
+      say(context, [`oc-clean: deleted ${deleted}, kept ${kept.length} busy`, ...failed].join("\n"));
     },
   });
 
