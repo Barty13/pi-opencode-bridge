@@ -36,7 +36,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 /** All delegated threads live here. Subfolders hold per-lane worktrees. */
-const ROOT = join(homedir(), "Pi");
+function resolveRoot(): string {
+  const root = join(homedir(), "Pi");
+  // A missing ~/Pi must not fail the load; directory() reports it when a call needs it.
+  try {
+    return realpathSync(root);
+  } catch {
+    return root;
+  }
+}
+const ROOT = resolveRoot();
 const MAX_TEXT = 4000;
 
 /**
@@ -103,8 +112,15 @@ let modelCache: { at: number; ids: string[]; variants: Map<string, string[]> } =
 function discover(): Service {
   const url = execFileSync("opencode", ["service", "status"], { encoding: "utf8", timeout: 5_000 }).trim();
   const file = join(homedir(), ".config", "opencode", "service.json");
-  const password = String(JSON.parse(readFileSync(file, "utf8")).password);
-  if (!/^https?:\/\//.test(url) || !password) throw new Error("OpenCode service not reachable");
+  let password: unknown;
+  try {
+    password = JSON.parse(readFileSync(file, "utf8")).password;
+  } catch (error) {
+    throw new Error(`OpenCode service file ${file} is unreadable: ${error instanceof Error ? error.message : error}`);
+  }
+  if (!/^https?:\/\//.test(url) || typeof password !== "string" || !password) {
+    throw new Error("OpenCode service not reachable");
+  }
   return { url, password };
 }
 
@@ -207,9 +223,16 @@ function directory(input?: string): string {
 async function assertLocal(state: BridgeState, session: string): Promise<void> {
   if (state.local.has(session)) return;
   const row = (await api<any>("GET", `/api/session/${session}`)).data;
-  const dir = String(row?.location?.directory ?? "");
+  const reported = String(row?.location?.directory ?? "");
+  // Compare real paths, so a symlink under ~/Pi cannot pass for a thread that lives outside it.
+  let dir = reported;
+  try {
+    dir = realpathSync(reported);
+  } catch {
+    dir = "";
+  }
   if (dir !== ROOT && !dir.startsWith(ROOT + "/")) {
-    throw new Error(`Thread ${session} sits in ${dir || "an unknown directory"}, outside ${ROOT}.`);
+    throw new Error(`Thread ${session} sits in ${dir || reported || "an unknown directory"}, outside ${ROOT}.`);
   }
   state.local.add(session);
 }
@@ -230,10 +253,9 @@ function truncate(text: string, at = 0): string {
   return text.length > next ? `${head}\n… truncated; read with oc_read offset=${next}` : head;
 }
 
-/** Cap one long field, starting at `at`, so oc_read offset walks a tool part too. */
-function clip(text: string, at = 0): string {
-  const rest = text.slice(at);
-  return rest.length > MAX_TEXT ? `${rest.slice(0, MAX_TEXT)}…` : rest;
+/** Cap one long field. The row offset applies once, in `truncate`. */
+function clip(text: string): string {
+  return text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}…` : text;
 }
 
 /** Newest rows, newest first. One fetch feeds the answer, the error, and the idle badge. */
@@ -260,16 +282,16 @@ function errorLine(row: any): string | null {
 }
 
 /** One message part as model-facing text. Tool input and result both cap, because a write
- * or a file read can carry megabytes. Only oc_read can walk the untruncated rows. */
-function partLine(part: any, at = 0): string {
+ * or a file read can carry megabytes. `truncate` applies the row offset once. */
+function partLine(part: any): string {
   if (part.type === "text") return `[text] ${String(part.text ?? "")}`;
   if (part.type === "reasoning") return `[reasoning] ${String(part.text ?? "")}`;
   if (part.type === "tool") {
     const tool = part.state ?? {};
     const result = (tool.content ?? []).map((entry: any) => String(entry.text ?? "")).join(" ");
-    return `[tool ${part.name} ${tool.status ?? "?"}] input=${clip(JSON.stringify(tool.input ?? {}), at)} result=${clip(result, at)}`;
+    return `[tool ${part.name} ${tool.status ?? "?"}] input=${clip(JSON.stringify(tool.input ?? {}))} result=${clip(result)}`;
   }
-  return `[${part.type}] ${clip(JSON.stringify(part), at)}`;
+  return `[${part.type}] ${clip(JSON.stringify(part))}`;
 }
 
 /** One message row as model-facing text. `at` skips that many characters of the body, so a
@@ -291,7 +313,7 @@ function rowBlock(row: any, full: boolean, at: number): string {
     return `[compaction ${row.status ?? "?"} ${row.reason ?? ""}] ${truncate(body, at)}`;
   }
   if (row.type !== "assistant") return `[${row.type}] ${clip(JSON.stringify(row))}`;
-  const body = full ? (row.content ?? []).map((part: any) => partLine(part, at)).join("\n") : textOf(row.content);
+  const body = full ? (row.content ?? []).map((part: any) => partLine(part)).join("\n") : textOf(row.content);
   const err = errorLine(row);
   return `[assistant ${row.finish ?? ""}] ${money(row)}${err ? `\n${err}` : ""}\n${truncate(body, at)}`;
 }
@@ -319,14 +341,20 @@ async function asks(session: string, signal?: AbortSignal): Promise<Ask[]> {
   ];
 }
 
-/** One line per field, so no cap can hide a required one. The service rejects an answer that
- * misses a required field, and in raw JSON the fields sit last, where a slice cuts them off. */
+/** One line per field. Each field caps on its own, so a long description cannot push a required
+ * key off the line; the marker names the field count when the whole line still overflows. */
 function formDetail(form: any): string {
   const fields = (form?.fields ?? []).map((f: any) => {
     const options = f.options ? ` {${f.options.map((o: any) => o.value).join("|")}}` : "";
-    return `${f.key}=${f.type}${f.required ? " required" : ""}${options}`;
+    const detail = [f.title, f.description, f.default !== undefined ? `default ${f.default}` : ""]
+      .filter((part) => part !== undefined && part !== "")
+      .join(" — ");
+    return `${f.key}=${f.type}${f.required ? " required" : ""}${options}${detail ? ` (${detail})` : ""}`.slice(0, 300);
   });
-  return `form ${form?.id ?? ""} "${form?.title ?? ""}" fields: ${fields.join("; ")}`.slice(0, MAX_TEXT);
+  const line = `form ${form?.id ?? ""} "${form?.title ?? ""}" fields: ${fields.join("; ")}`;
+  if (line.length <= MAX_TEXT) return line;
+  const marker = `\n… ${fields.length} fields; form detail truncated`;
+  return `${line.slice(0, MAX_TEXT - marker.length)}${marker}`;
 }
 
 function describe(ask: Ask): string {
@@ -368,17 +396,13 @@ export default function (pi: ExtensionAPI) {
   const deliver = (ask: Ask) => {
     if (state.reported.has(ask.id)) return;
     state.reported.add(ask.id);
-    try {
-      // steer reaches a turn that is already running; followUp would wait for it to settle,
-      // and an oc_wait holding that turn would then deadlock against the thread.
-      pi.sendUserMessage(`[opencode] ${describe(ask)}`, { deliverAs: "steer" });
-    } catch {
-      state.reported.delete(ask.id);
-      queue(ask);
-    }
+    // steer reaches a turn that is already running; followUp would wait for it to settle,
+    // and an oc_wait holding that turn would then deadlock against the thread.
+    // sendUserMessage returns void, so a failed send surfaces from Pi, not from here.
+    pi.sendUserMessage(`[opencode] ${describe(ask)}`, { deliverAs: "steer" });
   };
 
-  // Drain before delivering: a failed send re-queues into pending, so a loop that reads
+  // Drain before delivering: delivery marks the ask reported, so a loop that reads
   // pending.length would spin forever without awaiting anything. Re-read the thread first: an ask
   // answered elsewhere, or one whose thread is deleted, must not open a fresh turn later. A read
   // that fails for any other reason keeps the ask, because dropping it silently loses the thread.
@@ -390,8 +414,11 @@ export default function (pi: ExtensionAPI) {
     }
   };
   const flush = async () => {
-    for (const ask of state.pending.splice(0)) {
-      if (state.reported.has(ask.id)) continue;
+    const batch = state;
+    for (const ask of batch.pending.splice(0)) {
+      // A session switch drops this batch: the next run drains its own.
+      if (batch !== state) return;
+      if (batch.reported.has(ask.id)) continue;
       if (await stillOpen(ask)) deliver(ask);
     }
   };
@@ -399,14 +426,18 @@ export default function (pi: ExtensionAPI) {
   /** Ask the user about one permission, away from the event read loop. The event stream is
    * volatile: one slow consumer fails it, so a dialog must not hold the read path. */
   const askUser = async (ask: Ask, context: ExtensionContext) => {
+    const mine = state;
     // Claim it before the dialog, so a parallel oc_wait cannot re-list this ask.
-    state.reported.add(ask.id);
+    mine.reported.add(ask.id);
     try {
       const ok = await context.ui.confirm("OpenCode asks", describe(ask));
+      // A session switch closed this ask's owner: leave the answer to the service, not to us.
+      if (mine !== state) return;
       await replyTo(ask, ok ? "once" : "reject");
     } catch {
+      if (mine !== state) return;
       // The reply did not land, so hand the ask back to oc_reply.
-      state.reported.delete(ask.id);
+      mine.reported.delete(ask.id);
       queue(ask);
     }
   };
@@ -428,6 +459,8 @@ export default function (pi: ExtensionAPI) {
     if (type !== "permission.asked" && type !== "form.created") return;
     // form.created wraps its payload in data.form; permission.asked stays flat.
     const payload: any = type === "form.created" ? (event.data?.form ?? event.data) : event.data;
+    // A form can sit on the service rather than on a thread, so a non-session id has no thread to offer.
+    if (!String(payload?.sessionID ?? "").startsWith("ses")) return;
     offer({
       kind: type === "form.created" ? "form" : "permission",
       session: payload.sessionID,
@@ -530,6 +563,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     abort?.abort();
     abort = undefined;
+    ctx = undefined;
     state = freshState();
   });
 
@@ -555,7 +589,7 @@ Keep briefs small and ask for a short summary. oc_wait prints the thread's own e
 Supervised mode puts model questions in front of the user. Auto mode (or --oc-auto) sends them to you, and you answer with oc_reply.`,
   };
 
-  const sessionParam = { session: Type.String({ description: "OpenCode session id (ses_...)" }) };
+  const sessionParam = { session: Type.String({ pattern: "^ses", description: "OpenCode session id (ses_...)" }) };
 
   pi.registerTool(
     defineTool({
@@ -563,6 +597,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
       label: "OC models",
       description: "List cheap OpenCode models the account serves now, with provider prefixes.",
       namespace: ns,
+      annotations: { readOnlyHint: true },
       parameters: Type.Object({}),
       async execute() {
         const { ids, variants } = await cheapModels();
@@ -581,18 +616,18 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
     defineTool({
       name: "oc_open",
       label: "OC open",
-      description: "Start a delegated thread. Send a brief: goal, constraints, paths, output shape.",
+      description: "Start a delegated thread.",
       namespace: ns,
       annotations: { openWorldHint: true },
       parameters: Type.Object({
         model: Type.String({ description: "Model id from oc_models, with or without its provider prefix" }),
         variant: Type.Optional(
           Type.String({
-            description: "Reasoning effort, one of the model's own variants from oc_models. Default high when the model has it, otherwise the model's default.",
+            description: "Effort from the model's ladder in oc_models. Defaults to high when offered.",
           }),
         ),
         title: Type.String({ description: "Short thread name" }),
-        brief: Type.Optional(Type.String({ description: "First instruction for the thread" })),
+        brief: Type.Optional(Type.String({ description: "First instruction: goal, constraints, paths, output shape." })),
         directory: Type.Optional(Type.String({ description: `Subfolder of ${ROOT}, for example "lane-a". Omit for ${ROOT}.` })),
         permissionsJson: Type.Optional(
           Type.String({
@@ -604,21 +639,32 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
       async execute(_id, params) {
         const model = await requireModel(params.model);
         const variant = pickVariant(params.variant, model.variants);
+        const dir = directory(params.directory);
         const created = await api("POST", "/api/session", {
           title: params.title,
           model: { id: model.id, providerID: model.providerID, ...(variant ? { variant } : {}) },
-          location: { directory: directory(params.directory) },
+          location: { directory: dir },
           ...(params.permissionsJson ? { permissions: JSON.parse(params.permissionsJson) } : {}),
         });
         const session = created.data.id as string;
         state.known.add(session);
         state.local.add(session);
-        paneCall(["add", session, directory(params.directory)]);
+        paneCall(["add", session, dir]);
         let sent = "";
         if (params.brief) {
-          await api("POST", `/api/session/${session}/prompt`, { text: params.brief });
-          state.lastSend.set(session, Date.now());
-          sent = "\nbrief sent";
+          // The thread exists, so a failed brief still has to hand back its id.
+          try {
+            await api("POST", `/api/session/${session}/prompt`, { text: params.brief });
+            state.lastSend.set(session, Date.now());
+            sent = "\nbrief sent";
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+              content: [{ type: "text", text: `${session}\nbrief failed: ${message}` }],
+              details: { session },
+              isError: true,
+            };
+          }
         }
         return { content: [{ type: "text", text: `${session}${sent}` }], details: { session } };
       },
@@ -659,13 +705,13 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
     defineTool({
       name: "oc_wait",
       label: "OC wait",
-      description: "Wait for a thread to go idle, then report outcome, answer, and open asks.",
+      description: "Wait for a thread to idle or ask, then report the outcome, answer, and asks.",
       namespace: ns,
       annotations: { readOnlyHint: true },
       parameters: Type.Object({
         ...sessionParam,
         since: Type.Optional(Type.Number({ description: "Unix ms; only idle after this counts. Defaults to the last oc_send." })),
-        timeoutSec: Type.Optional(Type.Number({ description: "Give up after this long, default 300" })),
+        timeoutSec: Type.Optional(Type.Number({ description: "Seconds before the wait gives up. Default 300." })),
       }),
       async execute(_id, params, signal) {
         await assertLocal(state, params.session);
@@ -676,6 +722,8 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
         while (Date.now() < deadline) {
           if (signal?.aborted) throw new Error("cancelled");
           const slice = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+          // reported means this process already handed the ask over, so a dialog or a steer
+          // does not end the wait. A send that failed surfaces from Pi as its own error.
           open = (await asks(params.session, slice)).filter((ask) => !state.reported.has(ask.id));
           // The thread waits on an answer, not on time, so stop here and hand it over.
           if (open.length) break;
@@ -693,12 +741,15 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
         // dialog and any later oc_wait must still see it.
         const row = (await api("GET", `/api/session/${params.session}`)).data;
         const rows = await recentRows(params.session);
-        const last = rows.find((entry: any) => entry.type === "assistant") ?? null;
+        // Rows from before this send are another run's answer, not this one's.
+        const fresh = rows.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);
+        const last = fresh.find((entry: any) => entry.type === "assistant") ?? null;
         // A run can fail with no assistant row at all, leaving the cause on the idle row only.
-        const cause = rows.find((entry: any) => entry.error) ?? null;
+        const cause = fresh.find((entry: any) => entry.error) ?? null;
         const answer = textOf(last?.content);
-        const settled = Number(row?.time?.idle ?? 0) > floor ||
-          (neverRan(row) && !state.lastSend.has(params.session));
+        const finalIdle = Number(row?.time?.idle ?? 0);
+        const settled = (neverRan(row) && !state.lastSend.has(params.session)) ||
+          (finalIdle > floor && finalIdle >= Number(row?.time?.busy ?? 0));
         const text = [
           `outcome: ${row?.outcome ?? "unknown"} (idle ${settled ? "yes" : "no"})`,
           errorLine(last) ?? errorLine(cause) ?? "error: none",
@@ -756,7 +807,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
       annotations: { openWorldHint: true },
       parameters: Type.Object({
         ...sessionParam,
-        id: Type.String({ description: "Request id (per_... or form id)" }),
+        id: Type.String({ description: "Request id: per_… for a permission, frm_… for a form." }),
         kind: Type.Union([Type.Literal("permission"), Type.Literal("form")]),
         decision: Type.Optional(
           Type.Union([Type.Literal("once"), Type.Literal("always"), Type.Literal("reject")], {
@@ -841,7 +892,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
   });
 
   pi.registerCommand("oc-auto", {
-    description: "Answer OpenCode model questions with the local model from now on",
+    description: "Answer OpenCode asks from the local model for this session",
     handler: async (_args, context) => {
       state.mode = "unsupervised";
       void flush().catch(() => {});
@@ -850,7 +901,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
   });
 
   pi.registerCommand("oc-accept", {
-    description: "Ask me before answering any OpenCode permission or form request",
+    description: "Supervise OpenCode asks: permissions get a dialog, forms go to chat",
     handler: async (_args, context) => {
       state.mode = "supervised";
       say(context, "OpenCode bridge: supervised — you answer every request");
