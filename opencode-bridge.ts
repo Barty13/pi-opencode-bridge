@@ -13,8 +13,15 @@
  * Boundary: threads live under ~/Pi, subfolders are per-lane worktrees. `oc_open` checks the
  * create path, every other tool checks the thread's own directory once and remembers it.
  *
- * Live view: one Ghostty column per live question through `~/bin/oc-panes`. A send opens it,
- * oc_wait closes it once the answer lands. Best effort, `OC_PANES=0` turns it off.
+ * Wake-ups: a send returns at once and the thread settling opens a later turn, so no Pi turn is
+ * held open by a wait. Detector: `session.execution.{succeeded,failed,interrupted}` on the event
+ * stream, with one detail GET per armed thread every 5s as a backstop for dropped frames. Detect
+ * claims the thread, snapshots the answer, then one debounced message per batch. `oc_wait` waits
+ * on that same detector instead of polling. Print, JSON, and a Pi reload get no wake-ups; there
+ * `oc_wait` is the collector.
+ *
+ * Live view: one Ghostty column per live question through `~/bin/oc-panes`. A send opens it, the
+ * settle closes it. Best effort, `OC_PANES=0` turns it off.
  */
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -39,6 +46,12 @@ function resolveRoot(): string {
 }
 const ROOT = resolveRoot();
 const MAX_TEXT = 4000;
+const DEBOUNCE_MS = Number(process.env.OC_DEBOUNCE_MS ?? 400);
+const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
+const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
+const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
+// Only in-flight sends are armed, so the ceiling bounds a runaway loop of sends, not real work.
+const MAX_THREADS = 32;
 
 const PANES = process.env.OC_PANES === "0" ? "" : join(homedir(), "bin", "oc-panes");
 function paneCall(args: string[]): void {
@@ -62,19 +75,52 @@ interface Ask {
   raw: unknown;
 }
 
+/** A send whose settle has not reached the model yet. `floor` is set before the prompt POST. */
+interface Watch {
+  floor: number;
+  deadline: number;
+}
+
+/** One thread's outcome, read at detect so a newer run cannot answer for an older settle. */
+interface Settle {
+  session: string;
+  title: string;
+  outcome: string;
+  error: string | null;
+  answer: string;
+  asks: Ask[];
+  idleAt: number;
+  /** Set when the watch expired with the run still going. */
+  expired?: boolean;
+}
+
 interface BridgeState {
   mode: "supervised" | "unsupervised";
   /** Threads already checked to sit under ROOT, so a raw id is verified once. */
   local: Set<string>;
   /** Ask ids already handed over, so a second path stays silent. */
   reported: Set<string>;
-  pending: Ask[];
+  pendingAsks: Ask[];
   /** Directory each thread reported, so a later send can open its column. */
   dirs: Map<string, string>;
-  /** When each thread last got a prompt, so oc_wait knows which idle counts. */
-  lastSend: Map<string, number>;
   /** Threads this run has touched; a reconnect rescans their open asks. */
   known: Set<string>;
+  /** Threads owed a wake-up. The only floor source: a send sets it, a settle or stop clears it. */
+  armed: Map<string, Watch>;
+  /** Threads whose settle is being read, so stream and backstop settle one thread once. */
+  claimed: Set<string>;
+  /** Prompt POST in flight: a settle arriving now belongs to the run before this send. */
+  sending: Set<string>;
+  batch: Settle[];
+  batchTimer: ReturnType<typeof setTimeout> | null;
+  /** A batch that fell due during a cancelled run, so the next head line says so. */
+  batchWaited: boolean;
+  /** oc_wait callers per thread. A waiter takes the settle, so the batch stays empty for it. */
+  waiters: Map<string, Array<(settle: Settle | null) => void>>;
+  /** A run the human aborted holds the batch, so a wake-up cannot reopen a dropped conversation. */
+  held: boolean;
+  /** One human message in flight; its settle ends the hold. */
+  pendingRelease: boolean;
 }
 
 /** Fresh per-session state, so no ask or mode leaks into the next session. */
@@ -83,11 +129,47 @@ function freshState(): BridgeState {
     mode: "supervised",
     local: new Set(),
     reported: new Set(),
-    pending: [],
+    pendingAsks: [],
     dirs: new Map(),
-    lastSend: new Map(),
     known: new Set(),
+    armed: new Map(),
+    claimed: new Set(),
+    sending: new Set(),
+    batch: [],
+    batchTimer: null,
+    batchWaited: false,
+    waiters: new Map(),
+    held: false,
+    pendingRelease: false,
   };
+}
+
+/** Arm before the POST: a run that fails in milliseconds writes time.idle before the POST returns. */
+function arm(state: BridgeState, session: string): void {
+  const now = Date.now();
+  if (!state.armed.has(session) && state.armed.size >= MAX_THREADS) {
+    state.armed.delete(state.armed.keys().next().value as string);
+  }
+  state.armed.set(session, { floor: now, deadline: now + WATCH_TTL_MS });
+}
+
+/** Wake oc_wait callers with nothing: the thread stopped, vanished, or the session ended. */
+function releaseWaiters(state: BridgeState, session: string): void {
+  for (const done of state.waiters.get(session) ?? []) done(null);
+  state.waiters.delete(session);
+}
+
+/**
+ * Forget an in-flight run: settled, stopped, deleted, or expired. `settle` names the outcome the
+ * waiters are about to receive, so they are left alone; without it they are released with null.
+ */
+function disarm(state: BridgeState, session: string, settle?: Settle): void {
+  state.armed.delete(session);
+  state.claimed.delete(session);
+  state.sending.delete(session);
+  state.batch = state.batch.filter((entry) => entry.session !== session);
+  if (settle) return;
+  releaseWaiters(state, session);
 }
 
 let service: Service | null = null;
@@ -137,8 +219,9 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
     return await send((service ??= discover()));
   } catch (error) {
     service = null;
-    // Replay only a TypeError (never reached the service) or a GET after SyntaxError (body arrived).
-    if (error instanceof TypeError || (error instanceof SyntaxError && method === "GET")) {
+    // Replay GET only. A TypeError can follow a POST the service already accepted, and a replayed
+    // prompt would run twice with nobody watching the second run.
+    if (method === "GET" && (error instanceof TypeError || error instanceof SyntaxError)) {
       return send((service = discover()));
     }
     throw error;
@@ -215,8 +298,8 @@ async function assertLocal(state: BridgeState, session: string): Promise<void> {
 function forget(state: BridgeState, session: string): void {
   state.local.delete(session);
   state.known.delete(session);
-  state.lastSend.delete(session);
   state.dirs.delete(session);
+  disarm(state, session);
 }
 
 function textOf(parts: unknown): string {
@@ -246,11 +329,6 @@ async function recentRows(session: string, want = 8): Promise<any[]> {
 function money(row: any): string {
   const t = row?.tokens ?? {};
   return `tokens in/out/reasoning ${t.input ?? 0}/${t.output ?? 0}/${t.reasoning ?? 0}, cache ${t.cache?.read ?? 0}, cost ${row?.cost ?? 0}`;
-}
-
-/** A thread that never started a run has neither busy nor idle, so waiting on idle is hopeless. */
-function neverRan(row: any): boolean {
-  return !row?.time?.busy && !row?.time?.idle;
 }
 
 /** The service lists every project, and ?directory= is an exact match, so filter here. */
@@ -350,6 +428,54 @@ function describe(ask: Ask): string {
   return `OpenCode thread ${ask.session} asks: ${ask.label}\n${detail}\nAnswer with oc_reply (permission: once|always|reject; form: answerJson keyed by field keys).`;
 }
 
+/** `readSettle` result: the outcome, "gone" for a thread that no longer exists, null to retry. */
+type Read = Settle | "gone" | null;
+
+/**
+ * What a thread produced after `floor`. Rows newer than the idle belong to a run that has not
+ * settled, so the window closes at both ends. A 404 is final; anything else may pass on a retry.
+ */
+async function readSettle(session: string, floor: number): Promise<Read> {
+  let row: any;
+  try {
+    row = (await api<any>("GET", `/api/session/${session}`)).data;
+  } catch (error) {
+    return /HTTP 40[49]/.test(String(error)) ? "gone" : null;
+  }
+  const idleAt = Number(row?.time?.idle ?? 0);
+  const rows = await recentRows(session).catch(() => [] as any[]);
+  const fresh = rows.filter((entry: any) => {
+    const at = Number(entry?.time?.created ?? 0);
+    return at > floor && at <= idleAt + 1;
+  });
+  const last = fresh.find((entry: any) => entry.type === "assistant") ?? null;
+  const cause = fresh.find((entry: any) => entry.error) ?? null;
+  return {
+    session,
+    title: String(row?.title ?? ""),
+    outcome: String(row?.outcome ?? "unknown"),
+    error: errorLine(last) ?? errorLine(cause),
+    answer: textOf(last?.content),
+    asks: await asks(session).catch(() => [] as Ask[]),
+    idleAt,
+  };
+}
+
+/** Report shape shared by oc_wait and the wake-up, so the two cannot drift apart. */
+function settleText(s: Settle): string {
+  return [
+    `outcome: ${s.outcome}${s.expired ? " (watch expired, run still going)" : ""}`,
+    s.error ?? "error: none",
+    s.answer ? `answer:\n${truncate(s.answer)}` : "answer: (none)",
+    s.asks.length ? `open asks:\n${s.asks.map((ask) => describe(ask)).join("\n")}` : "open asks: none",
+  ].join("\n\n");
+}
+
+function batchLine(s: Settle): string {
+  const body = settleText(s).split("\n").map((line) => `  ${line}`).join("\n");
+  return `- ${s.session}${s.title ? ` ${s.title}` : ""}:\n${body}`;
+}
+
 async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promise<string> {
   if (ask.kind === "permission") {
     if (!decision) throw new Error("permission needs decision: once, always, or reject");
@@ -375,8 +501,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   /** Hold an ask for a later turn. One copy per id, because a rescan can repeat it. */
-  const queue = (ask: Ask) => {
-    if (!state.pending.some((entry) => entry.id === ask.id)) state.pending.push(ask);
+  const queueAsk = (ask: Ask) => {
+    if (!state.pendingAsks.some((entry) => entry.id === ask.id)) state.pendingAsks.push(ask);
   };
 
   const deliver = (ask: Ask) => {
@@ -398,9 +524,9 @@ export default function (pi: ExtensionAPI) {
       return !/HTTP 40[49]/.test(String(error));
     }
   };
-  const flush = async () => {
+  const flushAsks = async () => {
     const batch = state;
-    for (const ask of batch.pending.splice(0)) {
+    for (const ask of batch.pendingAsks.splice(0)) {
       // A session switch drops this batch: the next run drains its own.
       if (batch !== state) return;
       if (batch.reported.has(ask.id)) continue;
@@ -422,7 +548,7 @@ export default function (pi: ExtensionAPI) {
       if (mine !== state) return;
       // The reply did not land, so hand the ask back to oc_reply.
       mine.reported.delete(ask.id);
-      queue(ask);
+      queueAsk(ask);
     }
   };
 
@@ -433,17 +559,161 @@ export default function (pi: ExtensionAPI) {
     // A form carries fields, so no yes/no dialog can answer it: it goes to the message path.
     else if (ask.kind === "permission" && ctx?.hasUI) void askUser(ask, ctx);
     else if (ctx?.isIdle()) deliver(ask);
-    else queue(ask);
+    else queueAsk(ask);
   };
+
+  /** An ask can name a thread outside ROOT, so the boundary check runs before anyone sees it. */
+  const gateAsk = (ask: Ask) => {
+    const mine = state;
+    void assertLocal(mine, ask.session)
+      .then(() => {
+        if (mine === state) offer(ask);
+      })
+      .catch(() => {});
+  };
+
+  /** After an aborted run a delivered ask is invisible, so re-offer what the thread still holds. */
+  const recoverAsks = async (mine: BridgeState) => {
+    for (const session of mine.known) {
+      try {
+        for (const ask of await asks(session)) {
+          if (mine !== state) return;
+          if (mine.reported.delete(ask.id)) offer(ask);
+        }
+      } catch {
+        // A dead thread must not stop the recovery of the others.
+      }
+    }
+  };
+
+  const armFlush = (mine: BridgeState) => {
+    if (mine.batchTimer || !mine.batch.length) return;
+    mine.batchTimer = setTimeout(() => {
+      mine.batchTimer = null;
+      flushSettles(mine);
+    }, DEBOUNCE_MS);
+    mine.batchTimer.unref?.();
+  };
+
+  /** One message per batch. followUp, because a settle is news for the next turn, not a steer. */
+  function flushSettles(mine: BridgeState): void {
+    if (mine !== state) return;
+    if (mine.held) {
+      // Keep the batch for the next run the human starts; armFlush runs when that run settles.
+      if (mine.batch.length) mine.batchWaited = true;
+      return;
+    }
+    const batch = mine.batch;
+    mine.batch = [];
+    const waited = mine.batchWaited;
+    mine.batchWaited = false;
+    const context = ctx;
+    if (!batch.length || !context) return;
+    // Print and JSON have no idle agent, and a message there can extend a run that meant to exit.
+    if (context.mode === "print" || context.mode === "json") return;
+    const count = batch.length === 1 ? "One OpenCode thread" : `${batch.length} OpenCode threads`;
+    const head = `${count}${waited ? " settled while the run was cancelled" : " settled"}:`;
+    const text = `${head}\n${batch.map(batchLine).join("\n")}\n\nRead a thread with oc_read, then continue the task that started it.`;
+    if (context.isIdle()) pi.sendUserMessage(text);
+    else pi.sendUserMessage(text, { deliverAs: "followUp" });
+  }
+
+  /** Hand a settle to a waiting oc_wait, or queue it for the next batch turn. */
+  const deliverSettle = (settle: Settle) => {
+    const mine = state;
+    mine.claimed.delete(settle.session);
+    paneCall(["rm", settle.session]);
+    const waiters = mine.waiters.get(settle.session);
+    if (waiters?.length) {
+      mine.waiters.delete(settle.session);
+      for (const done of waiters) done(settle);
+      return;
+    }
+    mine.batch.push(settle);
+    armFlush(mine);
+  };
+
+  /**
+   * One detector for the stream and the backstop. Claim is synchronous, so the two cannot read the
+   * same settle twice. A thread whose prompt POST is still open is skipped: that settle belongs to
+   * the run before the send, and the backstop will catch the real one.
+   */
+  const detect = async (session: string) => {
+    const mine = state;
+    const w = mine.armed.get(session);
+    if (!w || mine.claimed.has(session) || mine.sending.has(session)) return;
+    mine.claimed.add(session);
+    const read = await readSettle(session, w.floor).catch(() => null);
+    if (mine !== state) return;
+    if (read === "gone") return disarm(mine, session);
+    if (!read) return void mine.claimed.delete(session);
+    // An event that predates the send reports another run, so it must not spend the watch.
+    if (read.idleAt <= w.floor) return void mine.claimed.delete(session);
+    disarm(mine, session, read);
+    deliverSettle(read);
+  };
+
+  /** Backstop for frames the volatile stream dropped, and for watches that outlive their run. */
+  const sweep = async () => {
+    const mine = state;
+    for (const [session, w] of [...mine.armed]) {
+      if (mine !== state) return;
+      if (Date.now() > w.deadline) {
+        disarm(mine, session);
+        deliverSettle({
+          session, title: "", outcome: "running", error: null, answer: "", asks: [], idleAt: Date.now(), expired: true,
+        });
+        continue;
+      }
+      if (mine.sending.has(session) || mine.claimed.has(session)) continue;
+      const read = await readSettle(session, w.floor).catch(() => null);
+      if (mine !== state) return;
+      if (read === "gone") disarm(mine, session);
+      else if (read && read.idleAt > w.floor) deliverSettle(read);
+    }
+  };
+
+  /** Wait for the next settle of this thread. Timeout or abort unregisters and keeps the watch. */
+  const waitForSettle = (
+    mine: BridgeState,
+    session: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<Settle | null> =>
+    new Promise((resolve) => {
+      const drop = () => {
+        clearTimeout(timeout);
+        const rest = (mine.waiters.get(session) ?? []).filter((fn) => fn !== done);
+        if (rest.length) mine.waiters.set(session, rest);
+        else mine.waiters.delete(session);
+        resolve(null);
+      };
+      const done = (settle: Settle | null) => {
+        clearTimeout(timeout);
+        resolve(settle);
+      };
+      const list = mine.waiters.get(session) ?? [];
+      list.push(done);
+      mine.waiters.set(session, list);
+      const timeout = setTimeout(drop, limit * 1000);
+      timeout.unref?.();
+      signal?.addEventListener("abort", drop, { once: true });
+    });
 
   const onEvent = (event: { type?: string; data?: any }) => {
     const type = event.type ?? "";
+    // A settle only matters for a thread this session armed, and that check stays synchronous.
+    if (type.startsWith("session.execution.")) {
+      const settled = String(event.data?.sessionID ?? "");
+      if (state.armed.has(settled)) void detect(settled);
+      return;
+    }
     if (type !== "permission.asked" && type !== "form.created") return;
     // form.created wraps its payload in data.form; permission.asked stays flat.
     const payload: any = type === "form.created" ? (event.data?.form ?? event.data) : event.data;
     // A form can sit on the service rather than on a thread, so a non-session id has no thread to offer.
     if (!String(payload?.sessionID ?? "").startsWith("ses")) return;
-    offer({
+    gateAsk({
       kind: type === "form.created" ? "form" : "permission",
       session: payload.sessionID,
       id: payload.id,
@@ -454,7 +724,7 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  /** List open asks for every known thread, because a reconnect misses that gap. */
+  /** List open asks and re-check armed threads for every known thread: a reconnect misses that gap. */
   const rescan = async () => {
     for (const session of state.known) {
       try {
@@ -463,6 +733,7 @@ export default function (pi: ExtensionAPI) {
         // A dead thread must not stop the rescan of the others.
       }
     }
+    await sweep();
   };
 
   /** Split one connection into frames; a bad frame must not drop the frames behind it. */
@@ -495,12 +766,18 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  /** SSE keeps asks visible within a second; oc_wait polls on its own. Ask for the two ask types only. */
+  /** SSE carries asks and settles. The stream is volatile, so `sweep` backs it up on a timer. */
   const watch = async (signal: AbortSignal) => {
     while (!signal.aborted) {
       try {
         const svc = (service ??= discover());
-        const types = ["permission.asked", "form.created"]
+        const types = [
+          "permission.asked",
+          "form.created",
+          "session.execution.succeeded",
+          "session.execution.failed",
+          "session.execution.interrupted",
+        ]
           .map((type) => `types=${encodeURIComponent(type)}`)
           .join("&");
         const res = await fetch(`${svc.url}/api/event?${types}`, {
@@ -529,38 +806,103 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  /**
+   * Arm before the POST, then send. A definitive 4xx means the prompt never landed, so the watch
+   * goes with it; a timeout keeps the watch, because the service may be running that prompt.
+   */
+  const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
+    const mine = state;
+    arm(mine, session);
+    mine.sending.add(session);
+    try {
+      await api("POST", `/api/session/${session}/prompt`, body);
+      // This send supersedes any snapshot still waiting to wake the model.
+      mine.batch = mine.batch.filter((entry) => entry.session !== session);
+    } catch (error) {
+      if (/HTTP 40[49]/.test(String(error))) disarm(mine, session);
+      throw error;
+    } finally {
+      mine.sending.delete(session);
+    }
+  };
+
+  /** Drop the last session's state and release everything still waiting on it. */
+  const reset = () => {
+    const old = state;
+    state = freshState();
+    if (old.batchTimer) clearTimeout(old.batchTimer);
+    old.batch = [];
+    for (const list of old.waiters.values()) for (const done of list) done(null);
+    old.waiters.clear();
+  };
+
+  let backstop: ReturnType<typeof setInterval> | null = null;
+  let sweeping = false;
+  const startBackstop = () => {
+    stopBackstop();
+    backstop = setInterval(() => {
+      if (sweeping || !state.armed.size) return;
+      sweeping = true;
+      void sweep().finally(() => {
+        sweeping = false;
+      });
+    }, BACKSTOP_MS);
+    backstop.unref?.();
+  };
+  const stopBackstop = () => {
+    if (backstop) clearInterval(backstop);
+    backstop = null;
+  };
+
   pi.on("session_start", (_event, context) => {
     ctx = context;
-    state = freshState();
+    reset();
     if (pi.getFlag("oc-auto") === true) state.mode = "unsupervised";
     abort?.abort();
     abort = new AbortController();
     void watch(abort.signal);
+    startBackstop();
   });
 
   pi.on("session_shutdown", () => {
     abort?.abort();
     abort = undefined;
     ctx = undefined;
-    state = freshState();
+    stopBackstop();
+    reset();
   });
 
-  // Deliver asks an aborted run could not carry. RPC sends input too, so both flush.
+  // Only human input arms the release: a wake-up this bridge sent must not lift its own hold.
   pi.on("input", (event) => {
-    if (event.source === "interactive" || event.source === "rpc") void flush().catch(() => {});
+    if (event.source === "interactive" || event.source === "rpc") {
+      state.pendingRelease = true;
+      void flushAsks().catch(() => {});
+    }
     return { action: "continue" };
   });
 
   pi.on("agent_settled", (event) => {
-    // A run stopped with Escape must not open a fresh turn right after.
-    if (!event.aborted) void flush().catch(() => {});
+    const mine = state;
+    // Escape ends a run the human dropped, so its wake-ups wait for the next thing they send.
+    if (event.aborted) {
+      mine.held = true;
+      return;
+    }
+    if (mine.pendingRelease) {
+      mine.held = false;
+      mine.pendingRelease = false;
+      void recoverAsks(mine).catch(() => {});
+    }
+    void flushAsks().catch(() => {});
+    armFlush(mine);
   });
 
   const ns = {
     name: "opencode",
     aliases: ["oc"],
     description: "Hand threads to cheap remote models over the local OpenCode service.",
-    instructions: `Threads live under ~/Pi. oc_models, then oc_open, then oc_send, then oc_wait.
+    instructions: `Threads live under ~/Pi. oc_models, then oc_open, then oc_send. A send returns at once; the thread settling opens a later turn with its outcome, so never poll for an answer.
+Use oc_wait only when this turn needs the answer now, or when no wake-up is coming (print, JSON, or after a Pi reload, which drops pending wake-ups).
 Retention, which oc_models does not carry: glm and deepseek flash-free are zero retention, safe for private code; beam keeps 30 days; mimo trains on prompts, so public code only.
 A variant off the ladder oc_models prints fails the run, so pick from that ladder or omit variant.
 Keep briefs small and ask for a short summary. Supervised mode puts asks in front of the user; auto mode (or --oc-auto) sends them to you, and you answer with oc_reply.`,
@@ -631,10 +973,9 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
         if (params.brief) {
           // The thread exists, so a failed brief still has to hand back its id.
           try {
-            await api("POST", `/api/session/${session}/prompt`, { text: params.brief });
-            state.lastSend.set(session, Date.now());
+            await sendPrompt(session, { text: params.brief });
             paneCall(["add", session, dir]);
-            sent = "\nbrief sent";
+            sent = "\nbrief sent, wake-up armed";
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return {
@@ -653,29 +994,22 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
     defineTool({
       name: "oc_send",
       label: "OC send",
-      description: "Send a message to a thread. delivery steer injects into the running turn.",
+      description: "Send a message to a thread. Returns at once; the settle opens a later turn with the outcome.",
       namespace: ns,
       annotations: { openWorldHint: true },
       parameters: Type.Object({
         ...sessionParam,
         text: Type.String({ description: "Message for the delegated model" }),
-        delivery: Type.Optional(
-          Type.Union([Type.Literal("steer"), Type.Literal("queue")], {
-            description: "steer joins the running turn, queue waits for it",
-          }),
-        ),
       }),
       async execute(_id, params) {
         await assertLocal(state, params.session);
-        await api("POST", `/api/session/${params.session}/prompt`, {
-          text: params.text,
-          ...(params.delivery ? { delivery: params.delivery } : {}),
-        });
         state.known.add(params.session);
-        // Set the floor only after a send that worked, or oc_wait waits on a ghost.
-        state.lastSend.set(params.session, Date.now());
+        await sendPrompt(params.session, { text: params.text });
         paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
-        return { content: [{ type: "text", text: "sent" }], details: undefined };
+        return {
+          content: [{ type: "text", text: "sent; the settle will open a turn, keep working" }],
+          details: { session: params.session },
+        };
       },
     }),
   );
@@ -684,60 +1018,52 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
     defineTool({
       name: "oc_wait",
       label: "OC wait",
-      description: "Wait for a thread to idle or ask, then report the outcome, answer, and asks.",
+      description:
+        "Block this turn for a thread's settle. Use only when this turn needs the answer or no wake-up is coming; a send already reports itself in a later turn.",
       namespace: ns,
       annotations: { readOnlyHint: true },
       parameters: Type.Object({
         ...sessionParam,
-        since: Type.Optional(Type.Number({ description: "Unix ms; only idle after this counts. Defaults to the last oc_send." })),
-        timeoutSec: Type.Optional(Type.Number({ description: "Seconds before the wait gives up. Default 300." })),
+        since: Type.Optional(Type.Number({ description: "Unix ms; read what came after this, without waiting. For recovery after a reload." })),
+        timeoutSec: Type.Optional(Type.Number({ description: `Seconds before the wait gives up. Max ${WAIT_MAX_S}, default ${WAIT_MAX_S}.` })),
       }),
       async execute(_id, params, signal) {
         await assertLocal(state, params.session);
-        const floor = params.since ?? state.lastSend.get(params.session) ?? 0;
-        const deadline = Date.now() + (params.timeoutSec ?? 300) * 1000;
-        let idle = 0;
-        let open: Ask[] = [];
-        while (Date.now() < deadline) {
-          if (signal?.aborted) throw new Error("cancelled");
-          const slice = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
-          // reported means this process already handed the ask over, so a dialog or a steer
-          // does not end the wait. A send that failed surfaces from Pi as its own error.
-          open = (await asks(params.session, slice)).filter((ask) => !state.reported.has(ask.id));
-          // The thread waits on an answer, not on time, so stop here and hand it over.
-          if (open.length) break;
-          const row = (await api("GET", `/api/session/${params.session}`, undefined, slice)).data;
-          idle = Number(row?.time?.idle ?? 0);
-          // time.idle keeps the old run's value while a new run is in flight, so idle needs busy.
-          // A thread this run never prompted stays unstarted, so idle never passes the floor.
-          if ((neverRan(row) && !state.lastSend.has(params.session)) ||
-              (idle > floor && idle >= Number(row?.time?.busy ?? 0))) break;
-          await new Promise((done) => setTimeout(done, 1500));
-        }
+        const mine = state;
         state.known.add(params.session);
-        // Deliberate: an ask is not reported here, only shown. Nothing was answered, so the
-        // dialog and any later oc_wait must still see it.
-        const row = (await api("GET", `/api/session/${params.session}`)).data;
-        const rows = await recentRows(params.session);
-        // Rows from before this send are another run's answer, not this one's.
-        const fresh = rows.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);
-        const last = fresh.find((entry: any) => entry.type === "assistant") ?? null;
-        // A run can fail with no assistant row at all, leaving the cause on the idle row only.
-        const cause = fresh.find((entry: any) => entry.error) ?? null;
-        const answer = textOf(last?.content);
-        const finalIdle = Number(row?.time?.idle ?? 0);
-        const settled = (neverRan(row) && !state.lastSend.has(params.session)) ||
-          (finalIdle > floor && finalIdle >= Number(row?.time?.busy ?? 0));
-        const text = [
-          `outcome: ${row?.outcome ?? "unknown"} (idle ${settled ? "yes" : "no"})`,
-          errorLine(last) ?? errorLine(cause) ?? "error: none",
-          money(last),
-          answer ? `answer:\n${truncate(answer)}` : "answer: (none)",
-          open.length ? `open asks:\n${open.map((ask) => describe(ask)).join("\n")}` : "open asks: none",
-        ].join("\n\n");
+        const w = mine.armed.get(params.session);
+        const floor = params.since ?? w?.floor ?? 0;
+        // A settle that already reached the batch is this call's answer: take it, do not wake twice.
+        const queued = mine.batch.findIndex((entry) => entry.session === params.session);
+        let settle = queued >= 0 ? mine.batch.splice(queued, 1)[0] : null;
+        if (settle) mine.claimed.delete(params.session);
+        // `since` reads the record instead of waiting, and a thread with no watch owes no wake-up.
+        if (!settle && w && params.since === undefined) {
+          const limit = Math.min(Math.max(params.timeoutSec ?? WAIT_MAX_S, 0), WAIT_MAX_S);
+          settle = await waitForSettle(mine, params.session, limit, signal);
+        }
+        if (!settle && params.since === undefined && mine.armed.has(params.session)) {
+          const seconds = Math.min(params.timeoutSec ?? WAIT_MAX_S, WAIT_MAX_S);
+          return {
+            content: [{ type: "text", text: `still running after ${seconds}s; the watch stays armed` }],
+            details: { session: params.session, settled: false, asks: [] as Ask[] },
+          };
+        }
+        // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
+        const read = settle ?? (await readSettle(params.session, floor));
+        if (read === "gone" || read === null) {
+          return {
+            content: [{ type: "text", text: read === "gone" ? "thread is gone" : "thread unreadable" }],
+            details: { session: params.session, settled: false, asks: [] as Ask[] },
+            isError: true,
+          };
+        }
         // The answer reached Pi, so the column has nothing left to show live.
-        if (settled) paneCall(["rm", params.session]);
-        return { content: [{ type: "text", text }], details: { session: params.session, asks: open } };
+        if (!read.expired) disarm(mine, params.session);
+        return {
+          content: [{ type: "text", text: settleText(read) }],
+          details: { session: params.session, settled: true, asks: read.asks },
+        };
       },
     }),
   );
@@ -829,6 +1155,8 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       parameters: Type.Object(sessionParam),
       async execute(_id, params) {
         await assertLocal(state, params.session);
+        // Disarm first: this call already carries the result, so the interrupted event owes no turn.
+        disarm(state, params.session);
         const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${params.session}/interrupt`);
         const hit = result.interrupted === true;
         paneCall(["rm", params.session]);
@@ -857,6 +1185,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
         [
           `mode: ${state.mode}`,
           `service: ${(service ??= discover()).url}`,
+          `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
           `cheap: ${(await cheapModels()).ids.join(", ")}`,
           ...rows.map((row: any) => `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title}`),
         ].join("\n"),
@@ -868,7 +1197,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
     description: "Answer OpenCode asks from the local model for this session",
     handler: async (_args, context) => {
       state.mode = "unsupervised";
-      void flush().catch(() => {});
+      void flushAsks().catch(() => {});
       say(context, "OpenCode bridge: auto — model questions go to the local model");
     },
   });
@@ -887,6 +1216,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       const session = args.trim();
       if (!session.startsWith("ses_")) return say(context, "usage: /oc-kill <ses_...>");
       await assertLocal(state, session);
+      disarm(state, session);
       const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`);
       paneCall(["rm", session]);
       say(context, result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`);
@@ -900,7 +1230,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       ctx = context;
       const rows = ((await api<any>("GET", "/api/session?limit=200")).data ?? []).filter(underRoot);
       const kept = rows.filter(busy);
-      const done = rows.filter((row) => !busy(row));
+      const done = rows.filter((row: any) => !busy(row));
       const line = (row: any) =>
         `${row.id}  ${row.model?.id ?? "-"}  ${row.outcome ?? "-"}  ${Math.round(
           (Date.now() - Number(row?.time?.updated ?? 0)) / 60_000,

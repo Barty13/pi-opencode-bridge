@@ -2,9 +2,14 @@
   "name": "pi-opencode-bridge",
   "private": true,
   "pi": {
-    "extensions": ["opencode-bridge.ts"]
+    "extensions": [
+      "opencode-bridge.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "bun run oc-rpc.ts"
   }
 }
