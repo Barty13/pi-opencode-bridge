@@ -47,7 +47,10 @@ const MAX_TEXT = 4000;
 const PANES = process.env.OC_PANES === "0" ? "" : join(homedir(), "bin", "oc-panes");
 function paneCall(args: string[]): void {
   if (!PANES || !existsSync(PANES)) return;
-  spawn(PANES, args, { detached: true, stdio: "ignore" }).unref();
+  // An error event with no listener kills the process, so a non-executable helper must be caught.
+  const child = spawn(PANES, args, { detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
 }
 
 interface Service {
@@ -98,7 +101,7 @@ let modelCache: { at: number; ids: string[]; variants: Map<string, string[]> } =
 };
 
 function discover(): Service {
-  const url = execFileSync("opencode", ["service", "status"], { encoding: "utf8" }).trim();
+  const url = execFileSync("opencode", ["service", "status"], { encoding: "utf8", timeout: 5_000 }).trim();
   const file = join(homedir(), ".config", "opencode", "service.json");
   const password = String(JSON.parse(readFileSync(file, "utf8")).password);
   if (!/^https?:\/\//.test(url) || !password) throw new Error("OpenCode service not reachable");
@@ -107,7 +110,7 @@ function discover(): Service {
 
 /** One retry after rediscovery, because the service port changes on restart. A dead service
  * can also answer with a non-JSON body, so SyntaxError retries like a failed connect. */
-async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
+async function api<T = any>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const send = async (svc: Service) => {
     const res = await fetch(svc.url + path, {
       method,
@@ -117,7 +120,8 @@ async function api<T = any>(method: string, path: string, body?: unknown): Promi
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       // A wedged service (two serve processes share opencode.db) would otherwise hang a tool.
-      signal: AbortSignal.timeout(30_000),
+      // A caller with a shorter deadline of its own passes a tighter signal.
+      signal: signal ?? AbortSignal.timeout(30_000),
     });
     const text = await res.text();
     if (!res.ok) {
@@ -149,7 +153,7 @@ async function api<T = any>(method: string, path: string, body?: unknown): Promi
  */
 async function cheapModels(): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
   if (Date.now() - modelCache.at < 60_000) return modelCache;
-  const out = execFileSync("opencode", ["models"], { encoding: "utf8" });
+  const out = execFileSync("opencode", ["models"], { encoding: "utf8", timeout: 5_000 });
   const ids = out
     .split("\n")
     .map((line) => line.trim())
@@ -242,6 +246,11 @@ function money(row: any): string {
   return `tokens in/out/reasoning ${t.input ?? 0}/${t.output ?? 0}/${t.reasoning ?? 0}, cache ${t.cache?.read ?? 0}, cost ${row?.cost ?? 0}`;
 }
 
+/** A thread that never started a run has neither busy nor idle, so waiting on idle is hopeless. */
+function neverRan(row: any): boolean {
+  return !row?.time?.busy && !row?.time?.idle;
+}
+
 /** Why a thread stopped. Quota and provider failures land here, not on an HTTP status. */
 function errorLine(row: any): string | null {
   const err = row?.error;
@@ -287,10 +296,10 @@ function rowBlock(row: any, full: boolean, at: number): string {
   return `[assistant ${row.finish ?? ""}] ${money(row)}${err ? `\n${err}` : ""}\n${truncate(body, at)}`;
 }
 
-async function asks(session: string): Promise<Ask[]> {
+async function asks(session: string, signal?: AbortSignal): Promise<Ask[]> {
   const [perms, forms] = await Promise.all([
-    api<any>(`GET`, `/api/session/${session}/permission`),
-    api<any>(`GET`, `/api/session/${session}/form`),
+    api<any>(`GET`, `/api/session/${session}/permission`, undefined, signal),
+    api<any>(`GET`, `/api/session/${session}/form`, undefined, signal),
   ]);
   return [
     ...(perms.data ?? []).map((row: any): Ask => ({
@@ -409,6 +418,7 @@ export default function (pi: ExtensionAPI) {
     if (state.mode === "unsupervised") deliver(ask);
     // A form carries fields, so no yes/no dialog can answer it: it goes to the message path.
     else if (ask.kind === "permission" && ctx?.hasUI) void askUser(ask, ctx);
+    else if (ctx?.isIdle()) deliver(ask);
     else queue(ask);
   };
 
@@ -665,14 +675,17 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
         let open: Ask[] = [];
         while (Date.now() < deadline) {
           if (signal?.aborted) throw new Error("cancelled");
-          open = (await asks(params.session)).filter((ask) => !state.reported.has(ask.id));
+          const slice = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+          open = (await asks(params.session, slice)).filter((ask) => !state.reported.has(ask.id));
           // The thread waits on an answer, not on time, so stop here and hand it over.
           if (open.length) break;
-          const row = (await api("GET", `/api/session/${params.session}`)).data;
+          const row = (await api("GET", `/api/session/${params.session}`, undefined, slice)).data;
           idle = Number(row?.time?.idle ?? 0);
           // time.idle keeps the previous run's value while a new run is in flight, so idle
-          // alone cannot prove this run ended: busy must not outrun it.
-          if (idle > floor && idle >= Number(row?.time?.busy ?? 0)) break;
+          // alone cannot prove this run ended: busy must not outrun it. A thread this run
+          // never prompted stays unstarted, so idle would never pass the floor at all.
+          if ((neverRan(row) && !state.lastSend.has(params.session)) ||
+              (idle > floor && idle >= Number(row?.time?.busy ?? 0))) break;
           await new Promise((done) => setTimeout(done, 1500));
         }
         state.known.add(params.session);
@@ -684,7 +697,8 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
         // A run can fail with no assistant row at all, leaving the cause on the idle row only.
         const cause = rows.find((entry: any) => entry.error) ?? null;
         const answer = textOf(last?.content);
-        const settled = Number(row?.time?.idle ?? 0) > floor;
+        const settled = Number(row?.time?.idle ?? 0) > floor ||
+          (neverRan(row) && !state.lastSend.has(params.session));
         const text = [
           `outcome: ${row?.outcome ?? "unknown"} (idle ${settled ? "yes" : "no"})`,
           errorLine(last) ?? errorLine(cause) ?? "error: none",
