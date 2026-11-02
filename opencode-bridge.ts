@@ -52,6 +52,8 @@ const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
 const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
 // Only in-flight sends are armed, so the ceiling bounds a runaway loop of sends, not real work.
 const MAX_THREADS = 32;
+// `OC_HUD=0` leaves the footer and the table alone.
+const HUD = process.env.OC_HUD !== "0";
 
 const PANES = process.env.OC_PANES === "0" ? "" : join(homedir(), "bin", "oc-panes");
 function paneCall(args: string[]): void {
@@ -103,6 +105,8 @@ interface BridgeState {
   pendingAsks: Ask[];
   /** Directory each thread reported, so a later send can open its column. */
   dirs: Map<string, string>;
+  /** Model id each thread was opened with, so the HUD row says something useful. */
+  labels: Map<string, string>;
   /** Threads this run has touched; a reconnect rescans their open asks. */
   known: Set<string>;
   /** Threads owed a wake-up. The only floor source: a send sets it, a settle or stop clears it. */
@@ -131,6 +135,7 @@ function freshState(): BridgeState {
     reported: new Set(),
     pendingAsks: [],
     dirs: new Map(),
+    labels: new Map(),
     known: new Set(),
     armed: new Map(),
     claimed: new Set(),
@@ -142,15 +147,6 @@ function freshState(): BridgeState {
     held: false,
     pendingRelease: false,
   };
-}
-
-/** Arm before the POST: a run that fails in milliseconds writes time.idle before the POST returns. */
-function arm(state: BridgeState, session: string): void {
-  const now = Date.now();
-  if (!state.armed.has(session) && state.armed.size >= MAX_THREADS) {
-    state.armed.delete(state.armed.keys().next().value as string);
-  }
-  state.armed.set(session, { floor: now, deadline: now + WATCH_TTL_MS });
 }
 
 /** Wake oc_wait callers with nothing: the thread stopped, vanished, or the session ended. */
@@ -299,6 +295,7 @@ function forget(state: BridgeState, session: string): void {
   state.local.delete(session);
   state.known.delete(session);
   state.dirs.delete(session);
+  state.labels.delete(session);
   disarm(state, session);
 }
 
@@ -645,11 +642,11 @@ export default function (pi: ExtensionAPI) {
     mine.claimed.add(session);
     const read = await readSettle(session, w.floor).catch(() => null);
     if (mine !== state) return;
-    if (read === "gone") return disarm(mine, session);
+    if (read === "gone") return dropThread(session);
     if (!read) return void mine.claimed.delete(session);
     // An event that predates the send reports another run, so it must not spend the watch.
     if (read.idleAt <= w.floor) return void mine.claimed.delete(session);
-    disarm(mine, session, read);
+    dropThread(session, read);
     deliverSettle(read);
   };
 
@@ -659,7 +656,7 @@ export default function (pi: ExtensionAPI) {
     for (const [session, w] of [...mine.armed]) {
       if (mine !== state) return;
       if (Date.now() > w.deadline) {
-        disarm(mine, session);
+        dropThread(session);
         deliverSettle({
           session, title: "", outcome: "running", error: null, answer: "", asks: [], idleAt: Date.now(), expired: true,
         });
@@ -668,7 +665,7 @@ export default function (pi: ExtensionAPI) {
       if (mine.sending.has(session) || mine.claimed.has(session)) continue;
       const read = await readSettle(session, w.floor).catch(() => null);
       if (mine !== state) return;
-      if (read === "gone") disarm(mine, session);
+      if (read === "gone") dropThread(session);
       else if (read && read.idleAt > w.floor) deliverSettle(read);
     }
   };
@@ -807,24 +804,54 @@ export default function (pi: ExtensionAPI) {
   };
 
   /**
-   * Arm before the POST, then send. A definitive 4xx means the prompt never landed, so the watch
-   * goes with it; a timeout keeps the watch, because the service may be running that prompt.
+   * Arm before the POST: a run that fails in milliseconds writes time.idle before the POST
+   * returns. A definitive 4xx means the prompt never landed, so the watch goes with it; a timeout
+   * keeps the watch, because the service may be running that prompt.
    */
   const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
     const mine = state;
-    arm(mine, session);
+    armThread(session);
     mine.sending.add(session);
     try {
       await api("POST", `/api/session/${session}/prompt`, body);
       // This send supersedes any snapshot still waiting to wake the model.
       mine.batch = mine.batch.filter((entry) => entry.session !== session);
     } catch (error) {
-      if (/HTTP 40[49]/.test(String(error))) disarm(mine, session);
+      if (/HTTP 40[49]/.test(String(error))) dropThread(session);
       throw error;
     } finally {
       mine.sending.delete(session);
     }
   };
+
+  const armThread = (session: string): void => {
+    const now = Date.now();
+    if (!state.armed.has(session) && state.armed.size >= MAX_THREADS) {
+      state.armed.delete(state.armed.keys().next().value as string);
+    }
+    state.armed.set(session, { floor: now, deadline: now + WATCH_TTL_MS });
+    drawHud();
+  };
+
+  /** Forget an in-flight run here, then show the new count. */
+  const dropThread = (session: string, settle?: Settle): void => {
+    disarm(state, session, settle);
+    drawHud();
+  };
+
+  /** Footer count plus the table above the editor. Static rows, so no ticker and no timer. */
+  function drawHud(): void {
+    const context = ctx;
+    if (!HUD || !context || context.mode !== "tui") return;
+    const now = Date.now();
+    const rows = [...state.armed].map(([session, w]) => {
+      const label = state.labels.get(session) ?? state.dirs.get(session)?.split("/").pop() ?? "-";
+      return `${session}  ${Math.round((now - w.floor) / 1000)}s  ${label}`;
+    });
+    const count = rows.length;
+    context.ui.setStatus("oc", count ? `${count} ${count === 1 ? "thread" : "threads"} running` : undefined);
+    context.ui.setWidget("oc", count ? ["OpenCode threads", ...rows] : undefined, { placement: "aboveEditor" });
+  }
 
   /** Drop the last session's state and release everything still waiting on it. */
   const reset = () => {
@@ -862,6 +889,7 @@ export default function (pi: ExtensionAPI) {
     abort = new AbortController();
     void watch(abort.signal);
     startBackstop();
+    drawHud();
   });
 
   pi.on("session_shutdown", () => {
@@ -969,6 +997,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
         state.known.add(session);
         state.local.add(session);
         state.dirs.set(session, dir);
+        state.labels.set(session, model.id);
         let sent = "";
         if (params.brief) {
           // The thread exists, so a failed brief still has to hand back its id.
@@ -1059,7 +1088,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
           };
         }
         // The answer reached Pi, so the column has nothing left to show live.
-        if (!read.expired) disarm(mine, params.session);
+        if (!read.expired) dropThread(params.session);
         return {
           content: [{ type: "text", text: settleText(read) }],
           details: { session: params.session, settled: true, asks: read.asks },
@@ -1156,7 +1185,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       async execute(_id, params) {
         await assertLocal(state, params.session);
         // Disarm first: this call already carries the result, so the interrupted event owes no turn.
-        disarm(state, params.session);
+        dropThread(params.session);
         const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${params.session}/interrupt`);
         const hit = result.interrupted === true;
         paneCall(["rm", params.session]);
@@ -1216,7 +1245,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       const session = args.trim();
       if (!session.startsWith("ses_")) return say(context, "usage: /oc-kill <ses_...>");
       await assertLocal(state, session);
-      disarm(state, session);
+      dropThread(session);
       const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`);
       paneCall(["rm", session]);
       say(context, result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`);
@@ -1258,6 +1287,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
           failed.push(`${row.id}: ${error instanceof Error ? error.message : error}`);
         }
       }
+      drawHud();
       say(context, [`oc-clean: deleted ${deleted}, kept ${kept.length} busy`, ...failed].join("\n"));
     },
   });
