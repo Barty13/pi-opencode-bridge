@@ -13,8 +13,8 @@
  * Boundary: threads live under ~/Pi, subfolders are per-lane worktrees. `oc_open` checks the
  * create path, every other tool checks the thread's own directory once and remembers it.
  *
- * Live view: one Ghostty column per thread through `~/bin/oc-panes`, best effort, `OC_PANES=0`
- * turns it off.
+ * Live view: one Ghostty column per live question through `~/bin/oc-panes`. A send opens it,
+ * oc_wait closes it once the answer lands. Best effort, `OC_PANES=0` turns it off.
  */
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -69,6 +69,8 @@ interface BridgeState {
   /** Ask ids already handed over, so a second path stays silent. */
   reported: Set<string>;
   pending: Ask[];
+  /** Directory each thread reported, so a later send can open its column. */
+  dirs: Map<string, string>;
   /** When each thread last got a prompt, so oc_wait knows which idle counts. */
   lastSend: Map<string, number>;
   /** Threads this run has touched; a reconnect rescans their open asks. */
@@ -82,6 +84,7 @@ function freshState(): BridgeState {
     local: new Set(),
     reported: new Set(),
     pending: [],
+    dirs: new Map(),
     lastSend: new Map(),
     known: new Set(),
   };
@@ -205,6 +208,7 @@ async function assertLocal(state: BridgeState, session: string): Promise<void> {
     throw new Error(`Thread ${session} sits in ${dir || reported || "an unknown directory"}, outside ${ROOT}.`);
   }
   state.local.add(session);
+  state.dirs.set(session, dir);
 }
 
 function textOf(parts: unknown): string {
@@ -603,13 +607,14 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
         const session = created.data.id as string;
         state.known.add(session);
         state.local.add(session);
-        paneCall(["add", session, dir]);
+        state.dirs.set(session, dir);
         let sent = "";
         if (params.brief) {
           // The thread exists, so a failed brief still has to hand back its id.
           try {
             await api("POST", `/api/session/${session}/prompt`, { text: params.brief });
             state.lastSend.set(session, Date.now());
+            paneCall(["add", session, dir]);
             sent = "\nbrief sent";
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -650,6 +655,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
         state.known.add(params.session);
         // Set the floor only after a send that worked, or oc_wait waits on a ghost.
         state.lastSend.set(params.session, Date.now());
+        paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
         return { content: [{ type: "text", text: "sent" }], details: undefined };
       },
     }),
@@ -710,6 +716,8 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
           answer ? `answer:\n${truncate(answer)}` : "answer: (none)",
           open.length ? `open asks:\n${open.map((ask) => describe(ask)).join("\n")}` : "open asks: none",
         ].join("\n\n");
+        // The answer reached Pi, so the column has nothing left to show live.
+        if (settled) paneCall(["rm", params.session]);
         return { content: [{ type: "text", text }], details: { session: params.session, asks: open } };
       },
     }),
