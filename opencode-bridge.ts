@@ -23,10 +23,11 @@
  * Live view: one Ghostty column per live question through `~/bin/oc-panes`. A send opens it, the
  * settle closes it. Best effort, `OC_PANES=0` turns it off.
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { Type } from "@earendil-works/pi-ai";
 import {
@@ -114,7 +115,8 @@ interface BridgeState {
   /** Threads whose settle is being read, so stream and backstop settle one thread once. */
   claimed: Set<string>;
   /** Prompt POST in flight: a settle arriving now belongs to the run before this send. */
-  sending: Set<string>;
+  /** Prompt POSTs in flight, counted: parallel sends on one thread share the key. */
+  sending: Map<string, number>;
   batch: Settle[];
   batchTimer: ReturnType<typeof setTimeout> | null;
   /** A batch that fell due during a cancelled run, so the next head line says so. */
@@ -139,7 +141,7 @@ function freshState(): BridgeState {
     known: new Set(),
     armed: new Map(),
     claimed: new Set(),
-    sending: new Set(),
+    sending: new Map(),
     batch: [],
     batchTimer: null,
     batchWaited: false,
@@ -225,11 +227,12 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
 }
 
 /** Cheap models the account serves, read live: ids keep their provider prefix and each model
- * carries its own ladder. A variant the model lacks fails the run, not the request. */
-async function cheapModels(): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
-  if (Date.now() - modelCache.at < 60_000) return modelCache;
-  const out = execFileSync("opencode", ["models"], { encoding: "utf8", timeout: 5_000 });
-  const ids = out
+ * carries its own ladder. `force` skips the cache, because oc_models is where the model reads
+ * the list. exec runs async: a sync 5s call would freeze the TUI. */
+async function cheapModels(force = false): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
+  if (!force && Date.now() - modelCache.at < 60_000) return modelCache;
+  const { stdout } = await promisify(execFile)("opencode", ["models"], { encoding: "utf8", timeout: 5_000 });
+  const ids = stdout
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.startsWith("opencode-go/") || line.endsWith("-free"));
@@ -242,8 +245,12 @@ async function cheapModels(): Promise<{ ids: string[]; variants: Map<string, str
 
 /** A bare id served by both providers is refused: picking one silently picks a biller. */
 async function requireModel(model: string): Promise<{ providerID: string; id: string; variants: string[] }> {
-  const { ids, variants } = await cheapModels();
-  const hits = ids.filter((entry) => entry === model || entry.endsWith(`/${model}`));
+  const hitsIn = (ids: string[]) => ids.filter((entry) => entry === model || entry.endsWith(`/${model}`));
+  let { ids, variants } = await cheapModels();
+  let hits = hitsIn(ids);
+  // A model added after the last read is real, so one forced refresh precedes the refusal.
+  if (!hits.length) ({ ids, variants } = await cheapModels(true));
+  hits = hitsIn(ids);
   if (!hits.length) throw new Error(`Model ${model} is not served cheaply. Read oc_models for the list.`);
   if (hits.length > 1) throw new Error(`Model ${model} is ambiguous: ${hits.join(", ")}. Pick one: go bills the subscription, opencode is the free tier.`);
   const [providerID, ...rest] = hits[0].split("/");
@@ -252,8 +259,9 @@ async function requireModel(model: string): Promise<{ providerID: string; id: st
 
 function pickVariant(requested: string | undefined, ladder: string[]): string | undefined {
   if (requested) {
-    if (ladder.length && !ladder.includes(requested)) {
-      throw new Error(`Variant ${requested} is not on this model's ladder: ${ladder.join("|") || "no variants"}.`);
+    if (!ladder.length) throw new Error(`Model takes no variant. Retry without variant.`);
+    if (!ladder.includes(requested)) {
+      throw new Error(`Variant ${requested} is not on this model's ladder: ${ladder.join("|")}.`);
     }
     return requested;
   }
@@ -296,6 +304,10 @@ function forget(state: BridgeState, session: string): void {
   state.known.delete(session);
   state.dirs.delete(session);
   state.labels.delete(session);
+  // A deleted thread's asks must stop occupying the queue and the reported set.
+  const dropped = state.pendingAsks.filter((ask) => ask.session === session);
+  state.pendingAsks = state.pendingAsks.filter((ask) => ask.session !== session);
+  for (const ask of dropped) state.reported.delete(ask.id);
   disarm(state, session);
 }
 
@@ -311,6 +323,8 @@ function textOf(parts: unknown): string {
 function truncate(text: string, at = 0): string {
   const next = at + MAX_TEXT;
   const head = text.slice(at, next);
+  // An offset past the end has nothing to show, so say so instead of returning an empty body.
+  if (!head) return at ? `(no text past offset ${at}, body is ${text.length} chars)` : "";
   return text.length > next ? `${head}\n… truncated; read with oc_read offset=${next}` : head;
 }
 
@@ -650,11 +664,12 @@ export default function (pi: ExtensionAPI) {
     deliverSettle(read);
   };
 
-  /** Backstop for frames the volatile stream dropped, and for watches that outlive their run. */
+  /** Backstop for frames the volatile stream dropped, and for watches that outlive their run.
+   * Reads run in parallel: a serial pass costs one service round trip per armed thread. */
   const sweep = async () => {
     const mine = state;
+    const reads: Array<[string, number]> = [];
     for (const [session, w] of [...mine.armed]) {
-      if (mine !== state) return;
       if (Date.now() > w.deadline) {
         dropThread(session);
         deliverSettle({
@@ -663,10 +678,14 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
       if (mine.sending.has(session) || mine.claimed.has(session)) continue;
-      const read = await readSettle(session, w.floor).catch(() => null);
-      if (mine !== state) return;
+      reads.push([session, w.floor]);
+    }
+    const results = await Promise.all(reads.map(([session, floor]) => readSettle(session, floor).catch(() => null)));
+    if (mine !== state) return;
+    for (const [index, read] of results.entries()) {
+      const [session, floor] = reads[index];
       if (read === "gone") dropThread(session);
-      else if (read && read.idleAt > w.floor) deliverSettle(read);
+      else if (read && read.idleAt > floor) deliverSettle(read);
     }
   };
 
@@ -811,7 +830,7 @@ export default function (pi: ExtensionAPI) {
   const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
     const mine = state;
     armThread(session);
-    mine.sending.add(session);
+    mine.sending.set(session, (mine.sending.get(session) ?? 0) + 1);
     try {
       await api("POST", `/api/session/${session}/prompt`, body);
       // This send supersedes any snapshot still waiting to wake the model.
@@ -820,14 +839,21 @@ export default function (pi: ExtensionAPI) {
       if (/HTTP 40[49]/.test(String(error))) dropThread(session);
       throw error;
     } finally {
-      mine.sending.delete(session);
+      const left = (mine.sending.get(session) ?? 1) - 1;
+      // One send finishing must not uncover a sibling send that is still in flight.
+      if (left > 0) mine.sending.set(session, left);
+      else mine.sending.delete(session);
     }
   };
 
   const armThread = (session: string): void => {
     const now = Date.now();
     if (!state.armed.has(session) && state.armed.size >= MAX_THREADS) {
-      state.armed.delete(state.armed.keys().next().value as string);
+      const oldest = state.armed.keys().next().value as string;
+      // Dropping the watch silently loses that thread's wake-up, so say which one went.
+      dropThread(oldest);
+      // notify needs a UI, and print/JSON own stdout, so the note stays a TUI thing.
+      if (ctx?.hasUI) ctx.ui.notify(`oc: watch limit ${MAX_THREADS} reached, wake-ups dropped for ${oldest}`, "warning");
     }
     state.armed.set(session, { floor: now, deadline: now + WATCH_TTL_MS });
     drawHud();
@@ -929,10 +955,10 @@ export default function (pi: ExtensionAPI) {
     name: "opencode",
     aliases: ["oc"],
     description: "Hand threads to cheap remote models over the local OpenCode service.",
-    instructions: `Threads live under ~/Pi. oc_models, then oc_open, then oc_send. A send returns at once; the thread settling opens a later turn with its outcome, so never poll for an answer.
+    instructions: `Threads live under ~/Pi. oc_models, then oc_open, then oc_send. A send returns at once; the thread settling opens a later turn with its outcome, so one wake-up carries the answer. Read a thread after that wake-up lands.
 Use oc_wait only when this turn needs the answer now, or when no wake-up is coming (print, JSON, or after a Pi reload, which drops pending wake-ups).
 Retention, which oc_models does not carry: glm and deepseek flash-free are zero retention, safe for private code; beam keeps 30 days; mimo trains on prompts, so public code only.
-A variant off the ladder oc_models prints fails the run, so pick from that ladder or omit variant.
+Pick the variant from that ladder or omit it; oc_open refuses one the model lacks, before the run starts.
 Keep briefs small and ask for a short summary. Supervised mode puts asks in front of the user; auto mode (or --oc-auto) sends them to you, and you answer with oc_reply.`,
   };
 
@@ -947,7 +973,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       annotations: { readOnlyHint: true },
       parameters: Type.Object({}),
       async execute() {
-        const { ids, variants } = await cheapModels();
+        const { ids, variants } = await cheapModels(true);
         const text = ids
           .map((id) => {
             const ladder = variants.get(id) ?? [];
@@ -1087,8 +1113,17 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
             isError: true,
           };
         }
-        // The answer reached Pi, so the column has nothing left to show live.
-        if (!read.expired) dropThread(params.session);
+        // A `since` read walks history, so a thread with no idle row after that point has nothing
+        // to report, and its armed watch must survive for the settle that is still coming.
+        if (settle === null && params.since !== undefined && read.idleAt <= params.since) {
+          return {
+            content: [{ type: "text", text: `no settle after ${params.since}; the watch stays armed` }],
+            details: { session: params.session, settled: false, asks: read.asks },
+          };
+        }
+        // The answer reached Pi, so the column has nothing left to show live. A `since` read kept the
+        // watch on purpose, so only a collected settle drops it.
+        if (!read.expired && params.since === undefined) dropThread(params.session);
         return {
           content: [{ type: "text", text: settleText(read) }],
           details: { session: params.session, settled: true, asks: read.asks },
@@ -1106,7 +1141,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       annotations: { readOnlyHint: true },
       parameters: Type.Object({
         ...sessionParam,
-        limit: Type.Optional(Type.Number({ description: "Messages to read, newest first, default 6" })),
+        limit: Type.Optional(Type.Number({ description: "Messages to read, newest first, default 6, max 25" })),
         parts: Type.Optional(
           Type.Union([Type.Literal("text"), Type.Literal("full")], {
             description: "full adds reasoning and tool input, status, and results",
@@ -1118,7 +1153,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
       }),
       async execute(_id, params) {
         await assertLocal(state, params.session);
-        const want = params.limit ?? 6;
+        const want = Math.min(Math.max(params.limit ?? 6, 1), 25);
         const rows =
           (await api("GET", `/api/session/${params.session}/message?order=desc&limit=${want + 2}`)).data ?? [];
         // An idle row carries only a status, so it must not crowd out the answer.
@@ -1276,9 +1311,15 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
         );
       }
       let deleted = 0;
+      let racing = 0;
       const failed: string[] = [];
       for (const row of done) {
         try {
+          // A run can start between the list and the delete, so re-read before cutting.
+          if (busy((await api<any>("GET", `/api/session/${row.id}`)).data)) {
+            racing++;
+            continue;
+          }
           await api("DELETE", `/api/session/${row.id}`);
           paneCall(["rm", row.id]);
           forget(state, row.id);
@@ -1288,7 +1329,7 @@ Keep briefs small and ask for a short summary. Supervised mode puts asks in fron
         }
       }
       drawHud();
-      say(context, [`oc-clean: deleted ${deleted}, kept ${kept.length} busy`, ...failed].join("\n"));
+      say(context, [`oc-clean: deleted ${deleted}, kept ${kept.length + racing} busy`, ...failed].join("\n"));
     },
   });
 
