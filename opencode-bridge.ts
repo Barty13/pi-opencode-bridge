@@ -17,8 +17,13 @@
  *
  * Boundary: threads must live under ~/Pi. `oc_open` checks the create path, the other tools
  * check the thread's own location once and remember it.
+ *
+ * Live view: `oc_open` gives each thread a Ghostty column through `~/bin/oc-panes` (Ghostty's
+ * AppleScript dictionary), so the prompt, reasoning, tool calls and answer show as they run.
+ * `oc_stop` and `/oc-kill` close the column, `/oc-panes open|close|list` drives it by hand.
+ * `OC_PANES=0` turns it off. Best effort: no column, no failure.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +38,17 @@ import {
 /** All delegated threads live here. Subfolders hold per-lane worktrees. */
 const ROOT = join(homedir(), "Pi");
 const MAX_TEXT = 4000;
+
+/**
+ * Ghostty column viewer: one column per live thread, driven by `~/bin/oc-panes` through
+ * Ghostty's AppleScript dictionary. Best effort: a missing script, a closed window, or a
+ * denied Apple Event must never fail a tool call. `OC_PANES=0` turns it off.
+ */
+const PANES = process.env.OC_PANES === "0" ? "" : join(homedir(), "bin", "oc-panes");
+function paneCall(args: string[]): void {
+  if (!PANES || !existsSync(PANES)) return;
+  spawn(PANES, args, { detached: true, stdio: "ignore" }).unref();
+}
 
 interface Service {
   url: string;
@@ -587,6 +603,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
         const session = created.data.id as string;
         state.known.add(session);
         state.local.add(session);
+        paneCall(["add", session, directory(params.directory)]);
         let sent = "";
         if (params.brief) {
           await api("POST", `/api/session/${session}/prompt`, { text: params.brief });
@@ -770,6 +787,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
         await assertLocal(state, params.session);
         const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${params.session}/interrupt`);
         const hit = result.interrupted === true;
+        paneCall(["rm", params.session]);
         return {
           content: [{ type: "text", text: hit ? "interrupted" : "no run to interrupt" }],
           details: { interrupted: hit },
@@ -832,7 +850,28 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
       if (!session.startsWith("ses_")) return say(context, "usage: /oc-kill <ses_...>");
       await assertLocal(state, session);
       const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`);
+      paneCall(["rm", session]);
       say(context, result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`);
+    },
+  });
+
+  /**
+   * Ghostty columns: /oc-panes open | close | list. Runs the script in the foreground, because
+   * Barty asked for it and wants the answer, not a detached attempt.
+   */
+  pi.registerCommand("oc-panes", {
+    description: "Ghostty columns for live threads: /oc-panes open | close | list",
+    handler: async (args, context) => {
+      const sub = args.trim().split(/\s+/)[0] || "list";
+      if (!PANES) return say(context, "OpenCode columns: off (OC_PANES=0)");
+      if (!existsSync(PANES)) return say(context, `OpenCode columns: missing ${PANES}`);
+      if (!["open", "close", "list"].includes(sub)) return say(context, "usage: /oc-panes open | close | list");
+      try {
+        const out = execFileSync(PANES, [sub], { encoding: "utf8", timeout: 20_000 }).trim();
+        say(context, out || `OpenCode columns: ${sub} done`);
+      } catch (error) {
+        say(context, `OpenCode columns: ${sub} failed: ${(error as Error).message}`);
+      }
     },
   });
 }
