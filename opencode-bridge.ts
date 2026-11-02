@@ -1,27 +1,20 @@
 /**
  * OpenCode bridge: hand threads to OpenCode's free models from a Pi session.
  *
- * Transport: HTTP to the running `opencode serve --service`. Free models work only inside
- * the OpenCode harness, so every call goes through that service. Port comes from
- * `opencode service status`, password from ~/.config/opencode/service.json.
+ * Transport: HTTP to the running `opencode serve --service`, because free models work only
+ * inside the OpenCode harness. Port from `opencode service status`, password from
+ * ~/.config/opencode/service.json.
  *
- * Supervision: `supervised` (default) puts every permission and form request in front of
- * Barty. `unsupervised` hands the request to the local model, which answers with oc_reply.
- * `/oc-auto`, `/oc-accept`, and the `--oc-auto` flag set the mode. Every session start
- * resets it to supervised and drops all per-thread state, so a stale run stays safe.
+ * Supervision: `supervised` (default) puts every ask in front of Barty; `unsupervised` hands
+ * it to the local model, which answers with oc_reply. `/oc-auto`, `/oc-accept` and `--oc-auto`
+ * set the mode. Every session start resets to supervised and drops per-thread state, so a
+ * stale run stays safe.
  *
- * Models: `opencode models` prints cheap ids as `provider/id`. Go subscription models live
- * under `opencode-go`, the free tier under `opencode`. Carry the prefix through, because the
- * session API rejects an id it did not get with its own provider. Each model carries its own
- * effort ladder, so `oc_models` prints it and `oc_open` checks the variant against it.
+ * Boundary: threads live under ~/Pi, subfolders are per-lane worktrees. `oc_open` checks the
+ * create path, every other tool checks the thread's own directory once and remembers it.
  *
- * Boundary: threads must live under ~/Pi. `oc_open` checks the create path, the other tools
- * check the thread's own location once and remember it.
- *
- * Live view: `oc_open` gives each thread a Ghostty column through `~/bin/oc-panes` (Ghostty's
- * AppleScript dictionary), so the prompt, reasoning, tool calls and answer show as they run.
- * `oc_stop` and `/oc-kill` close the column, `/oc-panes open|close|list` drives it by hand.
- * `OC_PANES=0` turns it off. Best effort: no column, no failure.
+ * Live view: one Ghostty column per thread through `~/bin/oc-panes`, best effort, `OC_PANES=0`
+ * turns it off.
  */
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -35,7 +28,6 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-/** All delegated threads live here. Subfolders hold per-lane worktrees. */
 function resolveRoot(): string {
   const root = join(homedir(), "Pi");
   // A missing ~/Pi must not fail the load; directory() reports it when a call needs it.
@@ -48,11 +40,6 @@ function resolveRoot(): string {
 const ROOT = resolveRoot();
 const MAX_TEXT = 4000;
 
-/**
- * Ghostty column viewer: one column per live thread, driven by `~/bin/oc-panes` through
- * Ghostty's AppleScript dictionary. Best effort: a missing script, a closed window, or a
- * denied Apple Event must never fail a tool call. `OC_PANES=0` turns it off.
- */
 const PANES = process.env.OC_PANES === "0" ? "" : join(homedir(), "bin", "oc-panes");
 function paneCall(args: string[]): void {
   if (!PANES || !existsSync(PANES)) return;
@@ -75,14 +62,12 @@ interface Ask {
   raw: unknown;
 }
 
-/** State that belongs to one Pi session. A new session gets a fresh record. */
 interface BridgeState {
   mode: "supervised" | "unsupervised";
   /** Threads already checked to sit under ROOT, so a raw id is verified once. */
   local: Set<string>;
   /** Ask ids already handed over, so a second path stays silent. */
   reported: Set<string>;
-  /** Asks that found no UI and no live run yet. */
   pending: Ask[];
   /** When each thread last got a prompt, so oc_wait knows which idle counts. */
   lastSend: Map<string, number>;
@@ -124,8 +109,7 @@ function discover(): Service {
   return { url, password };
 }
 
-/** One retry after rediscovery, because the service port changes on restart. A dead service
- * can also answer with a non-JSON body, so SyntaxError retries like a failed connect. */
+/** One retry after rediscovery: the port changes on restart, and a dead service can answer non-JSON. */
 async function api<T = any>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const send = async (svc: Service) => {
     const res = await fetch(svc.url + path, {
@@ -135,8 +119,7 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
         "content-type": "application/json",
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-      // A wedged service (two serve processes share opencode.db) would otherwise hang a tool.
-      // A caller with a shorter deadline of its own passes a tighter signal.
+      // Two serve processes share opencode.db; a wedged service would hang a tool without a deadline.
       signal: signal ?? AbortSignal.timeout(30_000),
     });
     const text = await res.text();
@@ -151,8 +134,7 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
     return await send((service ??= discover()));
   } catch (error) {
     service = null;
-    // TypeError never reached the service, so any method is safe to replay. A SyntaxError means
-    // the response arrived, so replaying a POST could apply it twice.
+    // Replay only a TypeError (never reached the service) or a GET after SyntaxError (body arrived).
     if (error instanceof TypeError || (error instanceof SyntaxError && method === "GET")) {
       return send((service = discover()));
     }
@@ -160,13 +142,8 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
   }
 }
 
-/**
- * Cheap models the account serves: the Go lineup under `opencode-go`, the free tier under
- * `opencode`. Ids keep their provider prefix, because `opencode models` prints it and the
- * session API needs it back. The list moves, so read it live, together with each model's
- * effort ladder from `GET /api/model`: kimi-k3 knows only `max`, qwen3.8-flash has no `high`,
- * mimo has no ladder at all. A variant the model lacks fails the run, not the request.
- */
+/** Cheap models the account serves, read live: ids keep their provider prefix and each model
+ * carries its own ladder. A variant the model lacks fails the run, not the request. */
 async function cheapModels(): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
   if (Date.now() - modelCache.at < 60_000) return modelCache;
   const out = execFileSync("opencode", ["models"], { encoding: "utf8", timeout: 5_000 });
@@ -181,9 +158,7 @@ async function cheapModels(): Promise<{ ids: string[]; variants: Map<string, str
   return modelCache;
 }
 
-/** Accepts `glm-5.3-flash` or `opencode-go/glm-5.3-flash`; returns what the API wants plus the
- * model's own ladder. A bare id that both providers serve is refused: picking one silently
- * picks a biller, because `beam-free` sits under `opencode-go` and under `opencode`. */
+/** A bare id served by both providers is refused: picking one silently picks a biller. */
 async function requireModel(model: string): Promise<{ providerID: string; id: string; variants: string[] }> {
   const { ids, variants } = await cheapModels();
   const hits = ids.filter((entry) => entry === model || entry.endsWith(`/${model}`));
@@ -193,8 +168,6 @@ async function requireModel(model: string): Promise<{ providerID: string; id: st
   return { providerID, id: rest.join("/"), variants: variants.get(hits[0]) ?? [] };
 }
 
-/** Variant the model accepts. Explicit means on its ladder or nothing; the default rides the
- * ladder and omits the field when the model has no `high`. */
 function pickVariant(requested: string | undefined, ladder: string[]): string | undefined {
   if (requested) {
     if (ladder.length && !ladder.includes(requested)) {
@@ -215,11 +188,8 @@ function directory(input?: string): string {
   return real;
 }
 
-/**
- * Guard for every call that takes a raw session id. `directory()` covers the create path only,
- * and the service answers any id from any project, so a thread in /tmp would otherwise read and
- * take prompts through this bridge. One check per thread per Pi session.
- */
+/** `directory()` covers only the create path. The service answers ids from any project, so a
+ * thread in /tmp would otherwise read and take prompts through this bridge. */
 async function assertLocal(state: BridgeState, session: string): Promise<void> {
   if (state.local.has(session)) return;
   const row = (await api<any>("GET", `/api/session/${session}`)).data;
@@ -246,7 +216,6 @@ function textOf(parts: unknown): string {
     .trim();
 }
 
-/** Cut text at MAX_TEXT. The marker names the offset that continues the same text. */
 function truncate(text: string, at = 0): string {
   const next = at + MAX_TEXT;
   const head = text.slice(at, next);
@@ -258,7 +227,6 @@ function clip(text: string): string {
   return text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}…` : text;
 }
 
-/** Newest rows, newest first. One fetch feeds the answer, the error, and the idle badge. */
 async function recentRows(session: string, want = 8): Promise<any[]> {
   return (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${want}`)).data ?? [];
 }
@@ -281,8 +249,7 @@ function errorLine(row: any): string | null {
   return `error: ${err.message ?? JSON.stringify(err)}${wait}`;
 }
 
-/** One message part as model-facing text. Tool input and result both cap, because a write
- * or a file read can carry megabytes. `truncate` applies the row offset once. */
+/** Tool input and result can carry megabytes, so both cap before the row offset. */
 function partLine(part: any): string {
   if (part.type === "text") return `[text] ${String(part.text ?? "")}`;
   if (part.type === "reasoning") return `[reasoning] ${String(part.text ?? "")}`;
@@ -294,8 +261,7 @@ function partLine(part: any): string {
   return `[${part.type}] ${clip(JSON.stringify(part))}`;
 }
 
-/** One message row as model-facing text. `at` skips that many characters of the body, so a
- * truncated row continues through oc_read offset. */
+/** One message row; `at` skips into the body for oc_read offset. */
 function rowBlock(row: any, full: boolean, at: number): string {
   if (row.type === "user") return `[user] ${truncate(String(row.text ?? ""), at)}`;
   if (row.type === "idle") return `[idle] ${row.outcome ?? ""}${errorLine(row) ? ` ${errorLine(row)}` : ""}`;
@@ -341,8 +307,7 @@ async function asks(session: string, signal?: AbortSignal): Promise<Ask[]> {
   ];
 }
 
-/** One line per field. Each field caps on its own, so a long description cannot push a required
- * key off the line; the marker names the field count when the whole line still overflows. */
+/** Per-field caps keep a long description from pushing a required key off the line. */
 function formDetail(form: any): string {
   const fields = (form?.fields ?? []).map((f: any) => {
     const options = f.options ? ` {${f.options.map((o: any) => o.value).join("|")}}` : "";
@@ -368,7 +333,6 @@ async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promis
     await api("POST", `/api/session/${ask.session}/permission/${ask.id}/reply`, { decision });
     return `permission ${ask.id} -> ${decision}`;
   }
-  // A form answer is keyed by the form's own field names. A permission decision is not one.
   if (!answerJson) {
     throw new Error(`form ${ask.id} needs answerJson keyed by field names, for example {"lane":"a"}`);
   }
@@ -379,7 +343,6 @@ async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promis
 export default function (pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
   let abort: AbortController | undefined;
-  /** Per-session state, replaced on session_start. */
   let state = freshState();
 
   pi.registerFlag("oc-auto", {
@@ -402,10 +365,9 @@ export default function (pi: ExtensionAPI) {
     pi.sendUserMessage(`[opencode] ${describe(ask)}`, { deliverAs: "steer" });
   };
 
-  // Drain before delivering: delivery marks the ask reported, so a loop that reads
-  // pending.length would spin forever without awaiting anything. Re-read the thread first: an ask
-  // answered elsewhere, or one whose thread is deleted, must not open a fresh turn later. A read
-  // that fails for any other reason keeps the ask, because dropping it silently loses the thread.
+  // Drain the batch before delivering, so a re-queue cannot spin the loop. Re-read the thread:
+  // an ask answered elsewhere or a deleted thread must not open a late turn. Other read
+  // failures keep the ask, because dropping it loses the thread.
   const stillOpen = async (ask: Ask): Promise<boolean> => {
     try {
       return (await asks(ask.session)).some((entry) => entry.id === ask.id);
@@ -423,8 +385,7 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  /** Ask the user about one permission, away from the event read loop. The event stream is
-   * volatile: one slow consumer fails it, so a dialog must not hold the read path. */
+  /** A dialog must not hold the volatile event read loop. */
   const askUser = async (ask: Ask, context: ExtensionContext) => {
     const mine = state;
     // Claim it before the dialog, so a parallel oc_wait cannot re-list this ask.
@@ -442,7 +403,6 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  /** Route one ask: auto, dialog, or the pending batch. */
   const offer = (ask: Ask) => {
     state.known.add(ask.session);
     if (state.reported.has(ask.id)) return;
@@ -453,7 +413,6 @@ export default function (pi: ExtensionAPI) {
     else queue(ask);
   };
 
-  /** Turn one event frame into an ask. Other types pass through cheaply. */
   const onEvent = (event: { type?: string; data?: any }) => {
     const type = event.type ?? "";
     if (type !== "permission.asked" && type !== "form.created") return;
@@ -483,8 +442,7 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  /** One connection's bytes into frames. A partial frame waits in the buffer for the next
-   * chunk. CRLF and CR both end a line. One bad frame must not drop the frames behind it. */
+  /** Split one connection into frames; a bad frame must not drop the frames behind it. */
   const readStream = async (body: NonNullable<Response["body"]>) => {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -514,9 +472,7 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  /** SSE keeps asks visible within a second; oc_wait polls on its own. Only the two ask types
-   * are wanted, so ask the service for them: an unfiltered stream carries every token delta of
-   * every thread, which a slow consumer is meant to survive but should not have to. */
+  /** SSE keeps asks visible within a second; oc_wait polls on its own. Ask for the two ask types only. */
   const watch = async (signal: AbortSignal) => {
     while (!signal.aborted) {
       try {
@@ -552,7 +508,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, context) => {
     ctx = context;
-    // A new session starts clean: no mode, ask, or send time from the old one.
     state = freshState();
     if (pi.getFlag("oc-auto") === true) state.mode = "unsupervised";
     abort?.abort();
@@ -584,9 +539,8 @@ export default function (pi: ExtensionAPI) {
     description: "Hand threads to cheap remote models over the local OpenCode service.",
     instructions: `Threads live under ~/Pi. oc_models, then oc_open, then oc_send, then oc_wait.
 Retention, which oc_models does not carry: glm and deepseek flash-free are zero retention, safe for private code; beam keeps 30 days; mimo trains on prompts, so public code only.
-oc_models prints each model's effort ladder. A variant the model lacks is not rejected at create time: the run fails, so pick from that ladder or omit variant.
-Keep briefs small and ask for a short summary. oc_wait prints the thread's own error, so a failed run says why.
-Supervised mode puts model questions in front of the user. Auto mode (or --oc-auto) sends them to you, and you answer with oc_reply.`,
+A variant off the ladder oc_models prints fails the run, so pick from that ladder or omit variant.
+Keep briefs small and ask for a short summary. Supervised mode puts asks in front of the user; auto mode (or --oc-auto) sends them to you, and you answer with oc_reply.`,
   };
 
   const sessionParam = { session: Type.String({ pattern: "^ses", description: "OpenCode session id (ses_...)" }) };
@@ -729,9 +683,8 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
           if (open.length) break;
           const row = (await api("GET", `/api/session/${params.session}`, undefined, slice)).data;
           idle = Number(row?.time?.idle ?? 0);
-          // time.idle keeps the previous run's value while a new run is in flight, so idle
-          // alone cannot prove this run ended: busy must not outrun it. A thread this run
-          // never prompted stays unstarted, so idle would never pass the floor at all.
+          // time.idle keeps the old run's value while a new run is in flight, so idle needs busy.
+          // A thread this run never prompted stays unstarted, so idle never passes the floor.
           if ((neverRan(row) && !state.lastSend.has(params.session)) ||
               (idle > floor && idle >= Number(row?.time?.busy ?? 0))) break;
           await new Promise((done) => setTimeout(done, 1500));
@@ -828,8 +781,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
             params.answerJson,
           );
         } catch (error) {
-          // The ask can settle while it travels: the service answers 404 for a gone permission
-          // and 409 for a settled form. That is a result, not a crash.
+          // A settled ask answers 404 or 409; that is a result, not a crash.
           const message = error instanceof Error ? error.message : String(error);
           if (!/AlreadySettled|not found|HTTP 40[49]/i.test(message)) throw error;
           text = `${params.id} is already settled or gone. Read the thread with oc_read.`;
@@ -872,8 +824,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
     description: "OpenCode bridge status: mode, service, threads",
     handler: async (_args, context) => {
       ctx = context;
-      // The service lists sessions from every project, so keep only the threads under ROOT.
-      // ?directory= is an exact match, not a subtree filter, so filter here instead.
+      // The service lists every project and ?directory= is exact, so filter here.
       const underRoot = (row: any) => {
         const dir = String(row?.location?.directory ?? "");
         return dir === ROOT || dir.startsWith(ROOT + "/");
@@ -920,10 +871,7 @@ Supervised mode puts model questions in front of the user. Auto mode (or --oc-au
     },
   });
 
-  /**
-   * Ghostty columns: /oc-panes open | close | list. Runs the script in the foreground, because
-   * Barty asked for it and wants the answer, not a detached attempt.
-   */
+  /** Foreground on purpose: Barty wants the answer, not a detached attempt. */
   pi.registerCommand("oc-panes", {
     description: "Ghostty columns for live threads: /oc-panes open | close | list",
     handler: async (args, context) => {
