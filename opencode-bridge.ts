@@ -1,5 +1,5 @@
 /**
- * OpenCode bridge: hand threads to the cheap models of a local OpenCode service from a Pi session.
+ * OpenCode bridge: hand threads to remote models of a local OpenCode service from a Pi session.
  *
  * Transport: HTTP to the running `opencode serve --service`, because those models work only
  * inside the OpenCode harness. Port from `opencode service status`, password from
@@ -258,7 +258,7 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
   }
 }
 
-/** Cheap models the account serves, read live: ids keep their provider prefix and each model
+/** Models the service serves for delegation, read live: ids keep their provider prefix and each model
  * carries its own ladder. `force` skips the cache, because oc_models is where the model reads
  * the list. exec runs async: a sync 5s call would freeze the TUI. */
 async function cheapModels(force = false): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
