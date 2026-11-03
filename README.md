@@ -40,7 +40,7 @@ The bridge adds seven tools and six commands.
 
 | Tool | What it does |
 | --- | --- |
-| `oc_models` | Lists the cheap models the service serves now, with each effort ladder |
+| `oc_models` | Lists the models the service serves for delegation, with each effort ladder |
 | `oc_open` | Opens a thread for one self-contained task, returns its id |
 | `oc_send` | Hands an instruction to a thread, returns at once |
 | `oc_wait` | Collects the settle inside the current turn, when a wake-up cannot arrive |
@@ -51,7 +51,7 @@ The bridge adds seven tools and six commands.
 | Command | What it does |
 | --- | --- |
 | `/oc` | Status: mode, service, live threads |
-| `/oc-auto` | The local model answers the asks for this session |
+| `/oc-auto` | The model in this Pi session answers the asks |
 | `/oc-accept` | You answer the asks yourself |
 | `/oc-kill <id>` | Stops a thread |
 | `/oc-clean [force]` | Lists or deletes finished threads |
@@ -85,7 +85,7 @@ Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
 ## Supervision
 
 Every ask from a thread (a permission, a form) goes to you by default. `/oc-auto` hands asks to
-the local model, which answers with `oc_reply`. `/oc-accept` returns to you. `--oc-auto` starts a
+the model in this Pi session, which answers with `oc_reply`. `/oc-accept` returns to you. `--oc-auto` starts a
 session in auto mode. Each session start resets to supervised and drops per-thread state, so a
 stale run stays safe.
 

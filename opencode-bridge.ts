@@ -6,7 +6,7 @@
  * ~/.config/opencode/service.json. The service is read-only here: this bridge never writes it.
  *
  * Supervision: `supervised` (default) puts every ask in front of you; `unsupervised` hands
- * it to the local model, which answers with oc_reply. `/oc-auto`, `/oc-accept` and `--oc-auto`
+ * it to the model in this Pi session, which answers with oc_reply. `/oc-auto`, `/oc-accept` and `--oc-auto`
  * set the mode. Every session start resets to supervised and drops per-thread state, so a
  * stale run stays safe.
  *
@@ -286,7 +286,7 @@ async function requireModel(
   // A model added after the last read is real, so one forced refresh precedes the refusal.
   if (!hits.length) ({ ids, variants } = await cheapModels(true));
   hits = hitsIn(ids);
-  if (!hits.length) throw new Error(`Model ${model} is not served cheaply. Read oc_models for the list.`);
+  if (!hits.length) throw new Error(`Model ${model} is not on the oc_models list. Read oc_models, then pick one.`);
   if (hits.length > 1) throw new Error(`Model ${model} is ambiguous: ${hits.join(", ")}. Pick one: go bills the subscription, opencode is the free tier.`);
   const [providerID, ...rest] = hits[0].split("/");
   return { providerID, id: rest.join("/"), variants: variants.get(hits[0]) };
@@ -554,7 +554,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("oc-auto", {
     type: "boolean",
     default: false,
-    description: "Answer OpenCode model questions with the local model",
+    description: "Answer OpenCode model questions with this session's model",
   });
 
   /** Hold an ask for a later turn. One copy per id, because a rescan can repeat it. */
@@ -1104,8 +1104,8 @@ export default function (pi: ExtensionAPI) {
   const ns = {
     name: "opencode",
     aliases: ["oc"],
-    description: "Hand threads to cheap remote models over the local OpenCode service.",
-    instructions: `Print, JSON, and a Pi reload carry no wake-up; there oc_wait is the collector. In auto mode the local model receives the thread's asks and answers them with oc_reply.`,
+    description: "Hand threads to remote models over the local OpenCode service.",
+    instructions: `Print, JSON, and a Pi reload carry no wake-up; there oc_wait is the collector. In auto mode the model in this Pi session receives the thread's asks and answers them with oc_reply.`,
   };
 
   const sessionParam = { session: Type.String({ pattern: "^ses", description: "ses_… id from oc_open" }) };
@@ -1114,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "oc_models",
       label: "OC models",
-      description: "List cheap OpenCode models the account serves now, with provider prefixes.",
+      description: "List the OpenCode models the service serves now, with provider prefixes.",
       namespace: ns,
       annotations: { readOnlyHint: true },
       parameters: Type.Object({}),
@@ -1465,7 +1465,7 @@ export default function (pi: ExtensionAPI) {
           `mode: ${state.mode}`,
           `service: ${(service ??= await discover()).url}`,
           `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
-          `cheap: ${(await cheapModels()).ids.join(", ")}`,
+          `served: ${(await cheapModels()).ids.join(", ")}`,
           ...rows.map((row: any) => `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title ?? ""}`),
         ].join("\n"),
       );
@@ -1473,11 +1473,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("oc-auto", {
-    description: "Answer OpenCode asks from the local model for this session",
+    description: "Answer OpenCode asks from the model in this Pi session",
     handler: async (_args, context) => {
       state.mode = "unsupervised";
       void flushAsks().catch(() => {});
-      say(context, "OpenCode bridge: auto — model questions go to the local model");
+      say(context, "OpenCode bridge: auto — model questions go to this session's model");
     },
   });
 
