@@ -1,6 +1,7 @@
 # pi-opencode-bridge
 
 [![CI](https://github.com/Barty13/pi-opencode-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/Barty13/pi-opencode-bridge/actions/workflows/test.yml)
+[![npm version](https://img.shields.io/npm/v/@barty13/pi-opencode-bridge)](https://www.npmjs.com/package/@barty13/pi-opencode-bridge)
 [![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ![Pi on the left, two OpenCode threads on the right](assets/banner.png)
