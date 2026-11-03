@@ -1,0 +1,21 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Matches the bun that wrote bun.lock. An older bun rejects that lockfile outright.
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit
+      # Model-free: a stub pi and a stub service. No key, no network model call.
+      - run: bun run check
+      - run: bash -n checks/check-tui.sh checks/check-reload.sh oc-panes

@@ -1,0 +1,50 @@
+{
+  "name": "pi-opencode-bridge",
+  "version": "0.1.0",
+  "description": "Delegate threads to a local OpenCode service from Pi. oc_open returns at once, the thread settling opens a later turn.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "opencode",
+    "delegation",
+    "subagents"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Barty13/pi-opencode-bridge.git"
+  },
+  "author": "Barty <Barty13@users.noreply.github.com>",
+  "bugs": {
+    "url": "https://github.com/Barty13/pi-opencode-bridge/issues"
+  },
+  "homepage": "https://github.com/Barty13/pi-opencode-bridge#readme",
+  "pi": {
+    "extensions": [
+      "opencode-bridge.ts"
+    ]
+  },
+  "scripts": {
+    "check": "for c in 4xx nowatch expire stale; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/bun": "^1.4.2",
+    "typescript": "^5.9.0"
+  },
+  "files": [
+    "opencode-bridge.ts",
+    "oc-panes",
+    "oc-rpc.ts",
+    "checks/",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ]
+}

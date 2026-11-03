@@ -1,0 +1,1576 @@
+/**
+ * OpenCode bridge: hand threads to the cheap models of a local OpenCode service from a Pi session.
+ *
+ * Transport: HTTP to the running `opencode serve --service`, because those models work only
+ * inside the OpenCode harness. Port from `opencode service status`, password from
+ * ~/.config/opencode/service.json. The service is read-only here: this bridge never writes it.
+ *
+ * Supervision: `supervised` (default) puts every ask in front of you; `unsupervised` hands
+ * it to the local model, which answers with oc_reply. `/oc-auto`, `/oc-accept` and `--oc-auto`
+ * set the mode. Every session start resets to supervised and drops per-thread state, so a
+ * stale run stays safe.
+ *
+ * Boundary: threads live under OC_ROOT (default: the working directory at start), subfolders are
+ * per-lane worktrees. `oc_open` checks the create path, every other tool checks the thread's own
+ * directory once and remembers it.
+ *
+ * Wake-ups: a send returns at once and the thread settling opens a later turn, so no Pi turn is
+ * held open by a wait. Detector: `session.execution.{succeeded,failed,interrupted}` on the event
+ * stream, with one detail GET per armed thread every 5s as a backstop for dropped frames. Detect
+ * claims the thread, snapshots the answer, then one debounced message per batch. `oc_wait` waits
+ * on that same detector instead of polling. Print, JSON, and a Pi reload get no wake-ups; there
+ * `oc_wait` is the collector.
+ *
+ * Live view: one Ghostty column per live question through the `oc-panes` script next to this
+ * file. A send opens it, the settle closes it. Best effort, `OC_PANES=0` turns it off.
+ */
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { Type } from "@earendil-works/pi-ai";
+import {
+  defineTool,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+
+function resolveRoot(): string {
+  // Threads may write files, so the root is an explicit scratch tree, not the Pi config dir.
+  const root = process.env.OC_ROOT ?? process.cwd();
+  // A missing root must not fail the load; directory() reports it when a call needs it.
+  try {
+    return realpathSync(root);
+  } catch {
+    return root;
+  }
+}
+const ROOT = resolveRoot();
+const MAX_TEXT = 4000;
+/** Data policy per model id, filled by the operator: OC_RETENTION='{"<id-suffix>":"zero"}'.
+  * Read the policy from your provider's model page; this bridge ships no ids. Match is by exact
+  * id suffix, so a new model gets no label rather than another model's policy. Display only. */
+const RETENTION: Array<[string, string]> = (() => {
+  try {
+    return Object.entries(JSON.parse(process.env.OC_RETENTION ?? "{}") as Record<string, string>);
+  } catch {
+    return [];  // a broken OC_RETENTION must not stop the load
+  }
+})();
+const DEBOUNCE_MS = Number(process.env.OC_DEBOUNCE_MS ?? 400);
+const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
+const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
+const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
+// Only in-flight sends are armed, so the ceiling bounds a runaway loop of sends, not real work.
+const MAX_THREADS = 32;
+// `OC_HUD=0` leaves the footer and the table alone.
+const HUD = process.env.OC_HUD !== "0";
+
+// Ship oc-panes next to the extension; OC_PANES names another path, OC_PANES=0 turns the view off.
+const PANES = process.env.OC_PANES === "0"
+  ? ""
+  : process.env.OC_PANES ?? join(import.meta.dirname, "oc-panes");
+// Panes are a TUI affordance: print, JSON, and RPC own the terminal, so no column opens there.
+// session_start sets this from the mode.
+let panesOn = false;
+function paneCall(args: string[]): void {
+  if (!panesOn || !PANES || !existsSync(PANES)) return;
+  // An error event with no listener kills the process, so a non-executable helper must be caught.
+  const child = spawn(PANES, args, { detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
+}
+
+interface Service {
+  url: string;
+  password: string;
+}
+
+interface Ask {
+  kind: "permission" | "form";
+  session: string;
+  id: string;
+  label: string;
+  raw: unknown;
+}
+
+/** A send whose settle has not reached the model yet. `floor` is set before the prompt POST. */
+interface Watch {
+  floor: number;
+  deadline: number;
+}
+
+/** One thread's outcome, read at detect so a newer run cannot answer for an older settle. */
+interface Settle {
+  session: string;
+  title: string;
+  outcome: string;
+  error: string | null;
+  answer: string;
+  asks: Ask[];
+  idleAt: number;
+  /** Set when the watch expired with the run still going. */
+  expired?: boolean;
+  /** Set when the open-ask read failed, so "none" is not claimed as a fact. */
+  asksUnknown?: boolean;
+}
+
+interface BridgeState {
+  mode: "supervised" | "unsupervised";
+  /** Threads already checked to sit under ROOT, so a raw id is verified once. */
+  local: Set<string>;
+  /** Ask ids already handed over, so a second path stays silent. */
+  reported: Set<string>;
+  pendingAsks: Ask[];
+  /** Directory each thread reported, so a later send can open its column. */
+  dirs: Map<string, string>;
+  /** Model id each thread was opened with, so the HUD row says something useful. */
+  labels: Map<string, string>;
+  /** Threads this run has touched; a reconnect rescans their open asks. */
+  known: Set<string>;
+  /** Threads owed a wake-up. The only floor source: a send sets it, a settle or stop clears it. */
+  armed: Map<string, Watch>;
+  /** Threads whose settle is being read, so stream and backstop settle one thread once. */
+  claimed: Set<string>;
+  /** Prompt POST in flight: a settle arriving now belongs to the run before this send. */
+  /** Prompt POSTs in flight, counted: parallel sends on one thread share the key. */
+  sending: Map<string, number>;
+  batch: Settle[];
+  batchTimer: ReturnType<typeof setTimeout> | null;
+  /** A batch that fell due during a cancelled run, so the next head line says so. */
+  batchWaited: boolean;
+  /** oc_wait callers per thread. A waiter takes the settle, so the batch stays empty for it. */
+  waiters: Map<string, Array<(settle: Settle | null) => void>>;
+  /** A run the human aborted holds the batch, so a wake-up cannot reopen a dropped conversation. */
+  held: boolean;
+  /** Manual compaction refuses prompts (agent-session.js:1648-1650), so asks and batches wait. */
+  compacting: boolean;
+  /** One human message in flight; its settle ends the hold. */
+  pendingRelease: boolean;
+}
+
+/** Fresh per-session state, so no ask or mode leaks into the next session. */
+function freshState(): BridgeState {
+  return {
+    mode: "supervised",
+    local: new Set(),
+    reported: new Set(),
+    pendingAsks: [],
+    dirs: new Map(),
+    labels: new Map(),
+    known: new Set(),
+    armed: new Map(),
+    claimed: new Set(),
+    sending: new Map(),
+    batch: [],
+    batchTimer: null,
+    batchWaited: false,
+    waiters: new Map(),
+    held: false,
+    compacting: false,
+    pendingRelease: false,
+  };
+}
+
+/** Wake oc_wait callers with nothing: the thread stopped, vanished, or the session ended. */
+function releaseWaiters(state: BridgeState, session: string): void {
+  for (const done of state.waiters.get(session) ?? []) done(null);
+  state.waiters.delete(session);
+}
+
+/** Forget an in-flight run, leaving any waiter alone. */
+function unwatch(state: BridgeState, session: string): void {
+  state.armed.delete(session);
+  state.claimed.delete(session);
+  state.sending.delete(session);
+  state.batch = state.batch.filter((entry) => entry.session !== session);
+}
+
+/**
+ * Forget an in-flight run: settled, stopped, deleted, or expired. `settle` names the outcome the
+ * waiters are about to receive, so they are left alone; without it they are released with null.
+ */
+function disarm(state: BridgeState, session: string, settle?: Settle): void {
+  unwatch(state, session);
+  if (settle) return;
+  releaseWaiters(state, session);
+}
+
+let service: Service | null = null;
+let modelCache: { at: number; ids: string[]; variants: Map<string, string[]> } = {
+  at: 0,
+  ids: [],
+  variants: new Map(),
+};
+
+/** Service url and password, read without blocking: a down service must not freeze the TUI. */
+async function discover(): Promise<Service> {
+  const { stdout } = await promisify(execFile)("opencode", ["service", "status"], { encoding: "utf8", timeout: 5_000 });
+  const url = stdout.trim();
+  const file = join(homedir(), ".config", "opencode", "service.json");
+  let password: unknown;
+  try {
+    password = JSON.parse(readFileSync(file, "utf8")).password;
+  } catch (error) {
+    throw new Error(`OpenCode service file ${file} is unreadable: ${error instanceof Error ? error.message : error}`);
+  }
+  if (!/^https?:\/\//.test(url) || typeof password !== "string" || !password) {
+    throw new Error("OpenCode service not reachable");
+  }
+  return { url, password };
+}
+
+/** One retry after rediscovery: the port changes on restart, and a dead service can answer non-JSON. */
+async function api<T = any>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  const send = async (svc: Service) => {
+    const res = await fetch(svc.url + path, {
+      method,
+      headers: {
+        authorization: "Basic " + Buffer.from(`opencode:${svc.password}`).toString("base64"),
+        "content-type": "application/json",
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      // Two serve processes share opencode.db; a wedged service would hang a tool without a deadline.
+      signal: signal ?? AbortSignal.timeout(30_000),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      const retry = /"retryAfterMs"\s*:\s*(\d+)/.exec(text)?.[1];
+      const hint = retry ? ` Retry after ${Math.ceil(Number(retry) / 60000)} min.` : "";
+      throw new Error(`opencode ${method} ${path} -> HTTP ${res.status}.${hint} ${text.slice(0, 300)}`);
+    }
+    return (text.trim() ? JSON.parse(text) : {}) as T;
+  };
+  try {
+    return await send((service ??= await discover()));
+  } catch (error) {
+    service = null;
+    // Replay GET only. A TypeError can follow a POST the service already accepted, and a replayed
+    // prompt would run twice with nobody watching the second run.
+    if (method === "GET" && (error instanceof TypeError || error instanceof SyntaxError)) {
+      return send((service = await discover()));
+    }
+    throw error;
+  }
+}
+
+/** Cheap models the account serves, read live: ids keep their provider prefix and each model
+ * carries its own ladder. `force` skips the cache, because oc_models is where the model reads
+ * the list. exec runs async: a sync 5s call would freeze the TUI. */
+async function cheapModels(force = false): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
+  if (!force && Date.now() - modelCache.at < 60_000) return modelCache;
+  const { stdout } = await promisify(execFile)("opencode", ["models"], { encoding: "utf8", timeout: 5_000 });
+  const ids = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("opencode-go/") || line.endsWith("-free"));
+  const variants = new Map<string, string[]>();
+  const rows = await api<any>("GET", "/api/model").catch(() => ({ data: [] as any[] }));
+  for (const row of rows.data ?? []) variants.set(`${row.providerID}/${row.modelID}`, (row.variants ?? []).map((v: any) => v.id));
+  modelCache = { at: Date.now(), ids, variants };
+  return modelCache;
+}
+
+/** A bare id served by both providers is refused: picking one silently picks a biller.
+ * `variants` is undefined when the ladder read failed, which is not the same as no variants. */
+async function requireModel(
+  model: string,
+): Promise<{ providerID: string; id: string; variants?: string[] }> {
+  const hitsIn = (ids: string[]) => ids.filter((entry) => entry === model || entry.endsWith(`/${model}`));
+  let { ids, variants } = await cheapModels();
+  let hits = hitsIn(ids);
+  // A model added after the last read is real, so one forced refresh precedes the refusal.
+  if (!hits.length) ({ ids, variants } = await cheapModels(true));
+  hits = hitsIn(ids);
+  if (!hits.length) throw new Error(`Model ${model} is not served cheaply. Read oc_models for the list.`);
+  if (hits.length > 1) throw new Error(`Model ${model} is ambiguous: ${hits.join(", ")}. Pick one: go bills the subscription, opencode is the free tier.`);
+  const [providerID, ...rest] = hits[0].split("/");
+  return { providerID, id: rest.join("/"), variants: variants.get(hits[0]) };
+}
+
+/** A ladder of undefined means the service never answered, so the request stands. */
+function pickVariant(requested: string | undefined, ladder?: string[]): string | undefined {
+  if (requested) {
+    if (ladder && !ladder.length) throw new Error(`Model takes no variant. Retry without variant.`);
+    if (ladder && !ladder.includes(requested)) {
+      throw new Error(`Variant ${requested} is not on this model's ladder: ${ladder.join("|")}.`);
+    }
+    return requested;
+  }
+  return ladder?.includes("high") ? "high" : undefined;
+}
+
+function directory(input?: string): string {
+  const dir = input ? join(ROOT, input) : ROOT;
+  if (dir !== ROOT && !dir.startsWith(ROOT + "/")) throw new Error(`Directory must sit under ${ROOT}`);
+  if (!existsSync(dir)) throw new Error(`${dir} does not exist. Omit directory to work in ${ROOT}.`);
+  // A symlink under the root can point outside it, so check where the path really lands.
+  const real = realpathSync(dir);
+  if (real !== ROOT && !real.startsWith(ROOT + "/")) throw new Error(`${dir} resolves outside ${ROOT}`);
+  return real;
+}
+
+/** `directory()` covers only the create path. The service answers ids from any project, so a
+ * thread in /tmp would otherwise read and take prompts through this bridge. */
+async function assertLocal(state: BridgeState, session: string): Promise<void> {
+  if (state.local.has(session)) return;
+  const row = (await api<any>("GET", `/api/session/${session}`)).data;
+  const reported = String(row?.location?.directory ?? "");
+  // Compare real paths, so a symlink under the root cannot pass for a thread that lives outside it.
+  let dir = reported;
+  try {
+    dir = realpathSync(reported);
+  } catch {
+    dir = "";
+  }
+  if (dir !== ROOT && !dir.startsWith(ROOT + "/")) {
+    throw new Error(`Thread ${session} sits in ${dir || reported || "an unknown directory"}, outside ${ROOT}.`);
+  }
+  state.local.add(session);
+  state.dirs.set(session, dir);
+}
+
+/** Drop every per-thread record, so a deleted id leaves nothing behind in this Pi session. */
+function forget(state: BridgeState, session: string): void {
+  state.local.delete(session);
+  state.known.delete(session);
+  state.dirs.delete(session);
+  state.labels.delete(session);
+  // A deleted thread's asks must stop occupying the queue and the reported set.
+  const dropped = state.pendingAsks.filter((ask) => ask.session === session);
+  state.pendingAsks = state.pendingAsks.filter((ask) => ask.session !== session);
+  for (const ask of dropped) state.reported.delete(ask.id);
+  disarm(state, session);
+}
+
+function textOf(parts: unknown): string {
+  if (typeof parts === "string") return parts;
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .map((part: any) => (part?.type === "text" ? String(part.text ?? "") : ""))
+    .join("")
+    .trim();
+}
+
+function truncate(text: string, at = 0): string {
+  const next = at + MAX_TEXT;
+  const head = text.slice(at, next);
+  // An offset past the end has nothing to show, so say so instead of returning an empty body.
+  if (!head) return at ? `(no text past offset ${at}, body is ${text.length} chars)` : "";
+  return text.length > next ? `${head}\n… truncated; read with oc_read offset=${next}` : head;
+}
+
+/** Cap one long field. The row offset applies once, in `truncate`. */
+function clip(text: string): string {
+  return text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}…` : text;
+}
+
+async function recentRows(session: string, want = 8): Promise<any[]> {
+  return (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${want}`)).data ?? [];
+}
+
+function money(row: any): string {
+  const t = row?.tokens ?? {};
+  return `tokens in/out/reasoning ${t.input ?? 0}/${t.output ?? 0}/${t.reasoning ?? 0}, cache ${t.cache?.read ?? 0}, cost ${row?.cost ?? 0}`;
+}
+
+/** The service lists every project, and ?directory= is an exact match, so filter here. */
+function underRoot(row: any): boolean {
+  const dir = String(row?.location?.directory ?? "");
+  return dir === ROOT || dir.startsWith(ROOT + "/");
+}
+
+/** A run in flight must not be deleted out from under the model waiting on it. */
+function busy(row: any): boolean {
+  return Boolean(row?.time?.busy) && !row?.time?.idle;
+}
+
+/** Why a thread stopped. Quota and provider failures land here, not on an HTTP status. */
+function errorLine(row: any): string | null {
+  const err = row?.error;
+  if (!err) return null;
+  const wait = err.retryAfterMs ? `, retry after ${Math.ceil(Number(err.retryAfterMs) / 60000)} min` : "";
+  return `error: ${err.message ?? JSON.stringify(err)}${wait}`;
+}
+
+/** Tool input and result can carry megabytes, so both cap before the row offset. */
+function partLine(part: any): string {
+  if (part.type === "text") return `[text] ${String(part.text ?? "")}`;
+  if (part.type === "reasoning") return `[reasoning] ${String(part.text ?? "")}`;
+  if (part.type === "tool") {
+    const tool = part.state ?? {};
+    const result = (tool.content ?? []).map((entry: any) => String(entry.text ?? "")).join(" ");
+    // A failed tool keeps its reason in state.error, so a reader can tell why it broke.
+    const error = tool.error?.message ? ` error=${clip(String(tool.error.message))}` : "";
+    return `[tool ${part.name} ${tool.status ?? "?"}] input=${clip(JSON.stringify(tool.input ?? {}))} result=${clip(result)}${error}`;
+  }
+  return `[${part.type}] ${clip(JSON.stringify(part))}`;
+}
+
+/** One message row; `at` skips into the body for oc_read offset. */
+function rowBlock(row: any, full: boolean, at: number): string {
+  if (row.type === "user") return `[user] ${truncate(String(row.text ?? ""), at)}`;
+  if (row.type === "idle") return `[idle] ${row.outcome ?? ""}${errorLine(row) ? ` ${errorLine(row)}` : ""}`;
+  if (row.type === "system") return `[system] ${truncate(String(row.text ?? ""), at)}`;
+  if (row.type === "synthetic") return `[synthetic] ${truncate(String(row.text ?? ""), at)}`;
+  if (row.type === "skill") {
+    return `[skill ${row.name ?? row.skill ?? ""}] ${truncate(String(row.text ?? ""), at)}`;
+  }
+  if (row.type === "shell") {
+    const output = row.output?.output ?? "";
+    return `[shell ${row.status ?? "?"} exit=${row.exit ?? "?"}] ${row.command ?? ""}\n${truncate(output, at)}`;
+  }
+  if (row.type === "compaction") {
+    const body = row.summary ?? row.error?.message ?? "";
+    return `[compaction ${row.status ?? "?"} ${row.reason ?? ""}] ${truncate(body, at)}`;
+  }
+  if (row.type !== "assistant") return `[${row.type}] ${clip(JSON.stringify(row))}`;
+  const body = full ? (row.content ?? []).map((part: any) => partLine(part)).join("\n") : textOf(row.content);
+  const err = errorLine(row);
+  return `[assistant ${row.finish ?? ""}] ${money(row)}${err ? `\n${err}` : ""}\n${truncate(body, at)}`;
+}
+
+async function asks(session: string, signal?: AbortSignal): Promise<Ask[]> {
+  const [perms, forms] = await Promise.all([
+    api<any>(`GET`, `/api/session/${session}/permission`, undefined, signal),
+    api<any>(`GET`, `/api/session/${session}/form`, undefined, signal),
+  ]);
+  return [
+    ...(perms.data ?? []).map((row: any): Ask => ({
+      kind: "permission",
+      session,
+      id: row.id,
+      label: `${row.action} ${row.resources?.join(", ") ?? ""}`.trim(),
+      raw: row,
+    })),
+    ...(forms.data ?? []).map((row: any): Ask => ({
+      kind: "form",
+      session,
+      id: row.id,
+      label: `form ${row.title ?? row.id}`,
+      raw: row,
+    })),
+  ];
+}
+
+/** Per-field caps keep a long description from pushing a required key off the line. */
+function formDetail(form: any): string {
+  const fields = (form?.fields ?? []).map((f: any) => {
+    const options = f.options ? ` {${f.options.map((o: any) => o.value).join("|")}}` : "";
+    const detail = [f.title, f.description, f.default !== undefined ? `default ${f.default}` : ""]
+      .filter((part) => part !== undefined && part !== "")
+      .join(" — ");
+    return `${f.key}=${f.type}${f.required ? " required" : ""}${options}${detail ? ` (${detail})` : ""}`.slice(0, 300);
+  });
+  const line = `form ${form?.id ?? ""} "${form?.title ?? ""}" fields: ${fields.join("; ")}`;
+  if (line.length <= MAX_TEXT) return line;
+  const marker = `\n… ${fields.length} fields; form detail truncated`;
+  return `${line.slice(0, MAX_TEXT - marker.length)}${marker}`;
+}
+
+function describe(ask: Ask): string {
+  const detail = ask.kind === "form" ? formDetail(ask.raw) : JSON.stringify(ask.raw).slice(0, 1200);
+  return `OpenCode thread ${ask.session} asks: ${ask.label}\n${detail}\nAnswer with oc_reply.`;
+}
+
+/** `readSettle` result: the outcome, "gone" for a thread that no longer exists, null to retry. */
+type Read = Settle | "gone" | null;
+
+/**
+ * What a thread produced after `floor`. Rows newer than the idle belong to a run that has not
+ * settled, so the window closes at both ends. A 404 is final; anything else may pass on a retry.
+ */
+async function readSettle(session: string, floor: number): Promise<Read> {
+  let row: any;
+  try {
+    row = (await api<any>("GET", `/api/session/${session}`)).data;
+  } catch (error) {
+    return /HTTP 40[49]/.test(String(error)) ? "gone" : null;
+  }
+  const idleAt = Number(row?.time?.idle ?? 0);
+  // A failed message read has no answer, so let the caller retry instead of reporting "(none)".
+  const rows = await recentRows(session).catch(() => null);
+  if (rows === null) return null;
+  const fresh = rows.filter((entry: any) => {
+    const at = Number(entry?.time?.created ?? 0);
+    return at > floor && at <= idleAt + 1;
+  });
+  const last = fresh.find((entry: any) => entry.type === "assistant") ?? null;
+  const cause = fresh.find((entry: any) => entry.error) ?? null;
+  // A run's own idle row carries its outcome, and the session row can still hold the one before.
+  const idle = fresh.find((entry: any) => entry.type === "idle") ?? null;
+  const open = await asks(session).catch(() => null);
+  return {
+    session,
+    title: String(row?.title ?? ""),
+    outcome: String(idle?.outcome ?? row?.outcome ?? "unknown"),
+    error: errorLine(idle) ?? errorLine(last) ?? errorLine(cause),
+    answer: textOf(last?.content),
+    asks: open ?? [],
+    asksUnknown: open === null,
+    idleAt,
+  };
+}
+
+/** Report shape shared by oc_wait and the wake-up, so the two cannot drift apart. */
+function settleText(s: Settle): string {
+  return [
+    `outcome: ${s.outcome}${s.expired ? " (watch expired; restart with oc_send to read the record)" : ""}`,
+    s.error ?? "error: none",
+    s.answer ? `answer:\n${truncate(s.answer)}` : "answer: (none)",
+    s.asks.length ? `open asks:\n${s.asks.map((ask) => describe(ask)).join("\n")}` : s.asksUnknown ? "open asks: unreadable" : "open asks: none",
+  ].join("\n\n");
+}
+
+function batchLine(s: Settle): string {
+  const body = settleText(s).split("\n").map((line) => `  ${line}`).join("\n");
+  return `- ${s.session}${s.title ? ` ${s.title}` : ""}:\n${body}`;
+}
+
+async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promise<string> {
+  if (ask.kind === "permission") {
+    if (!decision) throw new Error("permission needs decision: once, always, or reject");
+    await api("POST", `/api/session/${ask.session}/permission/${ask.id}/reply`, { decision });
+    return `permission ${ask.id} -> ${decision}`;
+  }
+  if (!answerJson) throw new Error(`form ${ask.id} needs answerJson keyed by field names, for example {"lane":"a"}`);
+  let answer: unknown;
+  try { answer = JSON.parse(answerJson); } catch {
+    throw new Error(`form ${ask.id}: answerJson is not valid JSON. Send one object keyed by field name, for example {"lane":"a"}.`);
+  }
+  await api("POST", `/api/session/${ask.session}/form/${ask.id}/reply`, { answer });
+  return `form ${ask.id} answered`;
+}
+
+export default function (pi: ExtensionAPI) {
+  let ctx: ExtensionContext | undefined;
+  let abort: AbortController | undefined;
+  let state = freshState();
+
+  pi.registerFlag("oc-auto", {
+    type: "boolean",
+    default: false,
+    description: "Answer OpenCode model questions with the local model",
+  });
+
+  /** Hold an ask for a later turn. One copy per id, because a rescan can repeat it. */
+  const queueAsk = (ask: Ask) => {
+    if (!state.pendingAsks.some((entry) => entry.id === ask.id)) state.pendingAsks.push(ask);
+  };
+
+  const deliver = (ask: Ask) => {
+    if (state.reported.has(ask.id)) return;
+    // prompt() refuses during compaction and the refusal never reaches this code (agent-session.js:1648-1650, :2774-2782); queue for afterCompact.
+    if (state.compacting) return queueAsk(ask);
+    state.reported.add(ask.id);
+    // steer reaches a turn that is already running; followUp would wait for it to settle,
+    // and an oc_wait holding that turn would then deadlock against the thread.
+    // sendUserMessage returns void, so a failed send surfaces from Pi, not from here.
+    pi.sendUserMessage(`[opencode] ${describe(ask)}`, { deliverAs: "steer" });
+  };
+
+  // Drain the batch before delivering, so a re-queue cannot spin the loop. Re-read the thread:
+  // an ask answered elsewhere or a deleted thread must not open a late turn. Other read
+  // failures keep the ask, because dropping it loses the thread.
+  const stillOpen = async (ask: Ask): Promise<boolean> => {
+    try {
+      return (await asks(ask.session)).some((entry) => entry.id === ask.id);
+    } catch (error) {
+      return !/HTTP 40[49]/.test(String(error));
+    }
+  };
+  const flushAsks = async () => {
+    const batch = state;
+    for (const ask of batch.pendingAsks.splice(0)) {
+      // A session switch drops this batch: the next run drains its own.
+      if (batch !== state) return;
+      if (batch.reported.has(ask.id)) continue;
+      if (await stillOpen(ask)) {
+        // A session switch during that fetch means this batch has no owner any more.
+        if (batch !== state) return;
+        deliver(ask);
+      }
+    }
+  };
+
+  /** A dialog must not hold the volatile event read loop. */
+  const askUser = async (ask: Ask, context: ExtensionContext) => {
+    const mine = state;
+    // Claim it before the dialog, so a parallel oc_wait cannot re-list this ask.
+    mine.reported.add(ask.id);
+    try {
+      // The dialog asks a human, so it shows the request, not the instructions meant for a model.
+      const ok = await context.ui.confirm("OpenCode asks", `${ask.label}\n${ask.session}\nAllow this request?`);
+      // A session switch closed this ask's owner: leave the answer to the service, not to us.
+      if (mine !== state) return;
+      await replyTo(ask, ok ? "once" : "reject");
+    } catch {
+      if (mine !== state) return;
+      // The reply did not land, so hand the ask back to oc_reply.
+      mine.reported.delete(ask.id);
+      queueAsk(ask);
+    }
+  };
+
+  const offer = (ask: Ask) => {
+    state.known.add(ask.session);
+    if (state.reported.has(ask.id)) return;
+    if (state.mode === "unsupervised") deliver(ask);
+    // A form carries fields, so no yes/no dialog can answer it: it goes to the message path.
+    else if (ask.kind === "permission" && ctx?.hasUI) void askUser(ask, ctx);
+    else if (ctx?.isIdle()) deliver(ask);
+    else queueAsk(ask);
+  };
+
+  /** An ask can name a thread outside ROOT, so the boundary check runs before anyone sees it.
+   * A service blip must not swallow the ask, so retry twice before giving up. */
+  const gateAsk = (ask: Ask, attempt = 0) => {
+    const mine = state;
+    void assertLocal(mine, ask.session)
+      .then(() => {
+        if (mine === state) offer(ask);
+      })
+      .catch((error) => {
+        if (mine !== state || attempt >= 2) return;
+        // 404 and 409 are final: outside ROOT or gone.
+        if (/HTTP 40[49]|outside /.test(String(error))) return;
+        const timer = setTimeout(() => {
+          if (mine === state) gateAsk(ask, attempt + 1);
+        }, 1000);
+        timer.unref?.();
+      });
+  };
+
+  /** After an aborted run a delivered ask is invisible, so re-offer what the thread still holds. */
+  const recoverAsks = async (mine: BridgeState) => {
+    for (const session of mine.known) {
+      try {
+        for (const ask of await asks(session)) {
+          if (mine !== state) return;
+          if (mine.reported.delete(ask.id)) offer(ask);
+        }
+      } catch {
+        // A dead thread must not stop the recovery of the others.
+      }
+    }
+  };
+
+  const armFlush = (mine: BridgeState) => {
+    if (mine.batchTimer || !mine.batch.length) return;
+    mine.batchTimer = setTimeout(() => {
+      mine.batchTimer = null;
+      flushSettles(mine);
+    }, DEBOUNCE_MS);
+    mine.batchTimer.unref?.();
+  };
+
+  /** One message per batch. followUp, because a settle is news for the next turn, not a steer. */
+  function flushSettles(mine: BridgeState): void {
+    if (mine !== state) return;
+    if (mine.held) {
+      // Keep the batch for the next run the human starts; armFlush runs when that run settles.
+      if (mine.batch.length) mine.batchWaited = true;
+      return;
+    }
+    if (mine.compacting) return;  // keep the batch; afterCompact re-arms the flush
+    const batch = mine.batch;
+    mine.batch = [];
+    const waited = mine.batchWaited;
+    mine.batchWaited = false;
+    const context = ctx;
+    if (!batch.length || !context) return;
+    // Print and JSON have no idle agent, and a message there can extend a run that meant to exit.
+    if (context.mode === "print" || context.mode === "json") return;
+    const count = batch.length === 1 ? "One OpenCode thread" : `${batch.length} OpenCode threads`;
+    const head = `${count}${waited ? " settled while the run was cancelled" : " settled"}:`;
+    const text = `${head}\n${batch.map(batchLine).join("\n")}\n\nRead a thread with oc_read, then continue the task that started it.`;
+    for (const settle of batch) markReported(settle.asks);
+    // prompt() ignores deliverAs while idle and queues on it while busy (agent-session.js:1664-1677),
+    // so one call covers both states.
+    pi.sendUserMessage(text, { deliverAs: "followUp" });
+  }
+
+  /** A delivered text hands these asks to the model, so a rescan must not re-offer them (:605). */
+  const markReported = (asks: Ask[]) => {
+    for (const ask of asks) state.reported.add(ask.id);
+  };
+
+  /** Hand a settle to a waiting oc_wait, or queue it for the next batch turn. */
+  const deliverSettle = (settle: Settle) => {
+    const mine = state;
+    mine.claimed.delete(settle.session);
+    // A settled thread with no open ask needs no rescan, so release it from the reconnect list.
+    if (!settle.asks.length && !settle.asksUnknown) mine.known.delete(settle.session);
+    paneCall(["rm", settle.session]);
+    const waiters = mine.waiters.get(settle.session);
+    if (waiters?.length) {
+      mine.waiters.delete(settle.session);
+      markReported(settle.asks);
+      for (const done of waiters) done(settle);
+      return;
+    }
+    mine.batch.push(settle);
+    armFlush(mine);
+  };
+
+  /**
+   * One detector for the stream and the backstop. Claim is synchronous, so the two cannot read the
+   * same settle twice. A thread whose prompt POST is still open is skipped: that settle belongs to
+   * the run before the send, and the backstop will catch the real one.
+   */
+  const detect = async (session: string) => {
+    const mine = state;
+    const w = mine.armed.get(session);
+    if (!w || mine.claimed.has(session) || mine.sending.has(session)) return;
+    mine.claimed.add(session);
+    const read = await readSettle(session, w.floor).catch(() => null);
+    if (mine !== state) return;
+    // A send during the read replaced that watch, so this result belongs to a run nobody waits on.
+    if (mine.armed.get(session) !== w || mine.sending.has(session)) return void mine.claimed.delete(session);
+    if (read === "gone") {
+      forget(state, session);
+      drawHud();
+      return;
+    }
+    if (!read) return void mine.claimed.delete(session);
+    // An event that predates the send reports another run, so it must not spend the watch.
+    if (read.idleAt <= w.floor) return void mine.claimed.delete(session);
+    dropThread(session, read);
+    deliverSettle(read);
+  };
+
+  /** Backstop for frames the volatile stream dropped, and for watches that outlive their run.
+   * Reads run in parallel: a serial pass costs one service round trip per armed thread. */
+  const sweep = async () => {
+    const mine = state;
+    const reads: Array<{ session: string; w: Watch }> = [];
+    for (const [session, w] of [...mine.armed]) {
+      if (Date.now() > w.deadline) {
+        const expired: Settle = {
+          // Nothing was read: the outcome and asks are unknown, not "running"/"none", and asksUnknown keeps the thread in `known` (:681) so a rescan re-checks it.
+          session, title: "", outcome: "unknown", error: null, answer: "", asks: [],
+          asksUnknown: true, idleAt: Date.now(), expired: true,
+        };
+        // Pass the settle, so an oc_wait holding this thread gets it instead of null.
+        dropThread(session, expired);
+        deliverSettle(expired);
+        continue;
+      }
+      if (mine.sending.has(session) || mine.claimed.has(session)) continue;
+      // Claim before the read, so a reconnect sweep and the backstop cannot read one thread twice.
+      mine.claimed.add(session);
+      reads.push({ session, w });
+    }
+    const results = await Promise.all(reads.map(({ session, w }) => readSettle(session, w.floor).catch(() => null)));
+    if (mine !== state) return;
+    for (const [index, read] of results.entries()) {
+      const { session, w } = reads[index];
+      // A send or a stop during the read owns the thread now, so this result is stale.
+      if (mine.armed.get(session) !== w || mine.sending.has(session)) {
+        mine.claimed.delete(session);  // or detect/sweep skip it until the 30 min TTL (:701, :732)
+        continue;
+      }
+      if (read === "gone") {
+        forget(state, session);
+        drawHud();
+        continue;
+      }
+      if (read && read.idleAt > w.floor) {
+        // Disarm here: the stream path does, and a watch left armed re-delivers every sweep.
+        dropThread(session, read);
+        deliverSettle(read);
+      } else mine.claimed.delete(session);
+    }
+  };
+
+  /** Wait for the next settle of this thread. Timeout or abort unregisters and keeps the watch. */
+  const waitForSettle = (
+    mine: BridgeState,
+    session: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<Settle | null> =>
+    new Promise((resolve) => {
+      const drop = () => {
+        clearTimeout(timeout);
+        const rest = (mine.waiters.get(session) ?? []).filter((fn) => fn !== done);
+        if (rest.length) mine.waiters.set(session, rest);
+        else mine.waiters.delete(session);
+        resolve(null);
+      };
+      const done = (settle: Settle | null) => {
+        clearTimeout(timeout);
+        resolve(settle);
+      };
+      const list = mine.waiters.get(session) ?? [];
+      list.push(done);
+      mine.waiters.set(session, list);
+      const timeout = setTimeout(drop, limit * 1000);
+      timeout.unref?.();
+      // An abort that landed before the wait would otherwise never fire its listener.
+      if (signal?.aborted) drop();
+      else signal?.addEventListener("abort", drop, { once: true });
+    });
+
+  const onEvent = (event: { type?: string; data?: any }) => {
+    const type = event.type ?? "";
+    // A settle only matters for a thread this session armed, and that check stays synchronous.
+    if (type.startsWith("session.execution.")) {
+      const settled = String(event.data?.sessionID ?? "");
+      if (state.armed.has(settled)) void detect(settled);
+      return;
+    }
+    if (type !== "permission.asked" && type !== "form.created") return;
+    // form.created wraps its payload in data.form; permission.asked stays flat.
+    const payload: any = type === "form.created" ? (event.data?.form ?? event.data) : event.data;
+    // A form can sit on the service rather than on a thread, so a non-session id has no thread to offer.
+    if (!String(payload?.sessionID ?? "").startsWith("ses")) return;
+    gateAsk({
+      kind: type === "form.created" ? "form" : "permission",
+      session: payload.sessionID,
+      id: payload.id,
+      label: payload.action
+        ? `${payload.action} ${payload.resources?.join(", ") ?? ""}`.trim()
+        : `form ${payload.title ?? payload.id}`,
+      raw: payload,
+    });
+  };
+
+  /** List open asks and re-check armed threads for every known thread: a reconnect misses that gap. */
+  const rescan = async () => {
+    for (const session of state.known) {
+      try {
+        for (const ask of await asks(session)) offer(ask);
+      } catch {
+        // A dead thread must not stop the rescan of the others.
+      }
+    }
+    await sweep();
+  };
+
+  /** Split one connection into frames; a bad frame must not drop the frames behind it. */
+  const readStream = async (body: NonNullable<Response["body"]>) => {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for await (const chunk of body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      // Keep a trailing CR for one chunk, because its LF may open the next chunk.
+      const held = buffer.endsWith("\r");
+      buffer = (held ? buffer.slice(0, -1) : buffer).replace(/\r\n?/g, "\n") + (held ? "\r" : "");
+      let cut = buffer.indexOf("\n\n");
+      while (cut >= 0) {
+        const frame = buffer.slice(0, cut);
+        buffer = buffer.slice(cut + 2);
+        cut = buffer.indexOf("\n\n");
+        // One frame can carry its JSON on several data lines; join them first.
+        const data = frame
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).replace(/^ /, ""))
+          .join("\n");
+        if (!data) continue;
+        try {
+          onEvent(JSON.parse(data));
+        } catch {
+          // The buffer is already past this frame, so the frames behind it still arrive.
+        }
+      }
+    }
+  };
+
+  /** SSE carries asks and settles. The stream is volatile, so `sweep` backs it up on a timer. */
+  const watch = async (signal: AbortSignal) => {
+    while (!signal.aborted) {
+      try {
+        const svc = (service ??= await discover());
+        const types = [
+          "permission.asked",
+          "form.created",
+          "session.execution.succeeded",
+          "session.execution.failed",
+          "session.execution.interrupted",
+        ]
+          .map((type) => `types=${encodeURIComponent(type)}`)
+          .join("&");
+        const res = await fetch(`${svc.url}/api/event?${types}`, {
+          headers: {
+            authorization: "Basic " + Buffer.from(`opencode:${svc.password}`).toString("base64"),
+            accept: "text/event-stream",
+          },
+          signal,
+        });
+        // Bad auth or a dead service answers with a JSON body, which holds no frame. Without
+        // this check the reader returns at once and the loop spins with no delay.
+        if (!res.ok || !res.body || !String(res.headers.get("content-type")).includes("text/event-stream")) {
+          throw new Error(`event stream HTTP ${res.status}`);
+        }
+        // This stream carries only later events, so read the gap before taking new ones.
+        await rescan();
+        if (signal.aborted) return;
+        await readStream(res.body);
+        // The stream is volatile by contract, so even a clean end waits before reconnecting. The
+        // sleep is unref'd and abort-aware, so a shutdown never waits on a reconnect pause.
+        await sleep(1000, signal);
+      } catch {
+        if (signal.aborted) return;
+        service = null;
+        await sleep(3000, signal);
+      }
+    }
+  };
+
+  /** Unref'd, abort-aware pause: quitting must not wait out a reconnect delay. */
+  const sleep = (ms: number, signal: AbortSignal) =>
+    new Promise<void>((done) => {
+      const stop = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", stop);
+        done();
+      };
+      const timer = setTimeout(stop, ms);
+      timer.unref?.();
+      signal.addEventListener("abort", stop, { once: true });
+    });
+
+  /**
+   * Arm before the POST: a run that fails in milliseconds writes time.idle before the POST
+   * returns. A definitive 4xx means the prompt never landed, so the watch goes with it; a timeout
+   * keeps the watch, because the service may be running that prompt.
+   */
+  const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
+    const mine = state;
+    const previous = mine.armed.get(session);
+    armThread(session);
+    mine.sending.set(session, (mine.sending.get(session) ?? 0) + 1);
+    try {
+      await api("POST", `/api/session/${session}/prompt`, body);
+      // This send supersedes any snapshot still waiting to wake the model.
+      mine.batch = mine.batch.filter((entry) => entry.session !== session);
+    } catch (error) {
+      if (/HTTP 404/.test(String(error))) dropThread(session);
+      else if (previous) mine.armed.set(session, previous);
+      // No earlier watch: a 409 run is not one we armed, other 4xx mean the prompt never landed. Either way the fresh watch is a phantom the sweep would expire into a lie (:721-726).
+      else if (/HTTP 4\d\d/.test(String(error))) dropThread(session);
+      throw error;
+    } finally {
+      const left = (mine.sending.get(session) ?? 1) - 1;
+      // One send finishing must not uncover a sibling send that is still in flight.
+      if (left > 0) mine.sending.set(session, left);
+      else mine.sending.delete(session);
+    }
+  };
+
+  const armThread = (session: string, floor = Date.now()): void => {
+    const now = Date.now();
+    if (!state.armed.has(session) && state.armed.size >= MAX_THREADS) {
+      // Refuse rather than evict: an evicted watch loses that thread's wake-up in silence.
+      throw new Error(`${MAX_THREADS} threads in flight; wait for one to settle with oc_wait.`);
+    }
+    state.armed.set(session, { floor, deadline: now + WATCH_TTL_MS });
+    drawHud();
+  };
+
+  /** Forget an in-flight run here, then show the new count. */
+  const dropThread = (session: string, settle?: Settle): void => {
+    disarm(state, session, settle);
+    drawHud();
+  };
+
+  /** Footer count plus the table above the editor; a TUI timer refreshes the age and TTL. */
+  function drawHud(): void {
+    const context = ctx;
+    if (!HUD || !context || context.mode !== "tui") return;
+    const now = Date.now();
+    const rows = [...state.armed].map(([session, w]) => {
+      const label = state.labels.get(session) ?? state.dirs.get(session)?.split("/").pop() ?? "-";
+      return `${session}  ${Math.round((now - w.floor) / 1000)}s  left ${Math.max(0, Math.round((w.deadline - now) / 1000))}s  ${label}`;
+    });
+    const count = rows.length;
+    context.ui.setStatus("oc", count ? `${count} ${count === 1 ? "thread" : "threads"} running` : undefined);
+    context.ui.setWidget("oc", count ? ["OpenCode threads", ...rows] : undefined, { placement: "aboveEditor" });
+  }
+
+  /** Drop the last session's state and release everything still waiting on it. */
+  const reset = () => {
+    const old = state;
+    // Columns belong to the run that opened them, so a switch or shutdown closes them.
+    for (const session of old.armed.keys()) paneCall(["rm", session]);
+    state = freshState();
+    if (old.batchTimer) clearTimeout(old.batchTimer);
+    old.batch = [];
+    for (const list of old.waiters.values()) for (const done of list) done(null);
+    old.waiters.clear();
+  };
+
+  let hudTimer: ReturnType<typeof setInterval> | null = null;
+  let backstop: ReturnType<typeof setInterval> | null = null;
+  let sweeping = false;
+  const startBackstop = () => {
+    stopBackstop();
+    backstop = setInterval(() => {
+      if (sweeping || !state.armed.size) return;
+      sweeping = true;
+      void sweep()
+        .catch(() => {})
+        .finally(() => {
+          sweeping = false;
+        });
+    }, BACKSTOP_MS);
+    backstop.unref?.();
+  };
+  const stopBackstop = () => {
+    if (backstop) clearInterval(backstop);
+    backstop = null;
+  };
+
+  pi.on("session_start", (_event, context) => {
+    ctx = context;
+    // Panes need a terminal, so print, JSON, and RPC runs never open a column.
+    panesOn = context.mode === "tui";
+    reset();
+    // Restore armed floors from the last session; the deadline gets a fresh TTL.
+    const saved = (context.sessionManager.getEntries()
+      .findLast((e: any) => e.type === "custom" && e.customType === "oc-armed") as
+      { data?: Array<{ session: string; floor: number }> } | undefined)?.data;
+    for (const row of saved ?? []) state.armed.set(row.session, { floor: row.floor, deadline: Date.now() + WATCH_TTL_MS });
+    if (pi.getFlag("oc-auto") === true) state.mode = "unsupervised";
+    abort?.abort();
+    abort = new AbortController();
+    void watch(abort.signal);
+    startBackstop();
+    drawHud();
+    if (context.mode === "tui") {
+      hudTimer = setInterval(() => { if (state.armed.size) drawHud(); }, 1000);
+      hudTimer.unref?.();
+    }
+  });
+
+  pi.on("session_shutdown", () => {
+    abort?.abort();
+    abort = undefined;
+    ctx = undefined;
+    stopBackstop();
+    if (hudTimer) clearInterval(hudTimer);
+    hudTimer = null;
+    // Save armed floors; the next session_start restores them with a fresh TTL.
+    if (state.armed.size) pi.appendEntry("oc-armed",
+      [...state.armed].map(([session, w]) => ({ session, floor: w.floor })));
+    reset();
+    panesOn = false;
+  });
+
+  // Only human input arms the release: a wake-up this bridge sent must not lift its own hold.
+  pi.on("input", (event) => {
+    if (event.source === "interactive" || event.source === "rpc") {
+      state.pendingRelease = true;
+      void flushAsks().catch(() => {});
+    }
+    return { action: "continue" };
+  });
+
+  pi.on("agent_settled", (event) => {
+    const mine = state;
+    // Escape ends a run the human dropped, so its wake-ups wait for the next thing they send.
+    if (event.aborted) {
+      mine.pendingRelease = false;  // the human message armed a run that just died; next input re-arms (:1027)
+      mine.held = true;
+      return;
+    }
+    const human = mine.pendingRelease;
+    if (human) {
+      mine.held = false;
+      mine.pendingRelease = false;
+      void recoverAsks(mine).catch(() => {});
+      void flushAsks().catch(() => {});
+    }
+    armFlush(mine);
+  });
+
+  pi.on("session_before_compact", () => { state.compacting = true; });
+  const afterCompact = () => {
+    setTimeout(() => {  // manual controller clears after this emit returns: agent-session.js:2321
+      state.compacting = false;
+      void flushAsks().catch(() => {});
+      armFlush(state);
+    }, 0).unref?.();
+  };
+  pi.on("session_compact", afterCompact);
+  pi.on("session_compact_failed", afterCompact);  // catch path clears first: agent-session.js:2335
+
+  const ns = {
+    name: "opencode",
+    aliases: ["oc"],
+    description: "Hand threads to cheap remote models over the local OpenCode service.",
+    instructions: `Print, JSON, and a Pi reload carry no wake-up; there oc_wait is the collector. In auto mode the local model receives the thread's asks and answers them with oc_reply.`,
+  };
+
+  const sessionParam = { session: Type.String({ pattern: "^ses", description: "ses_… id from oc_open" }) };
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_models",
+      label: "OC models",
+      description: "List cheap OpenCode models the account serves now, with provider prefixes.",
+      namespace: ns,
+      annotations: { readOnlyHint: true },
+      parameters: Type.Object({}),
+      async execute() {
+        const { ids, variants } = await cheapModels(true);
+        const text = ids
+          .map((id) => {
+            const ladder = variants.get(id);
+            const shown = ladder === undefined ? "unknown" : ladder.length ? ladder.join("|") : "none";
+            const keep = RETENTION.find(([key]) => id.endsWith(key))?.[1];
+            return `${id}  variants: ${shown}${keep ? `  retention: ${keep}` : ""}`;
+          })
+          .join("\n");
+        return { content: [{ type: "text", text }], details: undefined };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_open",
+      label: "OC open",
+      description: "Open a thread for one self-contained task; returns its id.",
+      namespace: ns,
+      annotations: { openWorldHint: true },
+      parameters: Type.Object({
+        model: Type.String({ description: "Model id from oc_models, with or without its provider prefix" }),
+        variant: Type.Optional(
+          Type.String({
+            description: "Effort from the model's ladder in oc_models. Defaults to high when offered.",
+          }),
+        ),
+        title: Type.String({ description: "Name for the HUD row and the thread list" }),
+        brief: Type.Optional(Type.String({ description: "First instruction: goal, constraints, paths, output shape." })),
+        directory: Type.Optional(Type.String({ description: `Subfolder of ${ROOT}, for example "lane-a". Defaults to ${ROOT}.` })),
+        permissionsJson: Type.Optional(
+          Type.String({
+            description:
+              'OpenCode ruleset that must ask before acting, for example [{"action":"*","resource":"*","effect":"ask"}]',
+          }),
+        ),
+      }),
+      async execute(_id, params) {
+        const model = await requireModel(params.model);
+        const variant = pickVariant(params.variant, model.variants);
+        const dir = directory(params.directory);
+        const created = await api("POST", "/api/session", {
+          title: params.title,
+          model: { id: model.id, providerID: model.providerID, ...(variant ? { variant } : {}) },
+          location: { directory: dir },
+          ...(params.permissionsJson ? { permissions: JSON.parse(params.permissionsJson) } : {}),
+        });
+        const session = created.data.id as string;
+        state.known.add(session);
+        state.local.add(session);
+        state.dirs.set(session, dir);
+        state.labels.set(session, model.id);
+        let sent = "";
+        if (params.brief) {
+          // The thread exists, so a failed brief still has to hand back its id.
+          try {
+            await sendPrompt(session, { text: params.brief });
+            if (state.armed.has(session)) paneCall(["add", session, dir]);
+            sent = "\nbrief sent, wake-up armed";
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return {
+              content: [{ type: "text", text: `${session}\nbrief failed: ${message}` }],
+              details: { session },
+              isError: true,
+            };
+          }
+        }
+        return { content: [{ type: "text", text: `${session}${sent}` }], details: { session } };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_send",
+      label: "OC send",
+      description: "Hand an instruction to a thread; returns at once, the settle opens a later turn.",
+      namespace: ns,
+      annotations: { openWorldHint: true },
+      parameters: Type.Object({
+        ...sessionParam,
+        text: Type.String({ description: "Instruction for the delegated model" }),
+      }),
+      async execute(_id, params) {
+        await assertLocal(state, params.session);
+        state.known.add(params.session);
+        await sendPrompt(params.session, { text: params.text });
+        if (state.armed.has(params.session)) paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
+        return {
+          content: [{ type: "text", text: "sent; the settle will open a turn, keep working" }],
+          details: { session: params.session },
+        };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_wait",
+      label: "OC wait",
+      description:
+        "Collect a thread's settle in this turn, when this turn needs the answer or no wake-up can arrive.",
+      namespace: ns,
+      annotations: { readOnlyHint: true },
+      parameters: Type.Object({
+        ...sessionParam,
+        since: Type.Optional(Type.Number({ description: "Read rows after this Unix ms; 0 reads the whole record. Omit it to start from the thread's current state." })),
+        timeoutSec: Type.Optional(Type.Number({ description: `Seconds before the wait gives up. Max ${WAIT_MAX_S}, default ${WAIT_MAX_S}.` })),
+      }),
+      async execute(_id, params, signal) {
+        await assertLocal(state, params.session);
+        const mine = state;
+        state.known.add(params.session);
+        let w = mine.armed.get(params.session);
+        // A Pi reload drops the watch, and print and JSON never had one. A thread that is still
+        // running owes this call its settle, so take a floor behind its in-flight rows and wait.
+        if (!w && params.since === undefined) {
+          const row = (await api<any>("GET", `/api/session/${params.session}`).catch(() => null))?.data;
+          if (busy(row)) {
+            try {
+              armThread(params.session, Number(row?.time?.idle ?? 0));
+              w = mine.armed.get(params.session);
+            } catch {
+              // At the watch ceiling: read the record below instead of waiting.
+            }
+          }
+        }
+        const floor = params.since ?? w?.floor ?? 0;
+        // A settle that already reached the batch is this call's answer: take it, do not wake twice.
+        const queued = mine.batch.findIndex((entry) => entry.session === params.session);
+        let settle = queued >= 0 ? mine.batch.splice(queued, 1)[0] : null;
+        // was: if (settle) mine.claimed.delete(...) — dead: every batch append clears the claim (:698).
+        if (settle && !mine.batch.length) mine.batchWaited = false;
+        // `since` reads the record instead of waiting, and a thread with no watch owes no wake-up.
+        if (!settle && w && params.since === undefined) {
+          const limit = Math.min(Math.max(params.timeoutSec ?? WAIT_MAX_S, 0), WAIT_MAX_S);
+          settle = await waitForSettle(mine, params.session, limit, signal);
+        }
+        // Escape cancelled this call. Give back anything this call took, so the wake-up still carries it.
+        if (signal?.aborted) {
+          if (settle) {
+            mine.batch.push(settle);
+            armFlush(mine);
+          }
+          return {
+            content: [{ type: "text", text: "wait cancelled; the settle stays queued" }],
+            details: { session: params.session, settled: false, asks: [] as Ask[] },
+          };
+        }
+        if (!settle && params.since === undefined && mine.armed.has(params.session)) {
+          const seconds = Math.min(Math.max(params.timeoutSec ?? WAIT_MAX_S, 0), WAIT_MAX_S);
+          return {
+            content: [{ type: "text", text: `still running after ${seconds}s; the watch stays armed` }],
+            details: { session: params.session, settled: false, asks: [] as Ask[] },
+          };
+        }
+        // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
+        const read = settle ?? (await readSettle(params.session, floor));
+        // The read spanned a session switch, so this result belongs to no live watch.
+        if (mine !== state) return { content: [{ type: "text", text: "Pi session switched; retry" }], details: undefined };
+        if (read === "gone" || read === null) {
+          if (read === "gone") forget(state, params.session);
+          return {
+            content: [{ type: "text", text: read === "gone" ? "thread is gone" : "thread unreadable" }],
+            details: { session: params.session, settled: false, asks: [] as Ask[] },
+            isError: true,
+          };
+        }
+        // No idle row after that point means nothing settled yet: say so, and keep the watch armed
+        // for the settle that is coming.
+        if (settle === null && read.idleAt <= (params.since ?? 0)) {
+          return {
+            content: [{
+              type: "text",
+              text: `no settle after ${params.since ?? floor}; ${
+                mine.armed.has(params.session)
+                  ? "the watch stays armed"
+                  : "no watch is armed and no wake-up will come; oc_send starts the run"
+              }`,
+            }],
+            details: { session: params.session, settled: false, asks: read.asks },
+          };
+        }
+        // The answer reached Pi, so the column has nothing left to show live. Keep the watch only when
+        // a newer run is still going, so a finished run never wakes twice.
+        const armedNow = mine.armed.get(params.session);
+        if (!read.expired && read.idleAt > floor && (!armedNow || read.idleAt > armedNow.floor)) dropThread(params.session);
+        return {
+          content: [{ type: "text", text: settleText(read) }],
+          details: { session: params.session, settled: !read.asksUnknown, asks: read.asks },
+        };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_read",
+      label: "OC read",
+      description: "Show a thread's latest messages; parts=full adds reasoning and tool calls.",
+      namespace: ns,
+      annotations: { readOnlyHint: true },
+      parameters: Type.Object({
+        ...sessionParam,
+        limit: Type.Optional(Type.Number({ description: "Messages to read, newest first, default 6, max 25" })),
+        parts: Type.Optional(
+          Type.Union([Type.Literal("text"), Type.Literal("full")], {
+            description: "full adds reasoning and tool input, status, and results",
+          }),
+        ),
+        offset: Type.Optional(
+          Type.Number({ description: "Characters to skip in each message body, to read past the 4000-char cap" }),
+        ),
+      }),
+      async execute(_id, params) {
+        await assertLocal(state, params.session);
+        const want = Math.min(Math.max(params.limit ?? 6, 1), 25);
+        const rows =
+          (await api("GET", `/api/session/${params.session}/message?order=desc&limit=${want + 2}`)).data ?? [];
+        // An idle row carries only a status, so it must not crowd out the answer.
+        const answer = rows.filter((row: any) => row.type !== "idle").slice(0, want);
+        const shown = answer.length ? answer : rows.slice(0, want);
+        state.known.add(params.session);
+        const full = params.parts === "full";
+        const at = Math.max(0, params.offset ?? 0);
+        const text = shown.map((row: any) => rowBlock(row, full, at)).join("\n\n");
+        // Rows are capped each, so cap the whole result too: 25 long rows still overflow a context.
+        const capped = text.length > 24_000 ? `${text.slice(0, 24_000)}\n… result capped; narrow limit or use offset` : text;
+        return { content: [{ type: "text", text: capped || "empty" }], details: undefined };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_reply",
+      label: "OC reply",
+      description: "Answer a thread's open permission or form ask by id.",
+      namespace: ns,
+      annotations: { openWorldHint: true },
+      parameters: Type.Object({
+        ...sessionParam,
+        id: Type.String({ description: "Ask id from the thread: per_… or frm_…" }),
+        decision: Type.Optional(
+          Type.Union([Type.Literal("once"), Type.Literal("always"), Type.Literal("reject")], {
+            description: "For a permission",
+          }),
+        ),
+        answerJson: Type.Optional(
+          Type.String({ description: 'For a form, JSON keyed by field name: {"lane":"a"}' }),
+        ),
+      }),
+      async execute(_id, params) {
+        await assertLocal(state, params.session);
+        // The service decides which kind an id carries: a wrong kind would 404 and read back as
+        // "already settled" while the ask stays open.
+        const open = await asks(params.session).catch(() => null);
+        const ask = open?.find((entry) => entry.id === params.id);
+        if (open && !ask) {
+          return {
+            content: [{ type: "text", text: `${params.id} is not open on ${params.session}. oc_wait lists its open asks.` }],
+            details: { openAsks: open.map((entry) => `${entry.kind} ${entry.id}`) },
+            isError: true,
+          };
+        }
+        // Without the ask list the kind is unknown, and a wrong kind reads back as "already settled".
+        if (!open) {
+          return {
+            content: [{ type: "text", text: `Cannot read the asks on ${params.session}. Retry oc_reply.` }],
+            details: undefined,
+            isError: true,
+          };
+        }
+        let text: string;
+        try {
+          text = await replyTo(ask!,
+            params.decision,
+            params.answerJson,
+          );
+        } catch (error) {
+          // A settled ask answers 404 or 409; that is a result, not a crash.
+          const message = error instanceof Error ? error.message : String(error);
+          if (!/AlreadySettled|not found|HTTP 40[49]/i.test(message)) throw error;
+          text = `${params.id} is already settled or gone. Read the thread with oc_read.`;
+        }
+        state.reported.add(params.id);
+        return { content: [{ type: "text", text }], details: undefined };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_stop",
+      label: "OC stop",
+      description: "Interrupt a running thread; no settle or wake-up follows.",
+      namespace: ns,
+      annotations: { destructiveHint: true },
+      parameters: Type.Object(sessionParam),
+      async execute(_id, params) {
+        await assertLocal(state, params.session);
+        // Unwatch first: this call carries the result, so the interrupted event owes no turn. Waiters
+        // stay, because a failed interrupt leaves the run live for them.
+        const prior = state.armed.get(params.session);
+        // A settle the stream missed sits in the batch; unwatch would erase it (:176), so this call carries it.
+        const queuedIndex = state.batch.findIndex((entry) => entry.session === params.session);
+        const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
+        unwatch(state, params.session);
+        const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${params.session}/interrupt`).catch((error) => {
+          // The POST failed, so a run may still be going: the watch goes back.
+          if (prior) state.armed.set(params.session, prior);
+          if (queued) state.batch.push(queued);
+          drawHud();
+          throw error;
+        });
+        releaseWaiters(state, params.session);
+        const hit = result.interrupted === true;
+        paneCall(["rm", params.session]);
+        return {
+          content: [{ type: "text", text: `${hit ? "interrupted" : "no run to interrupt"}${queued ? `\n\nThe run had already settled:\n${settleText(queued)}` : ""}` }],
+          details: { interrupted: hit },
+        };
+      },
+    }),
+  );
+
+  /** Toast in a terminal. Print, JSON, and RPC modes own stdout, so they get no text. */
+  const say = (context: ExtensionContext, text: string) => {
+    if (context.hasUI) context.ui.notify(text, "info");
+    // stderr stays free in print, JSON, and RPC runs, because stdout carries the protocol.
+    else process.stderr.write(`${text}\n`);
+  };
+
+  pi.registerCommand("oc", {
+    description: "OpenCode bridge status: mode, service, threads",
+    handler: async (_args, context) => {
+      ctx = context;
+      const rows = ((await api<any>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot).slice(0, 8);
+      say(
+        context,
+        [
+          `mode: ${state.mode}`,
+          `service: ${(service ??= await discover()).url}`,
+          `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
+          `cheap: ${(await cheapModels()).ids.join(", ")}`,
+          ...rows.map((row: any) => `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title ?? ""}`),
+        ].join("\n"),
+      );
+    },
+  });
+
+  pi.registerCommand("oc-auto", {
+    description: "Answer OpenCode asks from the local model for this session",
+    handler: async (_args, context) => {
+      state.mode = "unsupervised";
+      void flushAsks().catch(() => {});
+      say(context, "OpenCode bridge: auto — model questions go to the local model");
+    },
+  });
+
+  pi.registerCommand("oc-accept", {
+    description: "Supervise asks yourself: dialog for permissions, chat for forms",
+    handler: async (_args, context) => {
+      state.mode = "supervised";
+      say(context, "OpenCode bridge: supervised — you answer every request");
+    },
+  });
+
+  pi.registerCommand("oc-kill", {
+    description: "Stop a thread by id",
+    handler: async (args, context) => {
+      const session = args.trim();
+      if (!session.startsWith("ses_")) return say(context, "usage: /oc-kill <ses_...>");
+      await assertLocal(state, session);
+      const prior = state.armed.get(session);
+      // A settle the stream missed sits in the batch; unwatch would erase it (:176), so this call carries it.
+      const queuedIndex = state.batch.findIndex((entry) => entry.session === session);
+      const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
+      unwatch(state, session);
+      const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`).catch((error) => {
+        if (prior) state.armed.set(session, prior);
+        if (queued) state.batch.push(queued);
+        drawHud();
+        throw error;
+      });
+      releaseWaiters(state, session);
+      paneCall(["rm", session]);
+      say(context, `${result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`}${queued ? `\n\nThe run had already settled:\n${settleText(queued)}` : ""}`);
+    },
+  });
+
+  /** Threads pile up from smoke tests and finished briefs. Dry run lists, force deletes. */
+  pi.registerCommand("oc-clean", {
+    description: "List finished threads under the root; force deletes",
+    handler: async (args, context) => {
+      ctx = context;
+      const rows = ((await api<any>("GET", "/api/session?limit=200")).data ?? []).filter(underRoot);
+      const kept = rows.filter(busy);
+      const done = rows.filter((row: any) => !busy(row));
+      const line = (row: any) =>
+        `${row.id}  ${row.model?.id ?? "-"}  ${row.outcome ?? "-"}  ${Math.round(
+          (Date.now() - Number(row?.time?.updated ?? 0)) / 60_000,
+        )}m  out ${(row.tokens?.output ?? 0) + (row.tokens?.reasoning ?? 0)}  ${row.title ?? ""}`;
+      if (!done.length) return say(context, `oc-clean: nothing to delete, ${kept.length} busy kept`);
+      if (args.trim() !== "force") {
+        return say(
+          context,
+          [
+            `dry run: ${done.length} under ${ROOT}, ${kept.length} busy kept`,
+            ...done.map(line),
+            "run /oc-clean force to delete these",
+          ].join("\n"),
+        );
+      }
+      let deleted = 0;
+      let racing = 0;
+      const failed: string[] = [];
+      for (const row of done) {
+        try {
+          // A run can start between the list and the delete, so re-read before cutting.
+          if (busy((await api<any>("GET", `/api/session/${row.id}`)).data)) {
+            racing++;
+            continue;
+          }
+          await api("DELETE", `/api/session/${row.id}`);
+          paneCall(["rm", row.id]);
+          forget(state, row.id);
+          deleted++;
+        } catch (error) {
+          failed.push(`${row.id}: ${error instanceof Error ? error.message : error}`);
+        }
+      }
+      drawHud();
+      say(context, [`oc-clean: deleted ${deleted}, kept ${kept.length + racing} busy`, ...failed].join("\n"));
+    },
+  });
+
+  /** Foreground on purpose: the operator wants the answer, not a detached attempt. */
+  pi.registerCommand("oc-panes", {
+    description: "Open, close, or list the Ghostty columns for live threads",
+    handler: async (args, context) => {
+      const sub = args.trim().split(/\s+/)[0] || "list";
+      if (!panesOn) return say(context, "OpenCode columns: off outside a terminal");
+      if (!PANES) return say(context, "OpenCode columns: off (OC_PANES=0)");
+      if (!existsSync(PANES)) return say(context, `OpenCode columns: missing ${PANES}`);
+      if (!["open", "close", "list"].includes(sub)) return say(context, "usage: /oc-panes open | close | list");
+      try {
+        const out = execFileSync(PANES, [sub], { encoding: "utf8", timeout: 20_000 }).trim();
+        say(context, out || `OpenCode columns: ${sub} done`);
+      } catch (error) {
+        say(context, `OpenCode columns: ${sub} failed: ${(error as Error).message}`);
+      }
+    },
+  });
+}

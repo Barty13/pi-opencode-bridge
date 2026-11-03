@@ -1,0 +1,277 @@
+#!/bin/bash
+# oc-panes: one Ghostty column per OpenCode thread, driven from Pi.
+#
+# Ghostty exposes an AppleScript dictionary (Ghostty 1.3+): split, input text, send key,
+# perform action. That is enough to grow and shrink columns without tmux or Accessibility.
+#
+# Safety: this script types only into panes it created. Existing panes are used as split
+# anchors, never as input targets, so no command ever lands in a shell Pi does not own.
+#
+# Usage:
+#   oc-panes open [--window ID]   adopt the front (or given) window as the viewer
+#   oc-panes spawn [--font N]     create a small window (49x17: macOS ignores size flags)
+#   oc-panes add <ses_id> [dir]   new column running `opencode --session <ses_id>`
+#   oc-panes rm <ses_id>          close that column with `exit`
+#   oc-panes list                 window, anchor, columns
+#   oc-panes prune                drop tab entries for deleted sessions, prints the count
+#   oc-panes close                close every column Pi made, keep the window
+#
+# Env: OC_PANES_FONT (default 13, Ghostty's own default). OC_PANES=0 stops the bridge
+# calling this. Widths are Ghostty's own: every add equalizes, so columns stay even.
+set -uo pipefail
+
+STATE="${HOME}/.pi/agent/state/oc-panes.tsv"
+FONT="${OC_PANES_FONT:-13}"
+COLS="${OC_PANES_COLS:-0}"
+mkdir -p "$(dirname "$STATE")"
+
+# as runs AppleScript as one osascript -e per line. osascript takes a single line per -e.
+# Pass lines as arguments, or pipe a heredoc for a block.
+as() {
+  local -a args=(-e 'tell application "Ghostty"')
+  if [ "$#" -gt 0 ]; then
+    local a
+    for a in "$@"; do args+=(-e "$a"); done
+  else
+    local line
+    while IFS= read -r line; do
+      [ -n "$line" ] && args+=(-e "$line")
+    done
+  fi
+  args+=(-e 'end tell')
+  osascript "${args[@]}" 2>/dev/null
+}
+
+field() { [ -f "$STATE" ] && awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v}' "$STATE"; }
+
+# prune: drop tab entries whose session no longer exists. OpenCode keeps its tab strip in
+# ~/.local/state/opencode/latest/tui/tabs.json and never forgets a deleted session, so the
+# strip fills with ghosts. Runs before a new column opens; a TUI that exits later writes its
+# own list back, which can bring ghosts for that strip until the next prune.
+prune() {
+  local f="$HOME/.local/state/opencode/latest/tui/tabs.json"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PYEOF' 2>/dev/null
+import json, os, sys, base64, urllib.request
+path = sys.argv[1]
+try:
+    pw = json.load(open(os.path.expanduser("~/.config/opencode/service.json")))["password"]
+    url = os.popen("opencode service status").read().strip()
+    auth = "Basic " + base64.b64encode(f"opencode:{pw}".encode()).decode()
+    req = urllib.request.Request(url + "/api/session?limit=200", headers={"authorization": auth})
+    live = {r["id"] for r in json.load(urllib.request.urlopen(req, timeout=20))["data"]}
+except Exception:
+    sys.exit(0)
+data = json.load(open(path))
+dropped = 0
+for scope in data.values() if isinstance(data, dict) else []:
+    if not isinstance(scope, dict):
+        continue
+    for entry in scope.values() if isinstance(scope, dict) else []:
+        if not isinstance(entry, dict) or "tabs" not in entry:
+            continue
+        keep = [t for t in entry["tabs"] if t.get("sessionID") in live]
+        dropped += len(entry["tabs"]) - len(keep)
+        entry["tabs"] = keep
+        if isinstance(entry.get("unread"), dict):
+            entry["unread"] = {k: v for k, v in entry["unread"].items() if k in live}
+if dropped:
+    json.dump(data, open(path, "w"))
+print(dropped)
+PYEOF
+}
+
+alive() {
+  [ -n "${1:-}" ] || { echo dead; return; }
+  local out
+  out=$(as <<EOF
+try
+set x to first window whose id is "$1"
+return "ok"
+on error
+return "dead"
+end try
+EOF
+)
+  echo "${out:-dead}"
+}
+
+# adopt <window_id>: remember the window and the pane that anchors new splits.
+adopt() {
+  local w="$1"
+  local anchor
+  anchor=$(as <<EOF
+set w to first window whose id is "$w"
+return id of (focused terminal of selected tab of w)
+EOF
+)
+  printf 'window\t%s\nanchor\t%s\n' "$w" "$anchor" > "$STATE"
+  echo "$w"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  open)
+    w=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --window) w="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -z "$w" ] && w=$(as "return id of (first window)")
+    [ -z "$w" ] && { echo "oc-panes: no Ghostty window to adopt" >&2; exit 1; }
+    adopt "$w"
+    ;;
+
+  spawn)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --font) FONT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    w=$(as <<EOF
+set cfg to new surface configuration
+set font size of cfg to $FONT
+set w to new window with configuration cfg
+return id of w
+EOF
+)
+    [ -z "$w" ] && { echo "oc-panes: Ghostty refused to open a window" >&2; exit 1; }
+    adopt "$w"
+    ;;
+
+  add)
+    ses="${1:-}"; dir="${2:-$PWD}"
+    [ -z "$ses" ] && { echo "usage: oc-panes add <ses_id> [dir]" >&2; exit 2; }
+    w=$(field window)
+    # Self-heal: a window closed by hand, or no viewer yet, falls back to the front window.
+    if [ "$(alive "$w")" = dead ]; then
+      w=$(as "return id of (first window)")
+      [ -z "$w" ] && { echo "oc-panes: no Ghostty window" >&2; exit 1; }
+      adopt "$w"
+    fi
+    prune >/dev/null
+    # One column per session: a second question to a thread that still owns a column reuses it.
+    have=$(awk -F'\t' -v s="$ses" '$1=="pane" && $2==s{print $3; exit}' "$STATE")
+    if [ -n "$have" ]; then
+      ok=$(as <<EOF
+try
+set x to first terminal of (first window whose id is "$w") whose id is "$have"
+return "ok"
+on error
+return "gone"
+end try
+EOF
+)
+      if [ "$ok" = ok ]; then echo "$have"; exit 0; fi
+      awk -F'\t' -v s="$ses" '!($1=="pane" && $2==s)' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    fi
+    anchor=$(awk -F'\t' '$1=="pane"{t=$3} END{print t}' "$STATE")
+    [ -n "$anchor" ] || anchor=$(field anchor)
+    # Grow right from the newest column. A stale anchor id falls back to the adopted anchor
+    # pane, then to whatever pane the window focuses. Splitting is always safe: it never
+    # types into the anchor.
+    t=$(as <<EOF
+set w to first window whose id is "$w"
+set t0 to count of tabs of w
+set cfg to new surface configuration
+set font size of cfg to $FONT
+try
+set base to first terminal of w whose id is "$anchor"
+on error
+try
+set base to first terminal of w whose id is "$(field anchor)"
+on error
+set base to focused terminal of selected tab of w
+end try
+end try
+set t2 to split base direction right with configuration cfg
+perform action "equalize_splits" on t2
+return (id of t2) & " " & ((count of tabs of w) - t0) & " " & (tty of t2)
+EOF
+)
+    [ -z "$t" ] && { echo "oc-panes: split failed" >&2; exit 1; }
+    # Ghostty turns a right split into a new tab when the pane has no room for the minimum
+    # width. Say so, because the column then silently becomes a tab.
+    set -- $t
+    t="$1"
+    [ "${2:-0}" != "0" ] && echo "oc-panes: split became a tab, pane too narrow. Adopt a wider window: oc-panes open" >&2
+    # Type the attach command into the new pane only.
+    as <<EOF
+set t to first terminal of (first window whose id is "$w") whose id is "$t"
+input text "cd '$dir' && opencode --session $ses" to t
+send key "enter" to t
+EOF
+    printf 'pane\t%s\t%s\n' "$ses" "$t" >> "$STATE"
+    echo "$t"
+    ;;
+
+  rm)
+    ses="${1:-}"
+    [ -z "$ses" ] && { echo "usage: oc-panes rm <ses_id>" >&2; exit 2; }
+    w=$(field window); t=$(awk -F'\t' -v s="$ses" '$1=="pane" && $2==s{print $3; exit}' "$STATE")
+    [ -f "$STATE" ] && grep -v -F "	$ses	" "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    [ -z "$t" ] && exit 0
+    [ "$(alive "$w")" = ok ] || exit 0
+    # Two exits: opencode eats the first, the login shell takes the second, then Ghostty drops
+    # the pane and reclaims its width.
+    as <<EOF
+try
+set t to first terminal of (first window whose id is "$w") whose id is "$t"
+input text "exit" to t
+send key "enter" to t
+delay 0.5
+input text "exit" to t
+send key "enter" to t
+end try
+EOF
+    anchor=$(awk -F'\t' '$1=="pane"{t=$3} END{print t}' "$STATE")
+    [ -n "$anchor" ] || anchor=$(field anchor)
+    # Ghostty hands the freed width to one neighbour, so even the rest out. The stored anchor
+    # can point at the pane that just closed, hence focusing whatever survives.
+    sleep 1
+    # Ghostty answers the equalize action with `true`; the caller wants silence.
+    as >/dev/null <<EOF
+try
+perform action "equalize_splits" on (focused terminal of selected tab of (first window whose id is "$w"))
+end try
+EOF
+    ;;
+
+  prune)
+    prune
+    ;;
+
+  list)
+    w=$(field window)
+    printf 'window\t%s\t%s\n' "${w:-none}" "$(alive "$w")"
+    [ -f "$STATE" ] && awk -F'\t' '$1!="window" && $1!="pane"' "$STATE"
+    [ -f "$STATE" ] && awk -F'\t' '$1=="pane"{print}' "$STATE"
+    ;;
+
+  close)
+    w=$(field window)
+    [ "$(alive "$w")" = ok ] || { rm -f "$STATE"; exit 0; }
+    # Close only the columns Pi opened. The adopted anchor pane stays, so the window survives.
+    while read -r _ ses t; do
+      [ -n "${t:-}" ] && as <<EOF
+try
+set t to first terminal of (first window whose id is "$w") whose id is "$t"
+input text "exit" to t
+send key "enter" to t
+delay 0.5
+input text "exit" to t
+send key "enter" to t
+end try
+EOF
+    done < <(awk -F'\t' '$1=="pane"' "$STATE")
+    awk -F'\t' '$1!="pane"' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    ;;
+
+  *)
+    sed -n '2,20p' "$0"
+    exit 2
+    ;;
+esac
