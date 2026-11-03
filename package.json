@@ -26,7 +26,7 @@
     "image": "assets/banner.png"
   },
   "scripts": {
-    "check": "for c in 4xx nowatch expire stale; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts",
+    "check": "for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {

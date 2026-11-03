@@ -10,12 +10,14 @@
  *                      stays armed.
  *   stale    item 2  — a sweep read that loses its watch must release the claim, so the next real
  *                      settle still wakes the model inside the TTL.
+ *   dup                — a run the batch wake-up already reported must not be handed out again by
+ *                      the next oc_wait on that thread: one run, one report.
  *
  * Run: CASE=expire bun run checks/check-3-unit.ts   (from the package root)
  */
 const CASE = process.env.CASE ?? "4xx";
 process.env.OC_WATCH_TTL_S = CASE === "stale" ? "4" : "2";
-process.env.OC_BACKSTOP_MS = CASE === "stale" ? "500" : "1000";
+process.env.OC_BACKSTOP_MS = CASE === "stale" ? "500" : CASE === "dup" ? "300" : "1000";
 process.env.OC_HUD = "0";
 
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -174,6 +176,19 @@ if (CASE === "4xx") {
       ? "PASS  item 2: the stale claim released and the real settle arrived"
       : "FAIL  item 2: the stale claim swallowed the real settle, see sent above";
   }
+} else if (CASE === "dup") {
+  await open();
+  // The run ends with nobody waiting: the backstop reads it, the batch reports it once.
+  realAt = Date.now() + 50;
+  await wait(1500);
+  const wakes = sent.filter((text) => text.includes("REAL")).length;
+  // Same thread, watch already spent: this call owes no second copy of that run.
+  const probe = await tool("oc_wait").execute("t5", { session: ID });
+  const text = probe.content.map((part: any) => part.text).join(" ");
+  console.log(`wake-ups carrying the answer -> ${wakes}; oc_wait ->`, JSON.stringify(text).slice(0, 240));
+  verdict = wakes === 1 && !text.includes("REAL") && text.includes("already reported")
+    ? "PASS  dup: one run, one report"
+    : `FAIL  dup: one run reported twice (wake-ups ${wakes}, oc_wait said: ${text.slice(0, 120)})`;
 } else {
   verdict = `FAIL  unknown CASE ${CASE}`;
 }

@@ -125,6 +125,8 @@ interface BridgeState {
   local: Set<string>;
   /** Ask ids already handed over, so a second path stays silent. */
   reported: Set<string>;
+  /** `time.idle` of the run whose settle already reached the model, so one run is reported once. */
+  reportedRun: Map<string, number>;
   pendingAsks: Ask[];
   /** Directory each thread reported, so a later send can open its column. */
   dirs: Map<string, string>;
@@ -159,6 +161,7 @@ function freshState(): BridgeState {
     mode: "supervised",
     local: new Set(),
     reported: new Set(),
+    reportedRun: new Map(),
     pendingAsks: [],
     dirs: new Map(),
     labels: new Map(),
@@ -340,6 +343,7 @@ function forget(state: BridgeState, session: string): void {
   state.known.delete(session);
   state.dirs.delete(session);
   state.labels.delete(session);
+  state.reportedRun.delete(session);
   // A deleted thread's asks must stop occupying the queue and the reported set.
   const dropped = state.pendingAsks.filter((ask) => ask.session === session);
   state.pendingAsks = state.pendingAsks.filter((ask) => ask.session !== session);
@@ -688,7 +692,11 @@ export default function (pi: ExtensionAPI) {
     const count = batch.length === 1 ? "One OpenCode thread" : `${batch.length} OpenCode threads`;
     const head = `${count}${waited ? " settled while the run was cancelled" : " settled"}:`;
     const text = `${head}\n${batch.map(batchLine).join("\n")}\n\nRead a thread with oc_read, then continue the task that started it.`;
-    for (const settle of batch) markReported(settle.asks);
+    for (const settle of batch) {
+      markReported(settle.asks);
+      // This message is the report for these runs; a later oc_wait must not repeat them.
+      mine.reportedRun.set(settle.session, settle.idleAt);
+    }
     // prompt() ignores deliverAs while idle and queues on it while busy (agent-session.js:1664-1677),
     // so one call covers both states.
     pi.sendUserMessage(text, { deliverAs: "followUp" });
@@ -971,6 +979,8 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`${MAX_THREADS} threads in flight; wait for one to settle with oc_wait.`);
     }
     state.armed.set(session, { floor, deadline: now + WATCH_TTL_MS });
+    // A new run owes its own report, so the marker of the run before it no longer applies.
+    state.reportedRun.delete(session);
     drawHud();
   };
 
@@ -1304,6 +1314,20 @@ export default function (pi: ExtensionAPI) {
             details: { session: params.session, settled: false, asks: read.asks },
           };
         }
+        // One run reaches the model once. The wake-up already carried this run, so point at it
+        // instead of handing out a second copy. `since` names a point on purpose, so that call reads
+        // the record freely.
+        if (settle === null && params.since === undefined && mine.reportedRun.get(params.session) === read.idleAt) {
+          return {
+            content: [{
+              type: "text",
+              text: `already reported: outcome ${read.outcome}, idle at ${read.idleAt}; no newer run. oc_read shows the record.`,
+            }],
+            details: { session: params.session, settled: false, asks: read.asks },
+          };
+        }
+        // This call is the first report of this run, so mark it: the wake-up channel is now spent.
+        if (params.since === undefined) mine.reportedRun.set(params.session, read.idleAt);
         // The answer reached Pi, so the column has nothing left to show live. Keep the watch only when
         // a newer run is still going, so a finished run never wakes twice.
         const armedNow = mine.armed.get(params.session);

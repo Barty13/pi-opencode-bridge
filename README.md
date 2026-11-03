@@ -79,6 +79,8 @@ The bridge adds seven tools and six commands.
 3. Detect claims the thread once, snapshots the answer, and releases one debounced message per
    batch. Two settles produce one message.
 4. `oc_wait` waits on that same detector, so a collected answer never wakes the model twice.
+5. A run already reported answers `already reported` instead of a second copy: the wake-up and
+   `oc_wait` share one report per run. `oc_wait` with `since` and `oc_read` read the record freely.
 
 A batch that lands while you type waits for you. A batch held by compaction waits for the compact
 to end. An escape (abort) holds the batch, so a wake-up cannot reopen a conversation you dropped.
@@ -139,6 +141,8 @@ $ OC_RPC_MODEL=<id from oc_models> bun run oc-rpc.ts   # wake-up path, costs tok
 - Live columns need macOS plus Ghostty. They stay off in print, JSON, and RPC mode.
 - 32 open threads at most. A watch older than `OC_WATCH_TTL_S` expires and reports itself.
 - Message bodies cap at 4000 characters per read; `offset` pages past the cap.
+- Deleting a thread outside the bridge does not cancel its armed watch, so its wake-up still fires.
+  Clean up after the settle with `/oc-clean force`, not mid-run.
 
 ## Picture
 
