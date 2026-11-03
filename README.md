@@ -109,6 +109,7 @@ working directory at start.
 | `OC_BACKSTOP_MS` | `5000` | Poll gap between event frames |
 | `OC_WATCH_TTL_S` | `1800` | How long an armed thread waits before it expires |
 | `OC_WAIT_MAX_S` | `300` | Ceiling for `oc_wait` |
+| `OC_SERVICE_FILE` | `~/.config/opencode/service.json` | Where to read the local service password |
 | `OC_RETENTION` | `{}` | Your own data-policy labels, JSON keyed by model id suffix, for example `{"<id>":"zero"}`. Display only. The bridge ships no model ids: read each policy from your provider and set it here. |
 
 ## Checks

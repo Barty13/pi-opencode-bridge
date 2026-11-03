@@ -55,7 +55,7 @@ prune() {
 import json, os, sys, base64, urllib.request
 path = sys.argv[1]
 try:
-    pw = json.load(open(os.path.expanduser("~/.config/opencode/service.json")))["password"]
+    pw = json.load(open(os.environ.get("OC_SERVICE_FILE", os.path.expanduser("~/.config/opencode/service.json"))))["password"]
     url = os.popen("opencode service status").read().strip()
     auth = "Basic " + base64.b64encode(f"opencode:{pw}".encode()).decode()
     req = urllib.request.Request(url + "/api/session?limit=200", headers={"authorization": auth})

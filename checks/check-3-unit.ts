@@ -73,6 +73,9 @@ Bun.serve({
 // The bridge finds the service through `opencode service status` and the model list through
 // `opencode models`, so shadow that binary for both calls.
 const bin = mkdtempSync(join(tmpdir(), "fakeoc-"));
+// The service password file sits in the real home, and bun ignores a fake HOME, so point at a stub.
+process.env.OC_SERVICE_FILE = join(bin, "service.json");
+writeFileSync(process.env.OC_SERVICE_FILE, '{"password":"stub"}');
 writeFileSync(
   join(bin, "opencode"),
   `#!/bin/sh\nif [ "$1" = "models" ]; then echo stub/model-free; else echo http://127.0.0.1:${PORT}; fi\n`,

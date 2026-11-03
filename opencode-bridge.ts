@@ -48,6 +48,8 @@ function resolveRoot(): string {
   }
 }
 const ROOT = resolveRoot();
+// OC_SERVICE_FILE points at another service file; the checks need a stub, bun ignores HOME.
+const SERVICE_FILE = process.env.OC_SERVICE_FILE ?? join(homedir(), ".config", "opencode", "service.json");
 const MAX_TEXT = 4000;
 /** Data policy per model id, filled by the operator: OC_RETENTION='{"<id-suffix>":"zero"}'.
   * Read the policy from your provider's model page; this bridge ships no ids. Match is by exact
@@ -209,7 +211,7 @@ let modelCache: { at: number; ids: string[]; variants: Map<string, string[]> } =
 async function discover(): Promise<Service> {
   const { stdout } = await promisify(execFile)("opencode", ["service", "status"], { encoding: "utf8", timeout: 5_000 });
   const url = stdout.trim();
-  const file = join(homedir(), ".config", "opencode", "service.json");
+  const file = SERVICE_FILE;
   let password: unknown;
   try {
     password = JSON.parse(readFileSync(file, "utf8")).password;
