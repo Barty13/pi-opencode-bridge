@@ -7,9 +7,11 @@
     ]
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "bun run oc-rpc.ts"
+    "test": "bun run oc-rpc.ts",
+    "typecheck": "bunx tsc --noEmit --skipLibCheck --types node --target esnext --module preserve --moduleResolution bundler opencode-bridge.ts oc-rpc.ts"
   }
 }

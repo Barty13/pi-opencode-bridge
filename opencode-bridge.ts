@@ -47,6 +47,12 @@ function resolveRoot(): string {
 }
 const ROOT = resolveRoot();
 const MAX_TEXT = 4000;
+/** Data policy for the ids this account serves. Source: opencode.ai/v2/docs/console/models/#privacy,
+  * read 2026-11-03; ENVIRONMENT.md holds the full table. Match is by exact id: a substring would give
+  * a new model someone else's policy, and two of the old rows name models no longer served. */
+const RETENTION: Array<[string, string]> = [
+  ["glm-5.3", "zero"], ["glm-5.3-flash", "zero"], ["deepseek-v4.1-flash", "zero"],
+];
 const DEBOUNCE_MS = Number(process.env.OC_DEBOUNCE_MS ?? 400);
 const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
 const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
@@ -130,6 +136,8 @@ interface BridgeState {
   waiters: Map<string, Array<(settle: Settle | null) => void>>;
   /** A run the human aborted holds the batch, so a wake-up cannot reopen a dropped conversation. */
   held: boolean;
+  /** Manual compaction refuses prompts (agent-session.js:1648-1650), so asks and batches wait. */
+  compacting: boolean;
   /** One human message in flight; its settle ends the hold. */
   pendingRelease: boolean;
 }
@@ -152,6 +160,7 @@ function freshState(): BridgeState {
     batchWaited: false,
     waiters: new Map(),
     held: false,
+    compacting: false,
     pendingRelease: false,
   };
 }
@@ -499,7 +508,7 @@ async function readSettle(session: string, floor: number): Promise<Read> {
 /** Report shape shared by oc_wait and the wake-up, so the two cannot drift apart. */
 function settleText(s: Settle): string {
   return [
-    `outcome: ${s.outcome}${s.expired ? " (watch expired, run still going)" : ""}`,
+    `outcome: ${s.outcome}${s.expired ? " (watch expired; restart with oc_send to read the record)" : ""}`,
     s.error ?? "error: none",
     s.answer ? `answer:\n${truncate(s.answer)}` : "answer: (none)",
     s.asks.length ? `open asks:\n${s.asks.map((ask) => describe(ask)).join("\n")}` : s.asksUnknown ? "open asks: unreadable" : "open asks: none",
@@ -517,10 +526,12 @@ async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promis
     await api("POST", `/api/session/${ask.session}/permission/${ask.id}/reply`, { decision });
     return `permission ${ask.id} -> ${decision}`;
   }
-  if (!answerJson) {
-    throw new Error(`form ${ask.id} needs answerJson keyed by field names, for example {"lane":"a"}`);
+  if (!answerJson) throw new Error(`form ${ask.id} needs answerJson keyed by field names, for example {"lane":"a"}`);
+  let answer: unknown;
+  try { answer = JSON.parse(answerJson); } catch {
+    throw new Error(`form ${ask.id}: answerJson is not valid JSON. Send one object keyed by field name, for example {"lane":"a"}.`);
   }
-  await api("POST", `/api/session/${ask.session}/form/${ask.id}/reply`, { answer: JSON.parse(answerJson) });
+  await api("POST", `/api/session/${ask.session}/form/${ask.id}/reply`, { answer });
   return `form ${ask.id} answered`;
 }
 
@@ -542,6 +553,8 @@ export default function (pi: ExtensionAPI) {
 
   const deliver = (ask: Ask) => {
     if (state.reported.has(ask.id)) return;
+    // prompt() refuses during compaction and the refusal never reaches this code (agent-session.js:1648-1650, :2774-2782); queue for afterCompact.
+    if (state.compacting) return queueAsk(ask);
     state.reported.add(ask.id);
     // steer reaches a turn that is already running; followUp would wait for it to settle,
     // and an oc_wait holding that turn would then deadlock against the thread.
@@ -613,7 +626,7 @@ export default function (pi: ExtensionAPI) {
       .catch((error) => {
         if (mine !== state || attempt >= 2) return;
         // 404 and 409 are final: outside ROOT or gone.
-        if (/HTTP 40[49]/.test(String(error))) return;
+        if (/HTTP 40[49]|outside /.test(String(error))) return;
         const timer = setTimeout(() => {
           if (mine === state) gateAsk(ask, attempt + 1);
         }, 1000);
@@ -652,6 +665,7 @@ export default function (pi: ExtensionAPI) {
       if (mine.batch.length) mine.batchWaited = true;
       return;
     }
+    if (mine.compacting) return;  // keep the batch; afterCompact re-arms the flush
     const batch = mine.batch;
     mine.batch = [];
     const waited = mine.batchWaited;
@@ -663,9 +677,16 @@ export default function (pi: ExtensionAPI) {
     const count = batch.length === 1 ? "One OpenCode thread" : `${batch.length} OpenCode threads`;
     const head = `${count}${waited ? " settled while the run was cancelled" : " settled"}:`;
     const text = `${head}\n${batch.map(batchLine).join("\n")}\n\nRead a thread with oc_read, then continue the task that started it.`;
-    if (context.isIdle()) pi.sendUserMessage(text);
-    else pi.sendUserMessage(text, { deliverAs: "followUp" });
+    for (const settle of batch) markReported(settle.asks);
+    // prompt() ignores deliverAs while idle and queues on it while busy (agent-session.js:1664-1677),
+    // so one call covers both states.
+    pi.sendUserMessage(text, { deliverAs: "followUp" });
   }
+
+  /** A delivered text hands these asks to the model, so a rescan must not re-offer them (:605). */
+  const markReported = (asks: Ask[]) => {
+    for (const ask of asks) state.reported.add(ask.id);
+  };
 
   /** Hand a settle to a waiting oc_wait, or queue it for the next batch turn. */
   const deliverSettle = (settle: Settle) => {
@@ -677,6 +698,7 @@ export default function (pi: ExtensionAPI) {
     const waiters = mine.waiters.get(settle.session);
     if (waiters?.length) {
       mine.waiters.delete(settle.session);
+      markReported(settle.asks);
       for (const done of waiters) done(settle);
       return;
     }
@@ -698,7 +720,11 @@ export default function (pi: ExtensionAPI) {
     if (mine !== state) return;
     // A send during the read replaced that watch, so this result belongs to a run nobody waits on.
     if (mine.armed.get(session) !== w || mine.sending.has(session)) return void mine.claimed.delete(session);
-    if (read === "gone") return dropThread(session);
+    if (read === "gone") {
+      forget(state, session);
+      drawHud();
+      return;
+    }
     if (!read) return void mine.claimed.delete(session);
     // An event that predates the send reports another run, so it must not spend the watch.
     if (read.idleAt <= w.floor) return void mine.claimed.delete(session);
@@ -714,7 +740,9 @@ export default function (pi: ExtensionAPI) {
     for (const [session, w] of [...mine.armed]) {
       if (Date.now() > w.deadline) {
         const expired: Settle = {
-          session, title: "", outcome: "running", error: null, answer: "", asks: [], idleAt: Date.now(), expired: true,
+          // Nothing was read: the outcome and asks are unknown, not "running"/"none", and asksUnknown keeps the thread in `known` (:681) so a rescan re-checks it.
+          session, title: "", outcome: "unknown", error: null, answer: "", asks: [],
+          asksUnknown: true, idleAt: Date.now(), expired: true,
         };
         // Pass the settle, so an oc_wait holding this thread gets it instead of null.
         dropThread(session, expired);
@@ -731,9 +759,16 @@ export default function (pi: ExtensionAPI) {
     for (const [index, read] of results.entries()) {
       const { session, w } = reads[index];
       // A send or a stop during the read owns the thread now, so this result is stale.
-      if (mine.armed.get(session) !== w || mine.sending.has(session)) continue;
-      if (read === "gone") dropThread(session);
-      else if (read && read.idleAt > w.floor) {
+      if (mine.armed.get(session) !== w || mine.sending.has(session)) {
+        mine.claimed.delete(session);  // or detect/sweep skip it until the 30 min TTL (:701, :732)
+        continue;
+      }
+      if (read === "gone") {
+        forget(state, session);
+        drawHud();
+        continue;
+      }
+      if (read && read.idleAt > w.floor) {
         // Disarm here: the stream path does, and a watch left armed re-delivers every sweep.
         dropThread(session, read);
         deliverSettle(read);
@@ -905,10 +940,10 @@ export default function (pi: ExtensionAPI) {
       // This send supersedes any snapshot still waiting to wake the model.
       mine.batch = mine.batch.filter((entry) => entry.session !== session);
     } catch (error) {
-      // 404 means the thread is gone. 409 means the run before this send is live, so its watch and
-      // its floor stay: the new floor would hide that run's rows from the detector.
       if (/HTTP 404/.test(String(error))) dropThread(session);
       else if (previous) mine.armed.set(session, previous);
+      // No earlier watch: a 409 run is not one we armed, other 4xx mean the prompt never landed. Either way the fresh watch is a phantom the sweep would expire into a lie (:721-726).
+      else if (/HTTP 4\d\d/.test(String(error))) dropThread(session);
       throw error;
     } finally {
       const left = (mine.sending.get(session) ?? 1) - 1;
@@ -934,14 +969,14 @@ export default function (pi: ExtensionAPI) {
     drawHud();
   };
 
-  /** Footer count plus the table above the editor. Static rows, so no ticker and no timer. */
+  /** Footer count plus the table above the editor; a TUI timer refreshes the age and TTL. */
   function drawHud(): void {
     const context = ctx;
     if (!HUD || !context || context.mode !== "tui") return;
     const now = Date.now();
     const rows = [...state.armed].map(([session, w]) => {
       const label = state.labels.get(session) ?? state.dirs.get(session)?.split("/").pop() ?? "-";
-      return `${session}  ${Math.round((now - w.floor) / 1000)}s  ${label}`;
+      return `${session}  ${Math.round((now - w.floor) / 1000)}s  left ${Math.max(0, Math.round((w.deadline - now) / 1000))}s  ${label}`;
     });
     const count = rows.length;
     context.ui.setStatus("oc", count ? `${count} ${count === 1 ? "thread" : "threads"} running` : undefined);
@@ -960,6 +995,7 @@ export default function (pi: ExtensionAPI) {
     old.waiters.clear();
   };
 
+  let hudTimer: ReturnType<typeof setInterval> | null = null;
   let backstop: ReturnType<typeof setInterval> | null = null;
   let sweeping = false;
   const startBackstop = () => {
@@ -985,12 +1021,21 @@ export default function (pi: ExtensionAPI) {
     // Panes need a terminal, so print, JSON, and RPC runs never open a column.
     panesOn = context.mode === "tui";
     reset();
+    // Restore armed floors from the last session; the deadline gets a fresh TTL.
+    const saved = (context.sessionManager.getEntries()
+      .findLast((e: any) => e.type === "custom" && e.customType === "oc-armed") as
+      { data?: Array<{ session: string; floor: number }> } | undefined)?.data;
+    for (const row of saved ?? []) state.armed.set(row.session, { floor: row.floor, deadline: Date.now() + WATCH_TTL_MS });
     if (pi.getFlag("oc-auto") === true) state.mode = "unsupervised";
     abort?.abort();
     abort = new AbortController();
     void watch(abort.signal);
     startBackstop();
     drawHud();
+    if (context.mode === "tui") {
+      hudTimer = setInterval(() => { if (state.armed.size) drawHud(); }, 1000);
+      hudTimer.unref?.();
+    }
   });
 
   pi.on("session_shutdown", () => {
@@ -998,6 +1043,11 @@ export default function (pi: ExtensionAPI) {
     abort = undefined;
     ctx = undefined;
     stopBackstop();
+    if (hudTimer) clearInterval(hudTimer);
+    hudTimer = null;
+    // Save armed floors; the next session_start restores them with a fresh TTL.
+    if (state.armed.size) pi.appendEntry("oc-armed",
+      [...state.armed].map(([session, w]) => ({ session, floor: w.floor })));
     reset();
     panesOn = false;
   });
@@ -1015,26 +1065,36 @@ export default function (pi: ExtensionAPI) {
     const mine = state;
     // Escape ends a run the human dropped, so its wake-ups wait for the next thing they send.
     if (event.aborted) {
+      mine.pendingRelease = false;  // the human message armed a run that just died; next input re-arms (:1027)
       mine.held = true;
       return;
     }
-    if (mine.pendingRelease) {
+    const human = mine.pendingRelease;
+    if (human) {
       mine.held = false;
       mine.pendingRelease = false;
       void recoverAsks(mine).catch(() => {});
+      void flushAsks().catch(() => {});
     }
-    void flushAsks().catch(() => {});
     armFlush(mine);
   });
+
+  pi.on("session_before_compact", () => { state.compacting = true; });
+  const afterCompact = () => {
+    setTimeout(() => {  // manual controller clears after this emit returns: agent-session.js:2321
+      state.compacting = false;
+      void flushAsks().catch(() => {});
+      armFlush(state);
+    }, 0).unref?.();
+  };
+  pi.on("session_compact", afterCompact);
+  pi.on("session_compact_failed", afterCompact);  // catch path clears first: agent-session.js:2335
 
   const ns = {
     name: "opencode",
     aliases: ["oc"],
     description: "Hand threads to cheap remote models over the local OpenCode service.",
-    instructions: `Threads live under ~/Pi. oc_models, then oc_open, then oc_send. A send returns at once; the thread settling opens a later turn with its outcome, so one wake-up carries the answer. Read a thread after that wake-up lands.
-Use oc_wait only when this turn needs the answer now, or when no wake-up is coming (print, JSON, or after a Pi reload, which drops pending wake-ups).
-Retention: glm and deepseek flash-free are zero retention, safe for private code; beam keeps 30 days; mimo trains on prompts, so public code only.
-Keep briefs small and ask for a short summary. In auto mode the local model receives the thread's asks and answers them with oc_reply.`,
+    instructions: `Print, JSON, and a Pi reload carry no wake-up; there oc_wait is the collector. In auto mode the local model receives the thread's asks and answers them with oc_reply.`,
   };
 
   const sessionParam = { session: Type.String({ pattern: "^ses", description: "ses_… id from oc_open" }) };
@@ -1051,8 +1111,10 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         const { ids, variants } = await cheapModels(true);
         const text = ids
           .map((id) => {
-            const ladder = variants.get(id) ?? [];
-            return ladder.length ? `${id}  variants: ${ladder.join("|")}` : `${id}  variants: none`;
+            const ladder = variants.get(id);
+            const shown = ladder === undefined ? "unknown" : ladder.length ? ladder.join("|") : "none";
+            const keep = RETENTION.find(([key]) => id.endsWith(key))?.[1];
+            return `${id}  variants: ${shown}${keep ? `  retention: ${keep}` : ""}`;
           })
           .join("\n");
         return { content: [{ type: "text", text }], details: undefined };
@@ -1104,7 +1166,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
           // The thread exists, so a failed brief still has to hand back its id.
           try {
             await sendPrompt(session, { text: params.brief });
-            paneCall(["add", session, dir]);
+            if (state.armed.has(session)) paneCall(["add", session, dir]);
             sent = "\nbrief sent, wake-up armed";
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1135,7 +1197,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         await assertLocal(state, params.session);
         state.known.add(params.session);
         await sendPrompt(params.session, { text: params.text });
-        paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
+        if (state.armed.has(params.session)) paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
         return {
           content: [{ type: "text", text: "sent; the settle will open a turn, keep working" }],
           details: { session: params.session },
@@ -1154,7 +1216,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
       annotations: { readOnlyHint: true },
       parameters: Type.Object({
         ...sessionParam,
-        since: Type.Optional(Type.Number({ description: "Read the record after this Unix ms; use after a Pi reload" })),
+        since: Type.Optional(Type.Number({ description: "Read rows after this Unix ms; 0 reads the whole record. Omit it to start from the thread's current state." })),
         timeoutSec: Type.Optional(Type.Number({ description: `Seconds before the wait gives up. Max ${WAIT_MAX_S}, default ${WAIT_MAX_S}.` })),
       }),
       async execute(_id, params, signal) {
@@ -1179,7 +1241,8 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         // A settle that already reached the batch is this call's answer: take it, do not wake twice.
         const queued = mine.batch.findIndex((entry) => entry.session === params.session);
         let settle = queued >= 0 ? mine.batch.splice(queued, 1)[0] : null;
-        if (settle) mine.claimed.delete(params.session);
+        // was: if (settle) mine.claimed.delete(...) — dead: every batch append clears the claim (:698).
+        if (settle && !mine.batch.length) mine.batchWaited = false;
         // `since` reads the record instead of waiting, and a thread with no watch owes no wake-up.
         if (!settle && w && params.since === undefined) {
           const limit = Math.min(Math.max(params.timeoutSec ?? WAIT_MAX_S, 0), WAIT_MAX_S);
@@ -1197,7 +1260,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
           };
         }
         if (!settle && params.since === undefined && mine.armed.has(params.session)) {
-          const seconds = Math.min(params.timeoutSec ?? WAIT_MAX_S, WAIT_MAX_S);
+          const seconds = Math.min(Math.max(params.timeoutSec ?? WAIT_MAX_S, 0), WAIT_MAX_S);
           return {
             content: [{ type: "text", text: `still running after ${seconds}s; the watch stays armed` }],
             details: { session: params.session, settled: false, asks: [] as Ask[] },
@@ -1205,7 +1268,10 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         }
         // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
         const read = settle ?? (await readSettle(params.session, floor));
+        // The read spanned a session switch, so this result belongs to no live watch.
+        if (mine !== state) return { content: [{ type: "text", text: "Pi session switched; retry" }], details: undefined };
         if (read === "gone" || read === null) {
+          if (read === "gone") forget(state, params.session);
           return {
             content: [{ type: "text", text: read === "gone" ? "thread is gone" : "thread unreadable" }],
             details: { session: params.session, settled: false, asks: [] as Ask[] },
@@ -1216,7 +1282,14 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         // for the settle that is coming.
         if (settle === null && read.idleAt <= (params.since ?? 0)) {
           return {
-            content: [{ type: "text", text: `no settle after ${params.since ?? floor}; the watch stays armed` }],
+            content: [{
+              type: "text",
+              text: `no settle after ${params.since ?? floor}; ${
+                mine.armed.has(params.session)
+                  ? "the watch stays armed"
+                  : "no watch is armed and no wake-up will come; oc_send starts the run"
+              }`,
+            }],
             details: { session: params.session, settled: false, asks: read.asks },
           };
         }
@@ -1261,7 +1334,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         const shown = answer.length ? answer : rows.slice(0, want);
         state.known.add(params.session);
         const full = params.parts === "full";
-        const at = params.offset ?? 0;
+        const at = Math.max(0, params.offset ?? 0);
         const text = shown.map((row: any) => rowBlock(row, full, at)).join("\n\n");
         // Rows are capped each, so cap the whole result too: 25 long rows still overflow a context.
         const capped = text.length > 24_000 ? `${text.slice(0, 24_000)}\n… result capped; narrow limit or use offset` : text;
@@ -1332,7 +1405,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
     defineTool({
       name: "oc_stop",
       label: "OC stop",
-      description: "Interrupt a running thread.",
+      description: "Interrupt a running thread; no settle or wake-up follows.",
       namespace: ns,
       annotations: { destructiveHint: true },
       parameters: Type.Object(sessionParam),
@@ -1341,10 +1414,14 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         // Unwatch first: this call carries the result, so the interrupted event owes no turn. Waiters
         // stay, because a failed interrupt leaves the run live for them.
         const prior = state.armed.get(params.session);
+        // A settle the stream missed sits in the batch; unwatch would erase it (:176), so this call carries it.
+        const queuedIndex = state.batch.findIndex((entry) => entry.session === params.session);
+        const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
         unwatch(state, params.session);
         const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${params.session}/interrupt`).catch((error) => {
           // The POST failed, so a run may still be going: the watch goes back.
           if (prior) state.armed.set(params.session, prior);
+          if (queued) state.batch.push(queued);
           drawHud();
           throw error;
         });
@@ -1352,7 +1429,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
         const hit = result.interrupted === true;
         paneCall(["rm", params.session]);
         return {
-          content: [{ type: "text", text: hit ? "interrupted" : "no run to interrupt" }],
+          content: [{ type: "text", text: `${hit ? "interrupted" : "no run to interrupt"}${queued ? `\n\nThe run had already settled:\n${settleText(queued)}` : ""}` }],
           details: { interrupted: hit },
         };
       },
@@ -1378,7 +1455,7 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
           `service: ${(service ??= await discover()).url}`,
           `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
           `cheap: ${(await cheapModels()).ids.join(", ")}`,
-          ...rows.map((row: any) => `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title}`),
+          ...rows.map((row: any) => `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title ?? ""}`),
         ].join("\n"),
       );
     },
@@ -1408,15 +1485,19 @@ Keep briefs small and ask for a short summary. In auto mode the local model rece
       if (!session.startsWith("ses_")) return say(context, "usage: /oc-kill <ses_...>");
       await assertLocal(state, session);
       const prior = state.armed.get(session);
+      // A settle the stream missed sits in the batch; unwatch would erase it (:176), so this call carries it.
+      const queuedIndex = state.batch.findIndex((entry) => entry.session === session);
+      const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
       unwatch(state, session);
       const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`).catch((error) => {
         if (prior) state.armed.set(session, prior);
+        if (queued) state.batch.push(queued);
         drawHud();
         throw error;
       });
       releaseWaiters(state, session);
       paneCall(["rm", session]);
-      say(context, result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`);
+      say(context, `${result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`}${queued ? `\n\nThe run had already settled:\n${settleText(queued)}` : ""}`);
     },
   });
 
