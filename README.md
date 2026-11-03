@@ -3,6 +3,8 @@
 [![CI](https://github.com/Barty13/pi-opencode-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/Barty13/pi-opencode-bridge/actions/workflows/test.yml)
 [![license MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+![Pi on the left, two OpenCode threads on the right](assets/banner.png)
+
 Delegate threads from a [Pi](https://github.com/badlogic/pi-mono) session to a local OpenCode
 service. `oc_open` returns while the thread still runs. When the thread settles, Pi opens a new
 turn with the answer. Your main session keeps working, and you keep the terminal.
@@ -136,6 +138,12 @@ $ OC_RPC_MODEL=<id from oc_models> bun run oc-rpc.ts   # wake-up path, costs tok
 - Live columns need macOS plus Ghostty. They stay off in print, JSON, and RPC mode.
 - 32 open threads at most. A watch older than `OC_WATCH_TTL_S` expires and reports itself.
 - Message bodies cap at 4000 characters per read; `offset` pages past the cap.
+
+## Picture
+
+`assets/banner.png` comes from `gallery/render.py`. Run `bash gallery/fetch.sh` first: it pulls the
+producers' own screens, the Pi terminal screenshot from pi-mono and the OpenCode splash and working
+screens from opencode. Trademarks belong to their owners. No operator screenshot appears in it.
 
 ## License
 

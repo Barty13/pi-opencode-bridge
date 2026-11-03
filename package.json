@@ -22,7 +22,8 @@
   "pi": {
     "extensions": [
       "opencode-bridge.ts"
-    ]
+    ],
+    "image": "assets/banner.png"
   },
   "scripts": {
     "check": "for c in 4xx nowatch expire stale; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts",

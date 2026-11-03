@@ -1,4 +1,5 @@
 node_modules/
+gallery/.vendor/
 *.bak-*
 pnpm-lock.yaml
 pnpm-workspace.yaml
