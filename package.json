@@ -44,6 +44,7 @@
     "oc-panes",
     "oc-rpc.ts",
     "checks/",
+    "assets/banner.png",
     "README.md",
     "SECURITY.md",
     "LICENSE"
