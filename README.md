@@ -10,7 +10,7 @@ service. `oc_open` returns while the thread still runs. When the thread settles,
 turn with the answer. Your main session keeps working, and you keep the terminal.
 
 ```
-$ pi install npm:pi-opencode-bridge
+$ pi install npm:@barty13/pi-opencode-bridge
 ```
 
 Or from git:

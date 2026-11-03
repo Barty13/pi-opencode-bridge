@@ -1,5 +1,5 @@
 {
-  "name": "pi-opencode-bridge",
+  "name": "@barty13/pi-opencode-bridge",
   "version": "0.1.0",
   "description": "Delegate threads to a local OpenCode service from Pi. oc_open returns at once, the thread settling opens a later turn.",
   "license": "MIT",
