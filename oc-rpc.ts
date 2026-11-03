@@ -19,9 +19,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const EXTENSION = process.env.OC_extension ?? join(import.meta.dirname, "opencode-bridge.ts");
+const EXTENSION = process.env.OC_EXTENSION ?? join(import.meta.dirname, "opencode-bridge.ts");
 const DEADLINE_MS = Number(process.env.OC_RPC_DEADLINE_MS ?? 240_000);
-const MODEL = process.env.OC_RPC_MODEL ?? "opencode/deepseek-v4.1-flash-free";
+const MODEL = process.env.OC_RPC_MODEL ?? "opencode-go/deepseek-v4.1-flash";
 const SCENARIO = process.env.OC_RPC_SCENARIO ?? "wake";
 // Scenarios where the settle must open a later run, instead of answering inside the first one.
 const WAKES = SCENARIO === "wake" || SCENARIO === "send" || SCENARIO === "since";
@@ -37,10 +37,10 @@ const SEND = SCENARIO === "send"
 const PROMPT = SCENARIO === "wait"
   ? `${OPEN}\nthen call oc_wait on that session id.\nreply with the outcome line and nothing else.`
   : SCENARIO === "stop"
-    ? `${OPEN}\nthen immediately call oc_stop on that session id.\nreply STOPPED and nothing else. do not call oc_wait.`
+    ? `${OPEN}\nthen immediately call oc_stop on that session id.\nreply STOPPED and nothing else. oc_stop is your last tool call.`
     : SCENARIO === "since"
-      ? `${OPEN}\nthen call oc_wait on that session id with since 1.\nreply with the whole oc_wait result and nothing else. do not call oc_wait again.\nwhen a message about a settled OpenCode thread arrives, call oc_read on that session id, then reply READ.`
-      : `${OPEN}\n${SEND}\nthen reply OPENED and nothing else. do not call oc_wait.\nwhen a message about a settled OpenCode thread arrives, call oc_read on that session id, then reply READ.`;
+      ? `${OPEN}\nthen call oc_wait on that session id with since 1.\nreply with the whole oc_wait result and nothing else — one oc_wait per run.\nwhen a message about a settled OpenCode thread arrives, call oc_read on that session id, then reply READ.`
+      : `${OPEN}\n${SEND}\nthen reply OPENED and nothing else. oc_open and oc_send are your only tool calls this run.\nwhen a message about a settled OpenCode thread arrives, call oc_read on that session id, then reply READ.`;
 // After the run settles, time to watch for a turn that must not open.
 const QUIET_MS = 9_000;
 
