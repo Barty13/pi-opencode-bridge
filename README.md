@@ -39,22 +39,24 @@ Pi runs one turn at a time, and a turn is the unit that blocks. Delegation with 
 holds that turn for the whole run of the other model. Here the send returns in milliseconds. The
 finish arrives later, as one message, with the answer already inside it.
 
-The bridge adds eight tools and six commands.
+The bridge adds nine tools and seven commands.
 
 | Tool | What it does |
 | --- | --- |
 | `oc_models` | Lists the models the service serves for delegation, with each effort ladder |
 | `oc_open` | Opens a thread for one self-contained task, returns its id |
+| `oc_attach` | Adopts a thread the bridge did not open, arms one settle watch |
 | `oc_send` | Hands an instruction to a thread, returns at once |
 | `oc_steer` | Corrects a running thread in place; applies at the next step boundary |
 | `oc_wait` | Collects the settle inside the current turn, when a wake-up cannot arrive |
 | `oc_read` | Shows the latest messages, `parts: "full"` adds reasoning and tool calls |
 | `oc_reply` | Answers an open permission or form ask by id |
-| `oc_stop` | Interrupts a running thread, no wake-up follows |
+| `oc_stop` | Interrupts a running thread, or drops the watch with `detach: true` |
 
 | Command | What it does |
 | --- | --- |
-| `/oc` | Status: mode, service, live threads |
+| `/oc` | Status: mode, service, live threads; adopted threads marked `attached` |
+| `/oc-attach <ses_...>` | Adopts an existing thread under `OC_ROOT` |
 | `/oc-auto` | The model in this Pi session answers the asks |
 | `/oc-accept` | You answer the asks yourself |
 | `/oc-kill <id>` | Stops a thread |
@@ -95,6 +97,20 @@ A batch that lands while you type waits for you. A batch held by compaction wait
 to end. An escape (abort) holds the batch, so a wake-up cannot reopen a conversation you dropped.
 
 Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
+
+## Attach
+
+`oc_attach` adopts a thread the bridge did not open, for example a TUI thread or one a previous Pi
+session left. It reports the title, model, variant, size, open asks, and `running` or `idle`:
+
+```
+attached ses_… "attach-probe"
+model: opencode-go/glm-5.3-flash variant default · 8k tokens · open asks: none · idle
+```
+
+It arms one watch with the floor at the newest row, so an answer from an earlier run is not reported
+as a fresh settle. `/oc-attach <ses_...>` does the same from the command line, and `/oc` marks
+adopted threads `attached`. `oc_stop` with `detach: true` drops the watch and leaves the run going.
 
 ## Steering
 
@@ -152,10 +168,10 @@ stale run stays safe.
 
 ## Boundary
 
-Threads live under `OC_ROOT`. `oc_open` checks the create path, every other tool checks that
-thread's own directory once. Real paths compare, so a symlink cannot escape the root. Threads can
-write files, so point `OC_ROOT` at a scratch tree you own. Without `OC_ROOT` the root is the
-working directory at start.
+Threads live under `OC_ROOT`. `oc_open` checks the create path, `oc_attach` checks the adopted
+thread's directory, and every other tool checks that thread's own directory once. Real paths compare,
+so a symlink cannot escape the root. Threads can write files, so point `OC_ROOT` at a scratch tree you
+own. Without `OC_ROOT` the root is the working directory at start.
 
 ## Environment
 

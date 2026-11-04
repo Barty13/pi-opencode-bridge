@@ -9,3 +9,4 @@ pnpm-workspace.yaml
 .control-nogate.ts
 .control-digest.ts
 .control-steer.ts
+.control-attach.ts

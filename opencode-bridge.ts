@@ -146,6 +146,8 @@ interface BridgeState {
   labels: Map<string, string>;
   /** Threads this run has touched; a reconnect rescans their open asks. */
   known: Set<string>;
+  /** Threads adopted by oc_attach, so /oc can mark them. */
+  attached: Set<string>;
   /** Threads owed a wake-up. The only floor source: a send sets it, a settle or stop clears it. */
   armed: Map<string, Watch>;
   /** Threads whose settle is being read, so stream and backstop settle one thread once. */
@@ -177,6 +179,7 @@ function freshState(): BridgeState {
     dirs: new Map(),
     labels: new Map(),
     known: new Set(),
+    attached: new Set(),
     armed: new Map(),
     claimed: new Set(),
     sending: new Map(),
@@ -352,6 +355,7 @@ async function assertLocal(state: BridgeState, session: string): Promise<void> {
 function forget(state: BridgeState, session: string): void {
   state.local.delete(session);
   state.known.delete(session);
+  state.attached.delete(session);
   state.dirs.delete(session);
   state.labels.delete(session);
   state.reportedRun.delete(session);
@@ -388,13 +392,18 @@ async function recentRows(session: string, want = 8): Promise<any[]> {
   return (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${want}`)).data ?? [];
 }
 
+/** Thread size in tokens: input, cache, output, and reasoning. */
+function sizeOf(row: any): number {
+  const t = row?.tokens ?? {};
+  return (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0);
+}
+
 /** Newest answer size; a compaction newer than that answer reads 0, so no double compact. */
 async function readContext(session: string): Promise<{ size: number; tokens: number }> {
   const rows = await recentRows(session);
   const answer = rows.find((row) => row.type === "assistant");
   if (!answer) return { size: 0, tokens: 0 };
-  const t = answer.tokens ?? {};
-  const tokens = (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0);
+  const tokens = sizeOf(answer);
   const compactAt = Number(rows.find((row) => row.type === "compaction")?.time?.created ?? 0);
   return { size: compactAt > Number(answer.time?.created ?? 0) ? 0 : tokens, tokens };
 }
@@ -1127,6 +1136,28 @@ export default function (pi: ExtensionAPI) {
     drawHud();
   };
 
+  /** Adopt a thread the bridge did not open: one watch, floor at its newest row. */
+  const attach = async (session: string): Promise<string> => {
+    const row = (await api<any>("GET", `/api/session/${session}`)).data;
+    if (!underRoot(row)) {
+      throw new Error(`Thread ${session} sits in ${row?.location?.directory ?? "an unknown directory"}, outside ${ROOT}.`);
+    }
+    await assertLocal(state, session);
+    if (state.armed.has(session)) return `already armed: ${session}`;
+    const newest = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=1`)).data?.[0];
+    const floor = Number(newest?.time?.created ?? 0);
+    armThread(session, floor);
+    state.known.add(session);
+    state.attached.add(session);
+    state.labels.set(session, String(row.model?.id ?? ""));
+    const open = await asks(session).catch(() => null);
+    const asksLine = open === null ? "open asks: unreadable" : open.length ? `open asks: ${open.length}` : "open asks: none";
+    const model = `${row.model?.providerID ?? "?"}/${row.model?.id ?? "?"}`;
+    return `attached ${session} "${row.title ?? ""}"\nmodel: ${model} variant ${row.model?.variant ?? "default"} · ${
+      tokenK(sizeOf(row))
+    } tokens · ${asksLine} · ${busy(row) ? "running" : "idle"}`;
+  };
+
   /** Footer count plus the table above the editor; a TUI timer refreshes the age and TTL. */
   function drawHud(): void {
     const context = ctx;
@@ -1182,13 +1213,14 @@ export default function (pi: ExtensionAPI) {
     // Restore armed floors from the last session; the deadline gets a fresh TTL.
     const saved = (context.sessionManager.getEntries()
       .findLast((e: any) => e.type === "custom" && e.customType === "oc-armed") as
-      { data?: Array<{ session: string; floor: number; steers?: number }> } | undefined)?.data;
+      { data?: Array<{ session: string; floor: number; steers?: number; attached?: boolean }> } | undefined)?.data;
     for (const row of saved ?? []) {
       state.armed.set(row.session, {
         floor: row.floor,
         deadline: Date.now() + WATCH_TTL_MS,
         steers: row.steers ?? 0,
       });
+      if (row.attached) state.attached.add(row.session);
     }
     if (pi.getFlag("oc-auto") === true) state.mode = "unsupervised";
     abort?.abort();
@@ -1209,9 +1241,14 @@ export default function (pi: ExtensionAPI) {
     stopBackstop();
     if (hudTimer) clearInterval(hudTimer);
     hudTimer = null;
-    // Save armed floors and steer counts; the next session_start restores them with a fresh TTL.
+    // Save armed floors, steer counts, and attach markers; the next session_start restores them.
     if (state.armed.size) pi.appendEntry("oc-armed",
-      [...state.armed].map(([session, w]) => ({ session, floor: w.floor, steers: w.steers })));
+      [...state.armed].map(([session, w]) => ({
+        session,
+        floor: w.floor,
+        steers: w.steers,
+        attached: state.attached.has(session),
+      })));
     reset();
     panesOn = false;
   });
@@ -1342,6 +1379,30 @@ export default function (pi: ExtensionAPI) {
           }
         }
         return { content: [{ type: "text", text: `${session}${sent}` }], details: { session } };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_attach",
+      label: "OC attach",
+      description: "Adopt a thread the bridge did not open; arms one settle watch.",
+      namespace: ns,
+      annotations: { openWorldHint: true },
+      parameters: Type.Object(sessionParam),
+      async execute(_id, params) {
+        try {
+          const text = await attach(params.session);
+          return { content: [{ type: "text", text }], details: { session: params.session } };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `attach failed: ${message}` }],
+            details: { session: params.session },
+            isError: true,
+          };
+        }
       },
     }),
   );
@@ -1652,12 +1713,24 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "oc_stop",
       label: "OC stop",
-      description: "Interrupt a running thread; no settle or wake-up follows.",
+      description: "Interrupt a running thread, or drop its watch with detach:true.",
       namespace: ns,
       annotations: { destructiveHint: true },
-      parameters: Type.Object(sessionParam),
+      parameters: Type.Object({
+        ...sessionParam,
+        detach: Type.Optional(Type.Boolean({ description: "Drop the watch only; the run keeps going" })),
+      }),
       async execute(_id, params) {
         await assertLocal(state, params.session);
+        if (params.detach) {
+          const armed = state.armed.has(params.session);
+          unwatch(state, params.session);
+          drawHud();
+          return {
+            content: [{ type: "text", text: armed ? "detached; the run keeps going" : "no watch to detach" }],
+            details: { session: params.session, detached: armed, interrupted: false },
+          };
+        }
         // Unwatch first: this call carries the result, so the interrupted event owes no turn. Waiters
         // stay, because a failed interrupt leaves the run live for them.
         const prior = state.armed.get(params.session);
@@ -1677,7 +1750,7 @@ export default function (pi: ExtensionAPI) {
         paneCall(["rm", params.session]);
         return {
           content: [{ type: "text", text: `${hit ? "interrupted" : "no run to interrupt"}${queued ? `\n\nThe run had already settled:\n${settleText(queued)}` : ""}` }],
-          details: { interrupted: hit },
+          details: { session: params.session, detached: false, interrupted: hit },
         };
       },
     }),
@@ -1694,7 +1767,11 @@ export default function (pi: ExtensionAPI) {
     description: "OpenCode bridge status: mode, service, threads",
     handler: async (_args, context) => {
       ctx = context;
-      const rows = ((await api<any>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot).slice(0, 8);
+      const all = ((await api<any>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot);
+      const rows = [
+        ...all.filter((row: any) => state.attached.has(row.id)),
+        ...all.filter((row: any) => !state.attached.has(row.id)),
+      ].slice(0, 8);
       say(
         context,
         [
@@ -1702,9 +1779,26 @@ export default function (pi: ExtensionAPI) {
           `service: ${(service ??= await discover()).url}`,
           `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
           `served: ${(await cheapModels()).ids.join(", ")}`,
-          ...rows.map((row: any) => `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title ?? ""}`),
+          ...rows.map((row: any) =>
+            `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title ?? ""}${
+              state.attached.has(row.id) ? "  attached" : ""
+            }`
+          ),
         ].join("\n"),
       );
+    },
+  });
+
+  pi.registerCommand("oc-attach", {
+    description: "Adopt an existing thread under OC_ROOT",
+    handler: async (args, context) => {
+      const session = args.trim();
+      if (!session.startsWith("ses_")) return say(context, "usage: /oc-attach <ses_...>");
+      try {
+        say(context, await attach(session));
+      } catch (error) {
+        say(context, `attach failed: ${error instanceof Error ? error.message : error}`);
+      }
     },
   });
 

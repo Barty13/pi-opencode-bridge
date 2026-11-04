@@ -35,6 +35,9 @@ claimed = "        if (state.sending.has(params.session)) {"
 assert claimed in src
 control = control.replace(claimed, "        if (state.claimed.has(params.session)) {\n          return {\n            content: [{ type: \"text\", text: \"the run is settling; no steer sent\" }],\n            details: { session: params.session, steered: false },\n            isError: true,\n          };\n        }\n" + claimed)
 open('.control-steer.ts','w').write(control.replace(steer, "          armThread(params.session);\n" + steer))
+floor = "  const floor = Number(newest?.time?.created ?? 0);"
+assert floor in src
+open('.control-attach.ts','w').write(src.replace(floor, "  const floor = Date.now();"))
 PY
 ```
 
@@ -52,6 +55,8 @@ bun run checks/check-6-digest.ts
 BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts                   # must fail
 bun run checks/check-7-steer.ts
 BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts                     # must fail
+bun run checks/check-8-attach.ts
+BRIDGE=$PWD/.control-attach.ts bun run checks/check-8-attach.ts                   # must fail
 ```
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
@@ -79,6 +84,17 @@ The control drops the compaction floor, so the `compact` case must fail.
 | `polling` | a steer inside a held backstop poll is admitted, counted once, one wake-up |
 
 The control restores three defects: the steer re-arm (`one`), the old `busy` predicate (`rerun`), and the `claimed` guard (`polling`).
+
+`check-8-attach.ts` runs the attach cases against a stub service:
+
+| Case | What it proves |
+| --- | --- |
+| `old` | a thread settled before attach gives no wake-up; a second attach says `already armed`; `/oc` marks it `attached` |
+| `live` | a mid-run thread with `busy > idle` attaches; one wake-up carries the answer row created before attach |
+| `escape` | a thread outside `OC_ROOT` is refused; nothing is armed; the command reports the failure |
+| `detach` | `oc_stop detach: true` drops the watch, keeps the run, and never posts `/interrupt` |
+
+The control uses floor `Date.now()`, so `live` must fail: it wakes without the answer row.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
