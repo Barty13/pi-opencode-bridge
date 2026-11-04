@@ -20,6 +20,9 @@ open('.control-bridge.ts','w').write(out)
 gate = "    if (mine.compacting) return;  // keep the batch; afterCompact re-arms the flush\n"
 assert gate in src
 open('.control-compact.ts','w').write(src.replace(gate, ""))
+ceiling = "const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);"
+assert ceiling in src
+open('.control-nogate.ts','w').write(src.replace(ceiling, "const COMPACT_TOKENS = 0;  // CONTROL: gate off"))
 PY
 ```
 
@@ -31,7 +34,13 @@ bun run checks/check-1-compact.ts
 BRIDGE=file://$PWD/.control-bridge.ts CASE=stale bun run checks/check-3-unit.ts   # must fail
 BRIDGE=file://$PWD/.control-bridge.ts CASE=dup bun run checks/check-3-unit.ts     # must fail
 BRIDGE=file://$PWD/.control-compact.ts bun run checks/check-1-compact.ts          # must fail
+bun run checks/check-4-gate.ts
+BRIDGE=$PWD/.control-nogate.ts bun run checks/check-4-gate.ts                     # must fail
 ```
+
+`check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
+`OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
+compaction row precedes the reply and the size dropped. It prints `SKIP` when no thread qualifies.
 
 `check-tui.sh` and `check-reload.sh` drive a real pi TUI through tmux, one pane snapshot per second,
 and need a model, so they take `OC_CHECK_MODEL=<id from oc_models>`. They set `OC_ROOT` to a

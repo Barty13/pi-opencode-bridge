@@ -6,3 +6,4 @@ pnpm-workspace.yaml
 .control-bridge.ts
 .control-compact.ts
 .DS_Store
+.control-nogate.ts

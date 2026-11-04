@@ -1,6 +1,6 @@
 {
   "name": "@barty13/pi-opencode-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Delegate threads to a local OpenCode service from Pi. oc_open returns at once, the thread settling opens a later turn.",
   "license": "MIT",
   "keywords": [
@@ -26,7 +26,7 @@
     "image": "assets/banner.png"
   },
   "scripts": {
-    "check": "for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts",
+    "check": "for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts && bun run checks/check-4-gate.ts && BRIDGE=$PWD/.control-nogate.ts bun run checks/check-4-gate.ts || [ $? -eq 1 ]",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {

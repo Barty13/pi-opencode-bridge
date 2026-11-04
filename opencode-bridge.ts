@@ -14,6 +14,8 @@
  * per-lane worktrees. `oc_open` checks the create path, every other tool checks the thread's own
  * directory once and remembers it.
  *
+ * Compact gate: a send past OC_COMPACT_TOKENS (default 500k) orders a compaction first; `0` turns it off.
+ *
  * Wake-ups: a send returns at once and the thread settling opens a later turn, so no Pi turn is
  * held open by a wait. Detector: `session.execution.{succeeded,failed,interrupted}` on the event
  * stream, with one detail GET per armed thread every 5s as a backstop for dropped frames. Detect
@@ -65,6 +67,7 @@ const DEBOUNCE_MS = Number(process.env.OC_DEBOUNCE_MS ?? 400);
 const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
 const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
 const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
+const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);
 // Only in-flight sends are armed, so the ceiling bounds a runaway loop of sends, not real work.
 const MAX_THREADS = 32;
 // `OC_HUD=0` leaves the footer and the table alone.
@@ -138,7 +141,6 @@ interface BridgeState {
   armed: Map<string, Watch>;
   /** Threads whose settle is being read, so stream and backstop settle one thread once. */
   claimed: Set<string>;
-  /** Prompt POST in flight: a settle arriving now belongs to the run before this send. */
   /** Prompt POSTs in flight, counted: parallel sends on one thread share the key. */
   sending: Map<string, number>;
   batch: Settle[];
@@ -375,6 +377,22 @@ function clip(text: string): string {
 
 async function recentRows(session: string, want = 8): Promise<any[]> {
   return (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${want}`)).data ?? [];
+}
+
+/** Newest answer size; a compaction newer than that answer reads 0, so no double compact. */
+async function readContext(session: string): Promise<{ size: number; tokens: number }> {
+  const rows = await recentRows(session);
+  const answer = rows.find((row) => row.type === "assistant");
+  if (!answer) return { size: 0, tokens: 0 };
+  const t = answer.tokens ?? {};
+  const tokens = (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0);
+  const compactAt = Number(rows.find((row) => row.type === "compaction")?.time?.created ?? 0);
+  return { size: compactAt > Number(answer.time?.created ?? 0) ? 0 : tokens, tokens };
+}
+
+/** Token count for a receipt: 612000 reads 612k. */
+function tokenK(tokens: number): string {
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
 }
 
 function money(row: any): string {
@@ -949,9 +967,14 @@ export default function (pi: ExtensionAPI) {
    * returns. A definitive 4xx means the prompt never landed, so the watch goes with it; a timeout
    * keeps the watch, because the service may be running that prompt.
    */
-  const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
+  const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<number> => {
+    // Read the size before taking state: a session switch during the read must not leave the send
+    // armed in the state it replaced.
+    const size = COMPACT_TOKENS ? await readContext(session).then((read) => read.size).catch(() => 0) : 0;
     const mine = state;
     const previous = mine.armed.get(session);
+    const compactAt = size > COMPACT_TOKENS ? size : 0;
+    if (compactAt) await api("POST", `/api/session/${session}/compact`, { delivery: "steer" }).catch(() => {});
     armThread(session);
     mine.sending.set(session, (mine.sending.get(session) ?? 0) + 1);
     try {
@@ -970,6 +993,7 @@ export default function (pi: ExtensionAPI) {
       if (left > 0) mine.sending.set(session, left);
       else mine.sending.delete(session);
     }
+    return compactAt;
   };
 
   const armThread = (session: string, floor = Date.now()): void => {
@@ -1186,9 +1210,9 @@ export default function (pi: ExtensionAPI) {
         if (params.brief) {
           // The thread exists, so a failed brief still has to hand back its id.
           try {
-            await sendPrompt(session, { text: params.brief });
+            const compactAt = await sendPrompt(session, { text: params.brief });
             if (state.armed.has(session)) paneCall(["add", session, dir]);
-            sent = "\nbrief sent, wake-up armed";
+            sent = `\nbrief sent, wake-up armed${compactAt ? `\ncompact ordered at ${tokenK(compactAt)}` : ""}`;
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return {
@@ -1207,7 +1231,7 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "oc_send",
       label: "OC send",
-      description: "Hand an instruction to a thread; returns at once, the settle opens a later turn.",
+      description: "Hand an instruction to a thread; returns at once, the settle opens a later turn. Compacts first past OC_COMPACT_TOKENS.",
       namespace: ns,
       annotations: { openWorldHint: true },
       parameters: Type.Object({
@@ -1217,10 +1241,10 @@ export default function (pi: ExtensionAPI) {
       async execute(_id, params) {
         await assertLocal(state, params.session);
         state.known.add(params.session);
-        await sendPrompt(params.session, { text: params.text });
+        const compactAt = await sendPrompt(params.session, { text: params.text });
         if (state.armed.has(params.session)) paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
         return {
-          content: [{ type: "text", text: "sent; the settle will open a turn, keep working" }],
+          content: [{ type: "text", text: `sent; the settle will open a turn, keep working${compactAt ? `\ncompact ordered at ${tokenK(compactAt)}` : ""}` }],
           details: { session: params.session },
         };
       },

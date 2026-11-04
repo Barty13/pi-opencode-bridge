@@ -87,6 +87,19 @@ to end. An escape (abort) holds the batch, so a wake-up cannot reopen a conversa
 
 Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
 
+## Context ceiling
+
+A thread that grew past `OC_COMPACT_TOKENS` compacts before it takes your next instruction. The
+bridge reads the newest assistant row of that thread (`input + cache.read + cache.write + output +
+reasoning`), orders `POST /compact` with `delivery:"steer"`, then posts the prompt. OpenCode runs the
+compaction at the step boundary, so the prompt lands on the compacted context. Measured on a 716k
+thread: compact admitted in 77 ms, reply 98 s later, size down to 34k.
+
+The receipt says so: `sent; ... compact ordered at 716k`. A thread whose newest compaction row
+postdates its last answer reads 0, so one compaction never triggers the next. OpenCode answers a
+second steer with 409, so parallel sends order one compaction. Your own `opencode.json` auto-compact
+stays in charge below the ceiling.
+
 ## Supervision
 
 Every ask from a thread (a permission, a form) goes to you by default. `/oc-auto` hands asks to
@@ -114,6 +127,7 @@ working directory at start.
 | `OC_BACKSTOP_MS` | `5000` | Poll gap between event frames |
 | `OC_WATCH_TTL_S` | `1800` | How long an armed thread waits before it expires |
 | `OC_WAIT_MAX_S` | `300` | Ceiling for `oc_wait` |
+| `OC_COMPACT_TOKENS` | `500000` | Thread size in tokens above which a send orders a compaction first; `0` turns the gate off |
 | `OC_SERVICE_FILE` | `~/.config/opencode/service.json` | Where to read the local service password |
 | `OC_RETENTION` | `{}` | Your own data-policy labels, JSON keyed by model id suffix, for example `{"<id>":"zero"}`. Display only. The bridge ships no model ids: read each policy from your provider and set it here. |
 
