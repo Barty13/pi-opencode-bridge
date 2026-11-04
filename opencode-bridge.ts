@@ -108,6 +108,8 @@ interface Ask {
 interface Watch {
   floor: number;
   deadline: number;
+  /** Steers admitted for this run; the settle carries the count. */
+  steers: number;
 }
 
 /** One thread's outcome, read at detect so a newer run cannot answer for an older settle. */
@@ -119,6 +121,8 @@ interface Settle {
   answer: string;
   asks: Ask[];
   idleAt: number;
+  /** Steers admitted for this run. */
+  steers: number;
   /** Set when the watch expired with the run still going. */
   expired?: boolean;
   /** Set when the open-ask read failed, so "none" is not claimed as a fact. */
@@ -400,6 +404,11 @@ function tokenK(tokens: number): string {
   return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
 }
 
+/** Local clock for a receipt: 14:03:07. */
+function clock(): string {
+  return new Date().toTimeString().slice(0, 8);
+}
+
 function money(row: any): string {
   const t = row?.tokens ?? {};
   return `tokens in/out/reasoning ${t.input ?? 0}/${t.output ?? 0}/${t.reasoning ?? 0}, cache ${t.cache?.read ?? 0}, cost ${row?.cost ?? 0}`;
@@ -588,7 +597,7 @@ type Read = Settle | "gone" | null;
  * settled, so the window closes at both ends. `want` keeps the backstop poll cheap; only a report
  * reads the wide window and builds the digest. A 404 is final; anything else may pass on a retry.
  */
-async function readSettle(session: string, floor: number, want = 8): Promise<Read> {
+async function readSettle(session: string, floor: number, want = 8, steers = 0): Promise<Read> {
   let row: any;
   try {
     row = (await api<any>("GET", `/api/session/${session}`)).data;
@@ -620,6 +629,7 @@ async function readSettle(session: string, floor: number, want = 8): Promise<Rea
     asks: open ?? [],
     asksUnknown: open === null,
     idleAt,
+    steers,
     digest: want >= DIGEST_ROWS ? digestLine(digestRows, open === null ? undefined : open.length) : undefined,
   };
 }
@@ -629,6 +639,7 @@ function settleText(s: Settle): string {
   return [
     `outcome: ${s.outcome}${s.expired ? " (watch expired; restart with oc_send to read the record)" : ""}`,
     s.error ?? "error: none",
+    `steers ${s.steers}`,
     s.answer ? `answer:\n${truncate(s.answer)}` : "answer: (none)",
     s.asks.length ? `open asks:\n${s.asks.map((ask) => describe(ask)).join("\n")}` : s.asksUnknown ? "open asks: unreadable" : "open asks: none",
     ...(s.digest ? [s.digest] : []),
@@ -840,7 +851,7 @@ export default function (pi: ExtensionAPI) {
     const w = mine.armed.get(session);
     if (!w || mine.claimed.has(session) || mine.sending.has(session)) return;
     mine.claimed.add(session);
-    const read = await readSettle(session, w.floor, DIGEST_ROWS).catch(() => null);
+    const read = await readSettle(session, w.floor, DIGEST_ROWS, w.steers).catch(() => null);
     if (mine !== state) return;
     // A send during the read replaced that watch, so this result belongs to a run nobody waits on.
     if (mine.armed.get(session) !== w || mine.sending.has(session)) return void mine.claimed.delete(session);
@@ -866,7 +877,7 @@ export default function (pi: ExtensionAPI) {
         const expired: Settle = {
           // Nothing was read: the outcome and asks are unknown, not "running"/"none", and asksUnknown keeps the thread in `known` (:681) so a rescan re-checks it.
           session, title: "", outcome: "unknown", error: null, answer: "", asks: [],
-          asksUnknown: true, idleAt: Date.now(), expired: true,
+          asksUnknown: true, idleAt: Date.now(), steers: w.steers, expired: true,
         };
         // Pass the settle, so an oc_wait holding this thread gets it instead of null.
         dropThread(session, expired);
@@ -878,7 +889,7 @@ export default function (pi: ExtensionAPI) {
       mine.claimed.add(session);
       reads.push({ session, w });
     }
-    const results = await Promise.all(reads.map(({ session, w }) => readSettle(session, w.floor).catch(() => null)));
+    const results = await Promise.all(reads.map(({ session, w }) => readSettle(session, w.floor, 8, w.steers).catch(() => null)));
     if (mine !== state) return;
     for (const [index, read] of results.entries()) {
       const { session, w } = reads[index];
@@ -894,7 +905,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (read && read.idleAt > w.floor) {
         // The poll read 8 rows; read the wide window once for the report.
-        const wide = await readSettle(session, w.floor, DIGEST_ROWS).catch(() => null);
+        const wide = await readSettle(session, w.floor, DIGEST_ROWS, w.steers).catch(() => null);
         if (mine !== state) return;
         // A send or a stop during the wide read owns the thread now, so this settle is stale.
         if (mine.armed.get(session) !== w || mine.sending.has(session)) {
@@ -1059,6 +1070,11 @@ export default function (pi: ExtensionAPI) {
       signal.addEventListener("abort", stop, { once: true });
     });
 
+  /** One prompt POST, shared by a send and a steer. */
+  const postPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
+    await api("POST", `/api/session/${session}/prompt`, body);
+  };
+
   /**
    * Arm before the POST: a run that fails in milliseconds writes time.idle before the POST
    * returns. A definitive 4xx means the prompt never landed, so the watch goes with it; a timeout
@@ -1075,7 +1091,7 @@ export default function (pi: ExtensionAPI) {
     armThread(session);
     mine.sending.set(session, (mine.sending.get(session) ?? 0) + 1);
     try {
-      await api("POST", `/api/session/${session}/prompt`, body);
+      await postPrompt(session, body);
       // This send supersedes any snapshot still waiting to wake the model.
       mine.batch = mine.batch.filter((entry) => entry.session !== session);
     } catch (error) {
@@ -1099,7 +1115,7 @@ export default function (pi: ExtensionAPI) {
       // Refuse rather than evict: an evicted watch loses that thread's wake-up in silence.
       throw new Error(`${MAX_THREADS} threads in flight; wait for one to settle with oc_wait.`);
     }
-    state.armed.set(session, { floor, deadline: now + WATCH_TTL_MS });
+    state.armed.set(session, { floor, deadline: now + WATCH_TTL_MS, steers: 0 });
     // A new run owes its own report, so the marker of the run before it no longer applies.
     state.reportedRun.delete(session);
     drawHud();
@@ -1166,8 +1182,14 @@ export default function (pi: ExtensionAPI) {
     // Restore armed floors from the last session; the deadline gets a fresh TTL.
     const saved = (context.sessionManager.getEntries()
       .findLast((e: any) => e.type === "custom" && e.customType === "oc-armed") as
-      { data?: Array<{ session: string; floor: number }> } | undefined)?.data;
-    for (const row of saved ?? []) state.armed.set(row.session, { floor: row.floor, deadline: Date.now() + WATCH_TTL_MS });
+      { data?: Array<{ session: string; floor: number; steers?: number }> } | undefined)?.data;
+    for (const row of saved ?? []) {
+      state.armed.set(row.session, {
+        floor: row.floor,
+        deadline: Date.now() + WATCH_TTL_MS,
+        steers: row.steers ?? 0,
+      });
+    }
     if (pi.getFlag("oc-auto") === true) state.mode = "unsupervised";
     abort?.abort();
     abort = new AbortController();
@@ -1187,9 +1209,9 @@ export default function (pi: ExtensionAPI) {
     stopBackstop();
     if (hudTimer) clearInterval(hudTimer);
     hudTimer = null;
-    // Save armed floors; the next session_start restores them with a fresh TTL.
+    // Save armed floors and steer counts; the next session_start restores them with a fresh TTL.
     if (state.armed.size) pi.appendEntry("oc-armed",
-      [...state.armed].map(([session, w]) => ({ session, floor: w.floor })));
+      [...state.armed].map(([session, w]) => ({ session, floor: w.floor, steers: w.steers })));
     reset();
     panesOn = false;
   });
@@ -1350,6 +1372,63 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool(
     defineTool({
+      name: "oc_steer",
+      label: "OC steer",
+      description: "Correct a running thread in place; the steer applies at the next step boundary.",
+      namespace: ns,
+      annotations: { openWorldHint: true },
+      parameters: Type.Object({
+        ...sessionParam,
+        text: Type.String({ description: "Correction for the running thread" }),
+      }),
+      async execute(_id, params) {
+        await assertLocal(state, params.session);
+        const w = state.armed.get(params.session);
+        if (!w) {
+          return {
+            content: [{ type: "text", text: "no run in flight; oc_send starts one" }],
+            details: { session: params.session, steered: false },
+            isError: true,
+          };
+        }
+        if (state.claimed.has(params.session)) {
+          return {
+            content: [{ type: "text", text: "the run is settling; no steer sent" }],
+            details: { session: params.session, steered: false },
+            isError: true,
+          };
+        }
+        if (state.sending.has(params.session)) {
+          return {
+            content: [{ type: "text", text: "a send is in flight; retry oc_steer" }],
+            details: { session: params.session, steered: false },
+            isError: true,
+          };
+        }
+        try {
+          // A steer must not re-arm: the watch floor, deadline, claim, and report stay.
+          await postPrompt(params.session, { text: params.text, delivery: "steer" });
+        } catch (error) {
+          if (/HTTP 409/.test(String(error))) {
+            return {
+              content: [{ type: "text", text: "steer already pending" }],
+              details: { session: params.session, steered: false },
+            };
+          }
+          throw error;
+        }
+        // The watch can be spent or replaced during the POST; count only the run we admitted into.
+        if (state.armed.get(params.session) === w) w.steers++;
+        return {
+          content: [{ type: "text", text: `steer admitted at ${clock()} · applies at the next step boundary` }],
+          details: { session: params.session, steered: true },
+        };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
       name: "oc_wait",
       label: "OC wait",
       description:
@@ -1409,7 +1488,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
-        const read = settle ?? (await readSettle(params.session, floor, DIGEST_ROWS));
+        const read = settle ?? (await readSettle(params.session, floor, DIGEST_ROWS, w?.steers ?? 0));
         // The read spanned a session switch, so this result belongs to no live watch.
         if (mine !== state) return { content: [{ type: "text", text: "Pi session switched; retry" }], details: undefined };
         if (read === "gone" || read === null) {

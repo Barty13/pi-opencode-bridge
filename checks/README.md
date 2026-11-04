@@ -9,7 +9,7 @@ src = open('opencode-bridge.ts').read()
 pairs = [
  ("      if (mine.armed.get(session) !== w || mine.sending.has(session)) {\n        mine.claimed.delete(session);  // or detect/sweep skip it until the 30 min TTL (:701, :732)\n        continue;\n      }", "      if (mine.armed.get(session) !== w || mine.sending.has(session)) continue;"),
  ("      else if (/HTTP 4\\d\\d/.test(String(error))) dropThread(session);\n", ""),
- ('session, title: "", outcome: "unknown", error: null, answer: "", asks: [],\n          asksUnknown: true, idleAt: Date.now(), expired: true,', 'session, title: "", outcome: "running", error: null, answer: "", asks: [], idleAt: Date.now(), expired: true,'),
+ ('session, title: "", outcome: "unknown", error: null, answer: "", asks: [],\n          asksUnknown: true, idleAt: Date.now(), steers: w.steers, expired: true,', 'session, title: "", outcome: "running", error: null, answer: "", asks: [], idleAt: Date.now(), steers: w.steers, expired: true,'),
  ("      markReported(settle.asks);\n      // This message is the report for these runs; a later oc_wait must not repeat them.\n      mine.reportedRun.set(settle.session, settle.idleAt);", "      markReported(settle.asks);"),
 ]
 out = src
@@ -26,6 +26,9 @@ open('.control-nogate.ts','w').write(src.replace(ceiling, "const COMPACT_TOKENS 
 digest = "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));"
 assert digest in src
 open('.control-digest.ts','w').write(src.replace(digest, "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);"))
+steer = '          await postPrompt(params.session, { text: params.text, delivery: "steer" });'
+assert steer in src
+open('.control-steer.ts','w').write(src.replace(steer, "          armThread(params.session);\n" + steer))
 PY
 ```
 
@@ -41,6 +44,8 @@ bun run checks/check-4-gate.ts
 BRIDGE=$PWD/.control-nogate.ts bun run checks/check-4-gate.ts                     # must fail
 bun run checks/check-6-digest.ts
 BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts                   # must fail
+bun run checks/check-7-steer.ts
+BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts                     # must fail
 ```
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
@@ -55,6 +60,16 @@ BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts                 
 | `wide` | 300 rows with long paths: the path list shrinks, 5 failures survive, `unfinished: 1` shows, line ≤ 400 |
 
 The control drops the compaction floor, so the `compact` case must fail.
+
+`check-7-steer.ts` runs the steer cases against a stub service:
+
+| Case | What it proves |
+| --- | --- |
+| `one` | a steer mid-run gives one wake-up and `steers 1` |
+| `twice` | the second steer answers 409 and the run still gives one wake-up |
+| `idle` | a steer on a settled thread errors and posts nothing |
+
+The control re-arms the watch on steer, so `one` must fail.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

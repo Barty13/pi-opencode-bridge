@@ -39,13 +39,14 @@ Pi runs one turn at a time, and a turn is the unit that blocks. Delegation with 
 holds that turn for the whole run of the other model. Here the send returns in milliseconds. The
 finish arrives later, as one message, with the answer already inside it.
 
-The bridge adds seven tools and six commands.
+The bridge adds eight tools and six commands.
 
 | Tool | What it does |
 | --- | --- |
 | `oc_models` | Lists the models the service serves for delegation, with each effort ladder |
 | `oc_open` | Opens a thread for one self-contained task, returns its id |
 | `oc_send` | Hands an instruction to a thread, returns at once |
+| `oc_steer` | Corrects a running thread in place; applies at the next step boundary |
 | `oc_wait` | Collects the settle inside the current turn, when a wake-up cannot arrive |
 | `oc_read` | Shows the latest messages, `parts: "full"` adds reasoning and tool calls |
 | `oc_reply` | Answers an open permission or form ask by id |
@@ -94,6 +95,19 @@ A batch that lands while you type waits for you. A batch held by compaction wait
 to end. An escape (abort) holds the batch, so a wake-up cannot reopen a conversation you dropped.
 
 Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
+
+## Steering
+
+`oc_steer` corrects a running thread in place. It does not re-arm the watch, so the run still gives
+one wake-up. The receipt is:
+
+```
+steer admitted at 14:03:07 · applies at the next step boundary
+```
+
+Admission is not application: the steer lands at the next step boundary. A second steer while one is
+pending answers `steer already pending`, and the run keeps going. The settle body reports `steers N`
+for the run. A steer on a settled thread answers `no run in flight; oc_send starts one`.
 
 ## Run digest
 

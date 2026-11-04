@@ -8,3 +8,4 @@ pnpm-workspace.yaml
 .DS_Store
 .control-nogate.ts
 .control-digest.ts
+.control-steer.ts
