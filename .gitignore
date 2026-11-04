@@ -10,3 +10,4 @@ pnpm-workspace.yaml
 .control-digest.ts
 .control-steer.ts
 .control-attach.ts
+.control-rewind.ts

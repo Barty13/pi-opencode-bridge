@@ -1161,6 +1161,20 @@ export default function (pi: ExtensionAPI) {
     } tokens · ${asksLine} · ${running ? "running" : "idle"}${note}`;
   };
 
+  /** The human gate for a commit: supervised mode confirms in a dialog, auto mode posts through.
+   * A commit cannot be undone, so the question names the target and the paths. */
+  const confirmCommit = async (session: string, target: string, files: string): Promise<boolean> => {
+    if (state.mode === "unsupervised") return true;
+    const context = ctx;
+    if (!context?.hasUI) {
+      throw new Error("supervised commit needs a terminal dialog; run /oc-auto for this session, then retry");
+    }
+    return context.ui.confirm(
+      "OpenCode rewind",
+      `Commit the revert of ${session} to ${target}?\nFiles: ${files}\nThe run's messages after the target go away; this cannot be undone.`,
+    );
+  };
+
   /** Footer count plus the table above the editor; a TUI timer refreshes the age and TTL. */
   function drawHud(): void {
     const context = ctx;
@@ -1512,6 +1526,126 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: `steer admitted at ${clock()} · applies at the next step boundary` }],
           details: { session: params.session, steered: true },
+        };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_rewind",
+      label: "OC rewind",
+      description: "Undo the last run: stage a revert, commit it, fork before it, or clear a stage.",
+      namespace: ns,
+      annotations: { destructiveHint: true },
+      parameters: Type.Object({
+        ...sessionParam,
+        files: Type.Optional(
+          Type.Boolean({ description: "Restore the run's file edits; default true. false keeps the files" }),
+        ),
+        commit: Type.Optional(Type.Boolean({ description: "Make the staged revert permanent" })),
+        branch: Type.Optional(Type.Boolean({ description: "Fork a new thread before the run instead of reverting" })),
+        clear: Type.Optional(Type.Boolean({ description: "Drop a staged revert; the files go back to the run's state" })),
+      }),
+      async execute(_id, params) {
+        const session = params.session;
+        if (params.branch && (params.commit || params.clear)) throw new Error("branch forks; it does not commit or clear");
+        if (params.commit && params.clear) throw new Error("commit and clear conflict; pick one");
+        await assertLocal(state, session);
+        // A watched run is in flight. Refuse before the revert calls, because a revert needs an idle thread.
+        const w = state.armed.get(session);
+        if (w) {
+          const left = Math.max(0, Math.round((w.deadline - Date.now()) / 1000));
+          return {
+            content: [{
+              type: "text",
+              text: `rewind refused: ${session} has an armed watch (${left}s left). Stop it with oc_stop, or drop the watch with oc_stop detach:true, then retry.`,
+            }],
+            details: { session, rewound: false, target: "", branch: "" },
+            isError: true,
+          };
+        }
+        // The newest user row opens the last run; the rows newer than it carry that run's tools.
+        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
+        const at = rows.findIndex((row: any) => row.type === "user");
+        if (at < 0) throw new Error(`thread ${session} has no user message to rewind`);
+        const target = String(rows[at].id);
+        const runRows = rows.slice(0, at);
+        // A compaction hides the context before it, so the ledger starts after the newest one.
+        const compactAt = Number(runRows.find((row: any) => row.type === "compaction")?.time?.created ?? 0);
+        const digest = digestLine(runRows.filter((row: any) => Number(row?.time?.created ?? 0) > compactAt));
+        const revert = async (method: string, path: string, body?: unknown): Promise<any> => {
+          try {
+            return await api<any>(method, path, body);
+          } catch (error) {
+            // The service answers 409 while a run is live; say why the retry has to wait.
+            if (/HTTP 409/.test(String(error))) {
+              throw new Error(`thread ${session} is busy; wait for its settle or stop it with oc_stop, then retry`);
+            }
+            throw error;
+          }
+        };
+        const kept = params.files === false;
+        const pathsOf = (stage: any): string[] =>
+          (stage?.data?.files ?? []).map((file: any) => String(file?.file ?? "")).filter(Boolean);
+        const fileLine = (paths: string[]): string => {
+          if (kept) return "files kept (files:false)";
+          if (!paths.length) return "files restored: none";
+          const shown = paths.slice(0, 10).map((path) => (path.length > 120 ? `${path.slice(0, 119)}…` : path));
+          return `files restored: ${shown.join(", ")}${paths.length > 10 ? ` (+${paths.length - 10} more)` : ""}`;
+        };
+        if (params.clear) {
+          await revert("DELETE", `/api/session/${session}/revert`);
+          return {
+            content: [{ type: "text", text: `cleared the staged revert on ${session}; files are back at the run's state` }],
+            details: { session, rewound: false, target: "", branch: "" },
+          };
+        }
+        if (params.branch) {
+          // The only undo route: copy the history before the target and attach the child.
+          const forked = await api<any>("POST", `/api/session/${session}/fork`, { before: target });
+          const child = String(forked?.data?.id ?? "");
+          if (!child) throw new Error("fork answered no session id");
+          const attached = await attach(child).catch((error) =>
+            `forked, but attach failed: ${error instanceof Error ? error.message : String(error)}`
+          );
+          return {
+            content: [{ type: "text", text: `forked ${session} before ${target}: ${child}\n${attached}` }],
+            details: { session, rewound: false, target, branch: child },
+          };
+        }
+        const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
+        const paths = pathsOf(stage);
+        const head = [`rewound ${session} to ${target}`, fileLine(paths), digest];
+        if (!params.commit) {
+          return {
+            content: [{
+              type: "text",
+              text: [
+                ...head,
+                kept
+                  ? "staged messages only; clear drops the stage, commit makes it permanent."
+                  : "staged; clear restores these files, commit makes it permanent.",
+              ].join("\n"),
+            }],
+            details: { session, rewound: true, target, branch: "" },
+          };
+        }
+        const filesLabel = kept ? "kept (files:false)" : paths.length ? paths.join(", ") : "none";
+        if (!(await confirmCommit(session, target, filesLabel))) {
+          return {
+            content: [{ type: "text", text: "commit refused; the revert stays staged. clear restores the files." }],
+            details: { session, rewound: true, target, branch: "" },
+            isError: true,
+          };
+        }
+        await revert("POST", `/api/session/${session}/revert/commit`);
+        return {
+          content: [{
+            type: "text",
+            text: [...head, `committed; the run's messages after ${target} are gone.`].join("\n"),
+          }],
+          details: { session, rewound: true, target, branch: "" },
         };
       },
     }),

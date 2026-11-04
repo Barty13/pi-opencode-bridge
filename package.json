@@ -26,7 +26,7 @@
     "image": "assets/banner.png"
   },
   "scripts": {
-    "check": "for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts && bun run checks/check-4-gate.ts && (BRIDGE=$PWD/.control-nogate.ts bun run checks/check-4-gate.ts; [ $? -eq 1 ]) && bun run checks/check-6-digest.ts && (BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts; [ $? -eq 1 ]) && bun run checks/check-7-steer.ts && (BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts; [ $? -eq 1 ]) && bun run checks/check-8-attach.ts && (BRIDGE=$PWD/.control-attach.ts bun run checks/check-8-attach.ts; [ $? -eq 1 ])",
+    "check": "for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts && bun run checks/check-4-gate.ts && (BRIDGE=$PWD/.control-nogate.ts bun run checks/check-4-gate.ts; [ $? -eq 1 ]) && bun run checks/check-6-digest.ts && (BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts; [ $? -eq 1 ]) && bun run checks/check-7-steer.ts && (BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts; [ $? -eq 1 ]) && bun run checks/check-8-attach.ts && (BRIDGE=$PWD/.control-attach.ts bun run checks/check-8-attach.ts; [ $? -eq 1 ]) && bun run checks/check-9-rewind.ts && (BRIDGE=$PWD/.control-rewind.ts bun run checks/check-9-rewind.ts; [ $? -eq 1 ])",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {

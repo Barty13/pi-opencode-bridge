@@ -39,7 +39,7 @@ Pi runs one turn at a time, and a turn is the unit that blocks. Delegation with 
 holds that turn for the whole run of the other model. Here the send returns in milliseconds. The
 finish arrives later, as one message, with the answer already inside it.
 
-The bridge adds nine tools and seven commands.
+The bridge adds ten tools and seven commands.
 
 | Tool | What it does |
 | --- | --- |
@@ -48,6 +48,7 @@ The bridge adds nine tools and seven commands.
 | `oc_attach` | Adopts a thread the bridge did not open; arms a watch while it runs |
 | `oc_send` | Hands an instruction to a thread, returns at once |
 | `oc_steer` | Corrects a running thread in place; applies at the next step boundary |
+| `oc_rewind` | Undoes the last run: stage a revert, commit it, fork before it, or clear a stage |
 | `oc_wait` | Collects the settle inside the current turn, when a wake-up cannot arrive |
 | `oc_read` | Shows the latest messages, `parts: "full"` adds reasoning and tool calls |
 | `oc_reply` | Answers an open permission or form ask by id |
@@ -131,6 +132,32 @@ Any number of steers are accepted; each applies at its own step boundary. The se
 `steers N` when the run admitted at least one steer. A record read with no live watch omits the count,
 because the bridge cannot know it. If the service answers HTTP 409, the receipt names the status and
 the run stays.
+
+## Rewind
+
+`oc_rewind` undoes the last run of a thread. It reads the newest `user` row and stages a revert at
+that boundary. The default stage restores the run's file edits at once; the receipt names the target
+message and the paths the digest saw:
+
+```
+rewound ses_… to msg_…
+files restored: src/note.txt
+digest 2 calls (1 ok, 1 err) · shell 1 · write 1 · fails: shell: exit 1 · files: src/note.txt
+staged; clear restores these files, commit makes it permanent.
+```
+
+`files: false` stages the message revert and keeps the files. `commit: true` stages, then posts
+`/revert/commit`: the run's messages after the target go away and the staged file changes stay.
+Supervised mode asks first in a dialog that names the target and the paths; auto mode posts straight
+through. `clear: true` drops the staged revert with `DELETE /revert`, so the files go back to the
+run's state.
+
+`branch: true` is the undo that keeps the history: it forks with `POST /fork {before}` and attaches
+the child. There is no `unrevert` route, so a committed revert is final.
+
+A thread with an armed watch refuses a rewind: stop it with `oc_stop`, or drop the watch with
+`oc_stop detach: true`, then retry. The service answers 409 while a run is live, so a revert needs an
+idle thread.
 
 ## Run digest
 

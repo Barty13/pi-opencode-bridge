@@ -52,6 +52,17 @@ restore = """      if (mine !== state) return;
 assert restore in control
 control = control.replace(restore, "      if (mine !== state || readFailed) return;", 1)
 open('.control-attach.ts','w').write(control)
+rewind = '''        const filesLabel = kept ? "kept (files:false)" : paths.length ? paths.join(", ") : "none";
+        if (!(await confirmCommit(session, target, filesLabel))) {
+          return {
+            content: [{ type: "text", text: "commit refused; the revert stays staged. clear restores the files." }],
+            details: { session, rewound: true, target, branch: "" },
+            isError: true,
+          };
+        }
+'''
+assert rewind in src
+open('.control-rewind.ts','w').write(src.replace(rewind, "", 1))
 PY
 ```
 
@@ -71,6 +82,8 @@ bun run checks/check-7-steer.ts
 BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts                     # must fail
 bun run checks/check-8-attach.ts
 BRIDGE=$PWD/.control-attach.ts bun run checks/check-8-attach.ts                   # must fail
+bun run checks/check-9-rewind.ts
+BRIDGE=$PWD/.control-rewind.ts bun run checks/check-9-rewind.ts                   # must fail
 ```
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
@@ -112,6 +125,19 @@ The control restores three defects: the steer re-arm (`one`), the old `busy` pre
 | `readfail` | a failed status read during restore keeps the watch; `/oc` still counts it |
 
 The control carries four defects: the newest-row floor (`live`), the unconditional arm (`idle`), the blind restore (`restore`), and the dropped watch on a failed read (`readfail`).
+
+`check-9-rewind.ts` runs the rewind cases against a stub service:
+
+| Case | What it proves |
+| --- | --- |
+| `stage` | the default posts `{messageID, files:true}` at the newest user row and names the target, the paths, and the digest; `files:false` keeps the files |
+| `clear` | `DELETE /revert` drops the staged revert |
+| `ask` | supervised commit posts stage, then the human ask naming the target and paths, then commit; a no posts no commit |
+| `commit` | auto mode posts stage then commit, in that order, with no ask |
+| `branch` | the fork body carries `before`, the child is attached, and `/oc` marks it |
+| `armed` | an armed watch refuses the rewind with zero service calls |
+
+The control drops the supervised ask, so the `ask` case must fail.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
