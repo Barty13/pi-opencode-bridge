@@ -21,7 +21,7 @@ import { join } from "node:path";
 
 const EXTENSION = process.env.OC_EXTENSION ?? join(import.meta.dirname, "opencode-bridge.ts");
 const DEADLINE_MS = Number(process.env.OC_RPC_DEADLINE_MS ?? 240_000);
-const MODEL = process.env.OC_RPC_MODEL ?? "opencode-go/deepseek-v4.1-flash";
+const MODEL = process.env.OC_RPC_MODEL ?? "";  // any id oc_models lists; the bridge ships none
 const SCENARIO = process.env.OC_RPC_SCENARIO ?? "wake";
 // Scenarios where the settle must open a later run, instead of answering inside the first one.
 const WAKES = SCENARIO === "wake" || SCENARIO === "send" || SCENARIO === "since";
@@ -170,4 +170,4 @@ async function main(): Promise<number> {
   return ok ? 0 : 1;
 }
 
-main().then((code) => process.exit(code));
+main().then((code) => process.exit(code)).catch((error) => { console.log(`oc-rpc: ${error}`); process.exit(2); });

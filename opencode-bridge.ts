@@ -1,17 +1,20 @@
 /**
- * OpenCode bridge: hand threads to OpenCode's free models from a Pi session.
+ * OpenCode bridge: hand threads to remote models of a local OpenCode service from a Pi session.
  *
- * Transport: HTTP to the running `opencode serve --service`, because free models work only
+ * Transport: HTTP to the running `opencode serve --service`, because those models work only
  * inside the OpenCode harness. Port from `opencode service status`, password from
- * ~/.config/opencode/service.json.
+ * ~/.config/opencode/service.json. The service is read-only here: this bridge never writes it.
  *
- * Supervision: `supervised` (default) puts every ask in front of Barty; `unsupervised` hands
- * it to the local model, which answers with oc_reply. `/oc-auto`, `/oc-accept` and `--oc-auto`
+ * Supervision: `supervised` (default) puts every ask in front of you; `unsupervised` hands
+ * it to the model in this Pi session, which answers with oc_reply. `/oc-auto`, `/oc-accept` and `--oc-auto`
  * set the mode. Every session start resets to supervised and drops per-thread state, so a
  * stale run stays safe.
  *
- * Boundary: threads live under ~/Pi, subfolders are per-lane worktrees. `oc_open` checks the
- * create path, every other tool checks the thread's own directory once and remembers it.
+ * Boundary: threads live under OC_ROOT (default: the working directory at start), subfolders are
+ * per-lane worktrees. `oc_open` checks the create path, every other tool checks the thread's own
+ * directory once and remembers it.
+ *
+ * Compact gate: a send past OC_COMPACT_TOKENS (default 500k) orders a compaction first; `0` turns it off.
  *
  * Wake-ups: a send returns at once and the thread settling opens a later turn, so no Pi turn is
  * held open by a wait. Detector: `session.execution.{succeeded,failed,interrupted}` on the event
@@ -20,8 +23,8 @@
  * on that same detector instead of polling. Print, JSON, and a Pi reload get no wake-ups; there
  * `oc_wait` is the collector.
  *
- * Live view: one Ghostty column per live question through `~/bin/oc-panes`. A send opens it, the
- * settle closes it. Best effort, `OC_PANES=0` turns it off.
+ * Live view: one Ghostty column per live question through the `oc-panes` script next to this
+ * file. A send opens it, the settle closes it. Best effort, `OC_PANES=0` turns it off.
  */
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -37,8 +40,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 function resolveRoot(): string {
-  const root = join(homedir(), "Pi");
-  // A missing ~/Pi must not fail the load; directory() reports it when a call needs it.
+  // Threads may write files, so the root is an explicit scratch tree, not the Pi config dir.
+  const root = process.env.OC_ROOT ?? process.cwd();
+  // A missing root must not fail the load; directory() reports it when a call needs it.
   try {
     return realpathSync(root);
   } catch {
@@ -46,23 +50,33 @@ function resolveRoot(): string {
   }
 }
 const ROOT = resolveRoot();
+// OC_SERVICE_FILE points at another service file; the checks need a stub, bun ignores HOME.
+const SERVICE_FILE = process.env.OC_SERVICE_FILE ?? join(homedir(), ".config", "opencode", "service.json");
 const MAX_TEXT = 4000;
-/** Data policy for the ids this account serves. Source: opencode.ai/v2/docs/console/models/#privacy,
-  * read 2026-11-03; ENVIRONMENT.md holds the full table. Match is by exact id: a substring would give
-  * a new model someone else's policy, and two of the old rows name models no longer served. */
-const RETENTION: Array<[string, string]> = [
-  ["glm-5.3", "zero"], ["glm-5.3-flash", "zero"], ["deepseek-v4.1-flash", "zero"],
-];
+/** Data policy per model id, filled by the operator: OC_RETENTION='{"<id-suffix>":"zero"}'.
+  * Read the policy from your provider's model page; this bridge ships no ids. Match is by exact
+  * id suffix, so a new model gets no label rather than another model's policy. Display only. */
+const RETENTION: Array<[string, string]> = (() => {
+  try {
+    return Object.entries(JSON.parse(process.env.OC_RETENTION ?? "{}") as Record<string, string>);
+  } catch {
+    return [];  // a broken OC_RETENTION must not stop the load
+  }
+})();
 const DEBOUNCE_MS = Number(process.env.OC_DEBOUNCE_MS ?? 400);
 const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
 const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
 const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
+const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);
 // Only in-flight sends are armed, so the ceiling bounds a runaway loop of sends, not real work.
 const MAX_THREADS = 32;
 // `OC_HUD=0` leaves the footer and the table alone.
 const HUD = process.env.OC_HUD !== "0";
 
-const PANES = process.env.OC_PANES === "0" ? "" : join(homedir(), "bin", "oc-panes");
+// Ship oc-panes next to the extension; OC_PANES names another path, OC_PANES=0 turns the view off.
+const PANES = process.env.OC_PANES === "0"
+  ? ""
+  : process.env.OC_PANES ?? join(import.meta.dirname, "oc-panes");
 // Panes are a TUI affordance: print, JSON, and RPC own the terminal, so no column opens there.
 // session_start sets this from the mode.
 let panesOn = false;
@@ -114,6 +128,8 @@ interface BridgeState {
   local: Set<string>;
   /** Ask ids already handed over, so a second path stays silent. */
   reported: Set<string>;
+  /** `time.idle` of the run whose settle already reached the model, so one run is reported once. */
+  reportedRun: Map<string, number>;
   pendingAsks: Ask[];
   /** Directory each thread reported, so a later send can open its column. */
   dirs: Map<string, string>;
@@ -125,7 +141,6 @@ interface BridgeState {
   armed: Map<string, Watch>;
   /** Threads whose settle is being read, so stream and backstop settle one thread once. */
   claimed: Set<string>;
-  /** Prompt POST in flight: a settle arriving now belongs to the run before this send. */
   /** Prompt POSTs in flight, counted: parallel sends on one thread share the key. */
   sending: Map<string, number>;
   batch: Settle[];
@@ -148,6 +163,7 @@ function freshState(): BridgeState {
     mode: "supervised",
     local: new Set(),
     reported: new Set(),
+    reportedRun: new Map(),
     pendingAsks: [],
     dirs: new Map(),
     labels: new Map(),
@@ -200,7 +216,7 @@ let modelCache: { at: number; ids: string[]; variants: Map<string, string[]> } =
 async function discover(): Promise<Service> {
   const { stdout } = await promisify(execFile)("opencode", ["service", "status"], { encoding: "utf8", timeout: 5_000 });
   const url = stdout.trim();
-  const file = join(homedir(), ".config", "opencode", "service.json");
+  const file = SERVICE_FILE;
   let password: unknown;
   try {
     password = JSON.parse(readFileSync(file, "utf8")).password;
@@ -247,7 +263,7 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
   }
 }
 
-/** Cheap models the account serves, read live: ids keep their provider prefix and each model
+/** Models the service serves for delegation, read live: ids keep their provider prefix and each model
  * carries its own ladder. `force` skips the cache, because oc_models is where the model reads
  * the list. exec runs async: a sync 5s call would freeze the TUI. */
 async function cheapModels(force = false): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
@@ -275,7 +291,7 @@ async function requireModel(
   // A model added after the last read is real, so one forced refresh precedes the refusal.
   if (!hits.length) ({ ids, variants } = await cheapModels(true));
   hits = hitsIn(ids);
-  if (!hits.length) throw new Error(`Model ${model} is not served cheaply. Read oc_models for the list.`);
+  if (!hits.length) throw new Error(`Model ${model} is not on the oc_models list. Read oc_models, then pick one.`);
   if (hits.length > 1) throw new Error(`Model ${model} is ambiguous: ${hits.join(", ")}. Pick one: go bills the subscription, opencode is the free tier.`);
   const [providerID, ...rest] = hits[0].split("/");
   return { providerID, id: rest.join("/"), variants: variants.get(hits[0]) };
@@ -297,7 +313,7 @@ function directory(input?: string): string {
   const dir = input ? join(ROOT, input) : ROOT;
   if (dir !== ROOT && !dir.startsWith(ROOT + "/")) throw new Error(`Directory must sit under ${ROOT}`);
   if (!existsSync(dir)) throw new Error(`${dir} does not exist. Omit directory to work in ${ROOT}.`);
-  // A symlink under ~/Pi can point outside it, so check where the path really lands.
+  // A symlink under the root can point outside it, so check where the path really lands.
   const real = realpathSync(dir);
   if (real !== ROOT && !real.startsWith(ROOT + "/")) throw new Error(`${dir} resolves outside ${ROOT}`);
   return real;
@@ -309,7 +325,7 @@ async function assertLocal(state: BridgeState, session: string): Promise<void> {
   if (state.local.has(session)) return;
   const row = (await api<any>("GET", `/api/session/${session}`)).data;
   const reported = String(row?.location?.directory ?? "");
-  // Compare real paths, so a symlink under ~/Pi cannot pass for a thread that lives outside it.
+  // Compare real paths, so a symlink under the root cannot pass for a thread that lives outside it.
   let dir = reported;
   try {
     dir = realpathSync(reported);
@@ -329,6 +345,7 @@ function forget(state: BridgeState, session: string): void {
   state.known.delete(session);
   state.dirs.delete(session);
   state.labels.delete(session);
+  state.reportedRun.delete(session);
   // A deleted thread's asks must stop occupying the queue and the reported set.
   const dropped = state.pendingAsks.filter((ask) => ask.session === session);
   state.pendingAsks = state.pendingAsks.filter((ask) => ask.session !== session);
@@ -360,6 +377,22 @@ function clip(text: string): string {
 
 async function recentRows(session: string, want = 8): Promise<any[]> {
   return (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${want}`)).data ?? [];
+}
+
+/** Newest answer size; a compaction newer than that answer reads 0, so no double compact. */
+async function readContext(session: string): Promise<{ size: number; tokens: number }> {
+  const rows = await recentRows(session);
+  const answer = rows.find((row) => row.type === "assistant");
+  if (!answer) return { size: 0, tokens: 0 };
+  const t = answer.tokens ?? {};
+  const tokens = (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0);
+  const compactAt = Number(rows.find((row) => row.type === "compaction")?.time?.created ?? 0);
+  return { size: compactAt > Number(answer.time?.created ?? 0) ? 0 : tokens, tokens };
+}
+
+/** Token count for a receipt: 612000 reads 612k. */
+function tokenK(tokens: number): string {
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
 }
 
 function money(row: any): string {
@@ -543,7 +576,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("oc-auto", {
     type: "boolean",
     default: false,
-    description: "Answer OpenCode model questions with the local model",
+    description: "Answer OpenCode model questions with this session's model",
   });
 
   /** Hold an ask for a later turn. One copy per id, because a rescan can repeat it. */
@@ -677,7 +710,11 @@ export default function (pi: ExtensionAPI) {
     const count = batch.length === 1 ? "One OpenCode thread" : `${batch.length} OpenCode threads`;
     const head = `${count}${waited ? " settled while the run was cancelled" : " settled"}:`;
     const text = `${head}\n${batch.map(batchLine).join("\n")}\n\nRead a thread with oc_read, then continue the task that started it.`;
-    for (const settle of batch) markReported(settle.asks);
+    for (const settle of batch) {
+      markReported(settle.asks);
+      // This message is the report for these runs; a later oc_wait must not repeat them.
+      mine.reportedRun.set(settle.session, settle.idleAt);
+    }
     // prompt() ignores deliverAs while idle and queues on it while busy (agent-session.js:1664-1677),
     // so one call covers both states.
     pi.sendUserMessage(text, { deliverAs: "followUp" });
@@ -930,9 +967,14 @@ export default function (pi: ExtensionAPI) {
    * returns. A definitive 4xx means the prompt never landed, so the watch goes with it; a timeout
    * keeps the watch, because the service may be running that prompt.
    */
-  const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
+  const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<number> => {
+    // Read the size before taking state: a session switch during the read must not leave the send
+    // armed in the state it replaced.
+    const size = COMPACT_TOKENS ? await readContext(session).then((read) => read.size).catch(() => 0) : 0;
     const mine = state;
     const previous = mine.armed.get(session);
+    const compactAt = size > COMPACT_TOKENS ? size : 0;
+    if (compactAt) await api("POST", `/api/session/${session}/compact`, { delivery: "steer" }).catch(() => {});
     armThread(session);
     mine.sending.set(session, (mine.sending.get(session) ?? 0) + 1);
     try {
@@ -951,6 +993,7 @@ export default function (pi: ExtensionAPI) {
       if (left > 0) mine.sending.set(session, left);
       else mine.sending.delete(session);
     }
+    return compactAt;
   };
 
   const armThread = (session: string, floor = Date.now()): void => {
@@ -960,6 +1003,8 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`${MAX_THREADS} threads in flight; wait for one to settle with oc_wait.`);
     }
     state.armed.set(session, { floor, deadline: now + WATCH_TTL_MS });
+    // A new run owes its own report, so the marker of the run before it no longer applies.
+    state.reportedRun.delete(session);
     drawHud();
   };
 
@@ -1093,8 +1138,8 @@ export default function (pi: ExtensionAPI) {
   const ns = {
     name: "opencode",
     aliases: ["oc"],
-    description: "Hand threads to cheap remote models over the local OpenCode service.",
-    instructions: `Print, JSON, and a Pi reload carry no wake-up; there oc_wait is the collector. In auto mode the local model receives the thread's asks and answers them with oc_reply.`,
+    description: "Hand threads to remote models over the local OpenCode service.",
+    instructions: `Print, JSON, and a Pi reload carry no wake-up; there oc_wait is the collector. In auto mode the model in this Pi session receives the thread's asks and answers them with oc_reply.`,
   };
 
   const sessionParam = { session: Type.String({ pattern: "^ses", description: "ses_… id from oc_open" }) };
@@ -1103,7 +1148,7 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "oc_models",
       label: "OC models",
-      description: "List cheap OpenCode models the account serves now, with provider prefixes.",
+      description: "List the OpenCode models the service serves now, with provider prefixes.",
       namespace: ns,
       annotations: { readOnlyHint: true },
       parameters: Type.Object({}),
@@ -1165,9 +1210,9 @@ export default function (pi: ExtensionAPI) {
         if (params.brief) {
           // The thread exists, so a failed brief still has to hand back its id.
           try {
-            await sendPrompt(session, { text: params.brief });
+            const compactAt = await sendPrompt(session, { text: params.brief });
             if (state.armed.has(session)) paneCall(["add", session, dir]);
-            sent = "\nbrief sent, wake-up armed";
+            sent = `\nbrief sent, wake-up armed${compactAt ? `\ncompact ordered at ${tokenK(compactAt)}` : ""}`;
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return {
@@ -1186,7 +1231,7 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "oc_send",
       label: "OC send",
-      description: "Hand an instruction to a thread; returns at once, the settle opens a later turn.",
+      description: "Hand an instruction to a thread; returns at once, the settle opens a later turn. Compacts first past OC_COMPACT_TOKENS.",
       namespace: ns,
       annotations: { openWorldHint: true },
       parameters: Type.Object({
@@ -1196,10 +1241,10 @@ export default function (pi: ExtensionAPI) {
       async execute(_id, params) {
         await assertLocal(state, params.session);
         state.known.add(params.session);
-        await sendPrompt(params.session, { text: params.text });
+        const compactAt = await sendPrompt(params.session, { text: params.text });
         if (state.armed.has(params.session)) paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
         return {
-          content: [{ type: "text", text: "sent; the settle will open a turn, keep working" }],
+          content: [{ type: "text", text: `sent; the settle will open a turn, keep working${compactAt ? `\ncompact ordered at ${tokenK(compactAt)}` : ""}` }],
           details: { session: params.session },
         };
       },
@@ -1293,6 +1338,20 @@ export default function (pi: ExtensionAPI) {
             details: { session: params.session, settled: false, asks: read.asks },
           };
         }
+        // One run reaches the model once. The wake-up already carried this run, so point at it
+        // instead of handing out a second copy. `since` names a point on purpose, so that call reads
+        // the record freely.
+        if (settle === null && params.since === undefined && mine.reportedRun.get(params.session) === read.idleAt) {
+          return {
+            content: [{
+              type: "text",
+              text: `already reported: outcome ${read.outcome}, idle at ${read.idleAt}; no newer run. oc_read shows the record.`,
+            }],
+            details: { session: params.session, settled: false, asks: read.asks },
+          };
+        }
+        // This call is the first report of this run, so mark it: the wake-up channel is now spent.
+        if (params.since === undefined) mine.reportedRun.set(params.session, read.idleAt);
         // The answer reached Pi, so the column has nothing left to show live. Keep the watch only when
         // a newer run is still going, so a finished run never wakes twice.
         const armedNow = mine.armed.get(params.session);
@@ -1454,7 +1513,7 @@ export default function (pi: ExtensionAPI) {
           `mode: ${state.mode}`,
           `service: ${(service ??= await discover()).url}`,
           `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
-          `cheap: ${(await cheapModels()).ids.join(", ")}`,
+          `served: ${(await cheapModels()).ids.join(", ")}`,
           ...rows.map((row: any) => `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title ?? ""}`),
         ].join("\n"),
       );
@@ -1462,11 +1521,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("oc-auto", {
-    description: "Answer OpenCode asks from the local model for this session",
+    description: "Answer OpenCode asks from the model in this Pi session",
     handler: async (_args, context) => {
       state.mode = "unsupervised";
       void flushAsks().catch(() => {});
-      say(context, "OpenCode bridge: auto — model questions go to the local model");
+      say(context, "OpenCode bridge: auto — model questions go to this session's model");
     },
   });
 
@@ -1503,7 +1562,7 @@ export default function (pi: ExtensionAPI) {
 
   /** Threads pile up from smoke tests and finished briefs. Dry run lists, force deletes. */
   pi.registerCommand("oc-clean", {
-    description: "List finished threads under ~/Pi; force deletes",
+    description: "List finished threads under the root; force deletes",
     handler: async (args, context) => {
       ctx = context;
       const rows = ((await api<any>("GET", "/api/session?limit=200")).data ?? []).filter(underRoot);
@@ -1547,7 +1606,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  /** Foreground on purpose: Barty wants the answer, not a detached attempt. */
+  /** Foreground on purpose: the operator wants the answer, not a detached attempt. */
   pi.registerCommand("oc-panes", {
     description: "Open, close, or list the Ghostty columns for live threads",
     handler: async (args, context) => {

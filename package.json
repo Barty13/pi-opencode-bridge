@@ -1,17 +1,52 @@
 {
-  "name": "pi-opencode-bridge",
-  "private": true,
+  "name": "@barty13/pi-opencode-bridge",
+  "version": "0.1.2",
+  "description": "Delegate threads to a local OpenCode service from Pi. oc_open returns at once, the thread settling opens a later turn.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "opencode",
+    "delegation",
+    "subagents"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Barty13/pi-opencode-bridge.git"
+  },
+  "author": "Barty <Barty13@users.noreply.github.com>",
+  "bugs": {
+    "url": "https://github.com/Barty13/pi-opencode-bridge/issues"
+  },
+  "homepage": "https://github.com/Barty13/pi-opencode-bridge#readme",
   "pi": {
     "extensions": [
       "opencode-bridge.ts"
-    ]
+    ],
+    "image": "assets/banner.png"
+  },
+  "scripts": {
+    "check": "for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts || exit 1; done && bun run checks/check-1-compact.ts && bun run checks/check-4-gate.ts && BRIDGE=$PWD/.control-nogate.ts bun run checks/check-4-gate.ts || [ $? -eq 1 ]",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
-  "scripts": {
-    "test": "bun run oc-rpc.ts",
-    "typecheck": "bunx tsc --noEmit --skipLibCheck --types node --target esnext --module preserve --moduleResolution bundler opencode-bridge.ts oc-rpc.ts"
-  }
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/bun": "^1.4.2",
+    "typescript": "^5.9.0"
+  },
+  "files": [
+    "opencode-bridge.ts",
+    "oc-panes",
+    "oc-rpc.ts",
+    "checks/",
+    "assets/banner.png",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ]
 }

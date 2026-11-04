@@ -10,12 +10,14 @@
  *                      stays armed.
  *   stale    item 2  — a sweep read that loses its watch must release the claim, so the next real
  *                      settle still wakes the model inside the TTL.
+ *   dup                — a run the batch wake-up already reported must not be handed out again by
+ *                      the next oc_wait on that thread: one run, one report.
  *
- * Run: CASE=expire bun run ~/Pi/opencode/check-3-unit.ts
+ * Run: CASE=expire bun run checks/check-3-unit.ts   (from the package root)
  */
 const CASE = process.env.CASE ?? "4xx";
 process.env.OC_WATCH_TTL_S = CASE === "stale" ? "4" : "2";
-process.env.OC_BACKSTOP_MS = CASE === "stale" ? "500" : "1000";
+process.env.OC_BACKSTOP_MS = CASE === "stale" ? "500" : CASE === "dup" ? "300" : "1000";
 process.env.OC_HUD = "0";
 
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -26,7 +28,8 @@ import { join } from "node:path";
 const PORT = 8731;
 const ID = "ses_stub00000000000000000000";
 // assertLocal compares the thread directory against ROOT, so the stub must sit inside it.
-const ROOT = join(process.env.HOME ?? "", "Pi");
+const ROOT = mkdtempSync(join(tmpdir(), "oc-root-"));
+process.env.OC_ROOT = ROOT;  // the bridge reads the root at load, so set it before the import
 // The send fails only in the 4xx case; elsewhere the prompt lands and the watch stays armed.
 const FAIL_PROMPT = CASE === "4xx";
 // The stale case holds the first sweep read, replaces its watch with oc_send, then releases it.
@@ -72,9 +75,12 @@ Bun.serve({
 // The bridge finds the service through `opencode service status` and the model list through
 // `opencode models`, so shadow that binary for both calls.
 const bin = mkdtempSync(join(tmpdir(), "fakeoc-"));
+// The service password file sits in the real home, and bun ignores a fake HOME, so point at a stub.
+process.env.OC_SERVICE_FILE = join(bin, "service.json");
+writeFileSync(process.env.OC_SERVICE_FILE, '{"password":"stub"}');
 writeFileSync(
   join(bin, "opencode"),
-  `#!/bin/sh\nif [ "$1" = "models" ]; then echo opencode-go/glm-5.3-flash; else echo http://127.0.0.1:${PORT}; fi\n`,
+  `#!/bin/sh\nif [ "$1" = "models" ]; then echo stub/model-free; else echo http://127.0.0.1:${PORT}; fi\n`,
 );
 chmodSync(join(bin, "opencode"), 0o755);
 process.env.PATH = `${bin}:${process.env.PATH}`;
@@ -100,13 +106,27 @@ const ctx = {
   sessionManager: { getEntries: () => [] },
 };
 
+/** The tool map holds only what the extension registered, so a miss is a broken check. */
+const tool = (name: string) => {
+  const found = tools.get(name);
+  if (!found) throw new Error(`no tool ${name}`);
+  return found;
+};
+
+/** Registered event handlers; a miss means the bridge renamed the event. */
+const fire = (name: string) => {
+  const found = handlers.get(name);
+  if (!found) throw new Error(`no handler ${name}`);
+  return found;
+};
+
 const ext = (await import(process.env.BRIDGE ?? pathToFileURL(join(import.meta.dir, "..", "opencode-bridge.ts")).href)).default;
 ext(piStub as any);
-await handlers.get("session_start")({}, ctx);
+await fire("session_start")({}, ctx);
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const open = () => tools.get("oc_open").execute("t1", {
-  model: "opencode-go/glm-5.3-flash", title: "stub", brief: "Reply OK",
+const open = () => tool("oc_open").execute("t1", {
+  model: "stub/model-free", title: "stub", brief: "Reply OK",
 });
 
 let verdict = "";
@@ -114,7 +134,7 @@ if (CASE === "4xx") {
   const res = await open();
   console.log("oc_open ->", JSON.stringify(res).slice(0, 140));
   // A watch left behind reports itself: oc_wait with `since` answers "the watch stays armed".
-  const probe = await tools.get("oc_wait").execute("t2", { session: ID, since: 1 });
+  const probe = await tool("oc_wait").execute("t2", { session: ID, since: 1 });
   const text = probe.content.map((part: any) => part.text).join(" ");
   console.log("oc_wait ->", JSON.stringify(text).slice(0, 160));
   verdict = text.includes("no watch is armed")
@@ -131,7 +151,7 @@ if (CASE === "4xx") {
     ? "PASS  item 4: expiry reports unknown, not invented"
     : "FAIL  expiry text still invents facts, see sent above";
 } else if (CASE === "nowatch") {
-  const probe = await tools.get("oc_wait").execute("t4", { session: ID, since: 1 });
+  const probe = await tool("oc_wait").execute("t4", { session: ID, since: 1 });
   const text = probe.content.map((part: any) => part.text).join(" ");
   console.log("oc_wait ->", JSON.stringify(text).slice(0, 220));
   verdict = text.includes("no watch is armed and no wake-up will come")
@@ -144,7 +164,7 @@ if (CASE === "4xx") {
   if (!sessionHeld) {
     verdict = "FAIL  item 2: no sweep read was held";
   } else {
-    const send = await tools.get("oc_send").execute("t3", { session: ID, text: "second" });
+    const send = await tool("oc_send").execute("t3", { session: ID, text: "second" });
     console.log("oc_send ->", JSON.stringify(send).slice(0, 140));
     // The send armed a floor before this point; +10 keeps the row strictly newer.
     realAt = Date.now() + 10;
@@ -156,10 +176,23 @@ if (CASE === "4xx") {
       ? "PASS  item 2: the stale claim released and the real settle arrived"
       : "FAIL  item 2: the stale claim swallowed the real settle, see sent above";
   }
+} else if (CASE === "dup") {
+  await open();
+  // The run ends with nobody waiting: the backstop reads it, the batch reports it once.
+  realAt = Date.now() + 50;
+  await wait(1500);
+  const wakes = sent.filter((text) => text.includes("REAL")).length;
+  // Same thread, watch already spent: this call owes no second copy of that run.
+  const probe = await tool("oc_wait").execute("t5", { session: ID });
+  const text = probe.content.map((part: any) => part.text).join(" ");
+  console.log(`wake-ups carrying the answer -> ${wakes}; oc_wait ->`, JSON.stringify(text).slice(0, 240));
+  verdict = wakes === 1 && !text.includes("REAL") && text.includes("already reported")
+    ? "PASS  dup: one run, one report"
+    : `FAIL  dup: one run reported twice (wake-ups ${wakes}, oc_wait said: ${text.slice(0, 120)})`;
 } else {
   verdict = `FAIL  unknown CASE ${CASE}`;
 }
 
 console.log(verdict);
-await handlers.get("session_shutdown")({}, ctx);
+await fire("session_shutdown")({}, ctx);
 process.exit(verdict.startsWith("PASS") ? 0 : 1);
