@@ -6,8 +6,9 @@
  *   write input {path, content}; edit input {path, oldString, newString}; read input {path}
  *   shell input {command}, exit at state.metadata.exit. `executed` is false on completed calls.
  *
- * Cases: poll, plain, compact, fail, wide. The control drops the compaction window and must fail
- * compact. The poll case proves the backstop reads 8 rows until a settle, then one 200-row window.
+ * Cases: poll, plain, compact, fail, long, wide. The control drops the compaction window and must
+ * fail compact. The poll case proves the backstop reads 8 rows until a settle, then one 200-row
+ * window. The long case proves the failure cap and the 400-char line cap.
  * Run:
  *   bun run checks/check-6-digest.ts
  *   BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts
@@ -204,6 +205,25 @@ const failFixture = () => {
   };
 };
 
+const LONG_REASON = "x".repeat(240);
+const longFixture = () => {
+  const t = Date.now() + 5000;
+  const rows: any[] = [idleRow(t + 100)];
+  let at = t + 99;
+  for (let i = 0; i < 5; i++) {
+    rows.push(toolRow("read", { path: `missing-${i}.txt` }, at--, {
+      status: "error",
+      error: { message: `${LONG_REASON}\nstack line` },
+    }));
+  }
+  rows.push(toolRow("shell", { command: "sleep 1" }, at--, { status: "streaming" }));
+  return {
+    rows,
+    idleAt: t + 100,
+    permission: [{ id: "per_2", action: "read", resources: ["missing-0.txt"] }],
+  };
+};
+
 const WIDE_PATHS = Array.from({ length: 12 }, (_, i) =>
   `deep/nested/lane-${i}/src/module-${i}/component-with-a-long-name-${i}.ts`);
 const WIDE_UNFINISHED = 1;
@@ -272,6 +292,15 @@ await runCase("fail", failFixture, (digest) => {
   check("fail asks", digest.includes(`asks: ${permission.length}`), digest);
 });
 
+await runCase("long", longFixture, (digest) => {
+  const fails = digest.match(/fails: (.*?) · asks: /)?.[1]?.trim() ?? "";
+  check("long length", digest.length <= 400, `${digest.length} chars`);
+  check("long fail survives", fails.startsWith("read: "), fails);
+  check("long reason cap", fails.includes("…"), fails);
+  check("long unfinished", digest.includes("unfinished: 1"), digest);
+  check("long asks", digest.includes("asks: 1"), digest);
+});
+
 const wide = wideFixture();
 const wideWindow = wide.rows.slice(0, 200);
 const wideCalls = wideWindow.reduce(
@@ -308,5 +337,5 @@ if (failures.length) {
   console.log(`FAIL digest: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log(`PASS digest: poll, plain, compact, fail, wide; ${limits.filter((limit) => limit === 200).length} wide read on the wide settle`);
+console.log(`PASS digest: poll, plain, compact, fail, long, wide; ${limits.filter((limit) => limit === 200).length} wide read on the wide settle`);
 process.exit(0);

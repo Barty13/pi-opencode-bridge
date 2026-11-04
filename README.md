@@ -106,11 +106,11 @@ digest 5 calls (5 ok) · shell 5 · fails: none · files: none
 ```
 
 The line gives the call count and the ok/error split, the calls per tool name, the first five
-failures (tool name and first error line), the open ask count, and the touched paths (edits before
-reads, at most ten). A call that is still running adds `unfinished: N`. The path list shrinks to keep
-the line at or below 400 characters; the `fails:` and `asks:` sections stay. The window starts after
-the newer of the watch floor and the newest compaction row, so a compacted context does not show
-calls from before the compaction.
+failures (tool name and first error line, each reason capped at 120 characters), the open ask count,
+and the touched paths (edits before reads, at most ten). A call that is still running adds
+`unfinished: N`. The path list shrinks first, then the failure list, and a last-resort cut keeps the
+line at or below 400 characters. The window starts after the newer of the watch floor and the newest
+compaction row, so a compacted context does not show calls from before the compaction.
 
 ## Context ceiling
 

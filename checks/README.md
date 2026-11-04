@@ -51,6 +51,7 @@ BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts                 
 | `plain` | 5 shell calls print `digest 5 calls (5 ok) · shell 5 · fails: none · files: none` |
 | `compact` | an edit before the newest compaction row does not appear |
 | `fail` | the first error line lands in `fails`, and an open ask adds `asks: 1` |
+| `long` | 5 fails with 240-char reasons: each reason caps at 120 chars, the line stays ≤400, one fail and `unfinished`/`asks` survive |
 | `wide` | 300 rows with long paths: the path list shrinks, 5 failures survive, `unfinished: 1` shows, line ≤ 400 |
 
 The control drops the compaction floor, so the `compact` case must fail.

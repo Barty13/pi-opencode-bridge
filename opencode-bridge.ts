@@ -438,9 +438,10 @@ function partLine(part: any): string {
   return `[${part.type}] ${clip(JSON.stringify(part))}`;
 }
 
-/** First line of a tool error, so one failure cannot fill the ledger. */
+/** First line of a tool error, capped at 120 chars so one failure cannot fill the ledger. */
 function firstLine(text: unknown): string {
-  return String(text ?? "").split("\n")[0].trim();
+  const line = String(text ?? "").split("\n")[0].trim();
+  return line.length > 120 ? `${line.slice(0, 119)}…` : line;
 }
 
 /**
@@ -490,19 +491,27 @@ function digestLine(rows: any[], asks?: number): string {
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .map(([name, count]) => `${name} ${count}`);
   const paths = [...new Set([...edits, ...reads])].slice(0, 10);
-  const head = `digest ${calls} ${calls === 1 ? "call" : "calls"} (${split})${
-    unfinished ? ` · unfinished: ${unfinished}` : ""
-  } · ${names.length ? names.join(" · ") : "tools: none"} · fails: ${fails.length ? fails.join("; ") : "none"}${
-    asks !== undefined && asks > 0 ? ` · asks: ${asks}` : ""
-  } · files: `;
-  const files = paths.length ? paths.join(", ") : "none";
-  if (head.length + files.length <= DIGEST_MAX) return head + files;
-  // Keep the failure and ask sections; drop paths from the end until the line fits.
-  for (let kept = paths.length - 1; kept > 0; kept--) {
-    const candidate = paths.slice(0, kept).join(", ");
-    if (head.length + candidate.length <= DIGEST_MAX) return head + candidate;
+  const line = (shownFails: string[], shownFiles: string) =>
+    `digest ${calls} ${calls === 1 ? "call" : "calls"} (${split})${
+      unfinished ? ` · unfinished: ${unfinished}` : ""
+    } · ${names.length ? names.join(" · ") : "tools: none"} · fails: ${
+      shownFails.length ? shownFails.join("; ") : "none"
+    }${asks !== undefined && asks > 0 ? ` · asks: ${asks}` : ""} · files: ${shownFiles}`;
+  const full = line(fails, paths.length ? paths.join(", ") : "none");
+  if (full.length <= DIGEST_MAX) return full;
+  // Paths are the lowest priority: drop them first.
+  for (let kept = paths.length - 1; kept >= 0; kept--) {
+    const candidate = line(fails, kept ? paths.slice(0, kept).join(", ") : "none");
+    if (candidate.length <= DIGEST_MAX) return candidate;
   }
-  return `${head}none`;
+  // Then drop failures from the end, but keep one entry.
+  for (let kept = fails.length - 1; kept >= 1; kept--) {
+    const candidate = line(fails.slice(0, kept), "none");
+    if (candidate.length <= DIGEST_MAX) return candidate;
+  }
+  // Last resort: the head alone is longer than the cap.
+  const last = line(fails.slice(0, 1), "none");
+  return last.length > DIGEST_MAX ? `${last.slice(0, DIGEST_MAX - 1)}…` : last;
 }
 
 /** One message row; `at` skips into the body for oc_read offset. */
