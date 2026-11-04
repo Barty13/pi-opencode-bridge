@@ -73,6 +73,7 @@ The control drops the compaction floor, so the `compact` case must fail.
 | `twice` | two steers mid-run give `steers 2` and one wake-up |
 | `late` | a settled thread refuses the steer and posts nothing |
 | `nowatch` | a busy thread with no watch accepts the steer and names the missing wake-up |
+| `polling` | a steer inside a held backstop poll is admitted, counted once, one wake-up |
 
 The control re-arms the watch on steer and restores the old `busy` predicate, so `one` and `rerun` must fail.
 

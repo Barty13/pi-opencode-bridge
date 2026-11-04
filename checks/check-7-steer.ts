@@ -1,7 +1,7 @@
 /** oc_steer: a correction reaches a running thread without spending its watch.
  *
- * Cases: one, rerun, twice, late, nowatch. The control re-arms the watch on steer and restores the
- * old busy predicate; it must fail.
+ * Cases: one, rerun, twice, late, nowatch, polling. The control re-arms the watch on steer and
+ * restores the old busy predicate; it must fail.
  * Run:
  *   bun run checks/check-7-steer.ts
  *   BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts   # must fail
@@ -24,6 +24,10 @@ process.env.OC_ROOT = ROOT;
 let rows: any[] = [];
 let idleAt = 0;
 let busyAt = 0;
+let holdPoll = false;
+let pollHeld = false;
+let releasePoll!: () => void;
+const pollGate = new Promise<void>((resolve) => { releasePoll = resolve; });
 const posts: Array<{ text: string; delivery?: string }> = [];
 
 Bun.serve({
@@ -41,6 +45,10 @@ Bun.serve({
     }
     if (p.endsWith("/message")) {
       const limit = Number(new URL(req.url).searchParams.get("limit") ?? 0);
+      if (holdPoll && limit === 8 && !pollHeld) {
+        pollHeld = true;
+        await pollGate;
+      }
       return json(rows.slice(0, limit));
     }
     if (p.endsWith("/permission") || p.endsWith("/form")) return json([]);
@@ -209,11 +217,36 @@ idleAt = noWatchAt;
 await wait(300);
 check("nowatch no wake", sent.length === noWatchWake, `${sent.length - noWatchWake}`);
 
+// polling: the backstop holds the claim while its 8-row read is open; the steer is still admitted.
+holdPoll = true;
+pollHeld = false;
+busyAt = Date.now();
+await tool("oc_send").execute("t", { session: ID, text: "run poll" });
+const pollDeadline = Date.now() + 2000;
+while (!pollHeld && Date.now() < pollDeadline) await wait(20);
+check("polling held", pollHeld, "the backstop did not hold a poll");
+const pollingPosts = posts.filter((post) => post.delivery === "steer").length;
+const pollingText = textOf(await tool("oc_steer").execute("t", { session: ID, text: "fix poll" }));
+console.log("polling receipt ->", pollingText);
+check("polling receipt", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the next step boundary$/.test(pollingText), pollingText);
+check("polling post", posts.filter((post) => post.delivery === "steer").length === pollingPosts + 1, JSON.stringify(posts));
+releasePoll();
+holdPoll = false;
+await wait(100);
+busyAt = 0;
+const pollingBefore = sent.length;
+const pollingAt = Date.now() + 50;
+rows = settleRows(pollingAt);
+idleAt = pollingAt;
+const pollingWake = await wake(pollingBefore);
+check("polling wake-ups", pollingWake !== null && sent.length === pollingBefore + 1, `${sent.length - pollingBefore}`);
+check("polling steers", pollingWake?.includes("steers 1") ?? false, pollingWake ?? "(none)");
+
 await fire("session_shutdown")({}, ctx);
 
 if (failures.length) {
   console.log(`FAIL steer: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS steer: one steer gives steers 1, a rerun steer is admitted, two steers give steers 2, a late steer refuses, a busy thread with no watch posts without a wake-up");
+console.log("PASS steer: one steer gives steers 1, a rerun steer is admitted, two steers give steers 2, a late steer refuses, a busy thread with no watch posts without a wake-up, a steer during a held poll is admitted");
 process.exit(0);

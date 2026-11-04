@@ -1410,13 +1410,6 @@ export default function (pi: ExtensionAPI) {
             details: { session: params.session, steered: true },
           };
         }
-        if (state.claimed.has(params.session)) {
-          return {
-            content: [{ type: "text", text: "the run is settling; no steer sent" }],
-            details: { session: params.session, steered: false },
-            isError: true,
-          };
-        }
         if (state.sending.has(params.session)) {
           return {
             content: [{ type: "text", text: "a send is in flight; retry oc_steer" }],
