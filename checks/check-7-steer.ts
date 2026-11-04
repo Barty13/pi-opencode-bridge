@@ -218,8 +218,10 @@ await wait(300);
 check("nowatch no wake", sent.length === noWatchWake, `${sent.length - noWatchWake}`);
 
 // polling: the backstop holds the claim while its 8-row read is open; the steer is still admitted.
+// A first run keeps idle at 0, so the old busy predicate cannot mask the claimed guard.
 holdPoll = true;
 pollHeld = false;
+idleAt = 0;
 busyAt = Date.now();
 await tool("oc_send").execute("t", { session: ID, text: "run poll" });
 const pollDeadline = Date.now() + 2000;

@@ -31,6 +31,9 @@ assert steer in src
 busy = "  return Number(row?.time?.busy ?? 0) > Number(row?.time?.idle ?? 0);"
 assert busy in src
 control = src.replace(busy, "  return Boolean(row?.time?.busy) && !row?.time?.idle;")
+claimed = "        if (state.sending.has(params.session)) {"
+assert claimed in src
+control = control.replace(claimed, "        if (state.claimed.has(params.session)) {\n          return {\n            content: [{ type: \"text\", text: \"the run is settling; no steer sent\" }],\n            details: { session: params.session, steered: false },\n            isError: true,\n          };\n        }\n" + claimed)
 open('.control-steer.ts','w').write(control.replace(steer, "          armThread(params.session);\n" + steer))
 PY
 ```
@@ -75,7 +78,7 @@ The control drops the compaction floor, so the `compact` case must fail.
 | `nowatch` | a busy thread with no watch accepts the steer and names the missing wake-up |
 | `polling` | a steer inside a held backstop poll is admitted, counted once, one wake-up |
 
-The control re-arms the watch on steer and restores the old `busy` predicate, so `one` and `rerun` must fail.
+The control restores three defects: the steer re-arm (`one`), the old `busy` predicate (`rerun`), and the `claimed` guard (`polling`).
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
