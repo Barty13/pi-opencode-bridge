@@ -35,9 +35,21 @@ claimed = "        if (state.sending.has(params.session)) {"
 assert claimed in src
 control = control.replace(claimed, "        if (state.claimed.has(params.session)) {\n          return {\n            content: [{ type: \"text\", text: \"the run is settling; no steer sent\" }],\n            details: { session: params.session, steered: false },\n            isError: true,\n          };\n        }\n" + claimed)
 open('.control-steer.ts','w').write(control.replace(steer, "          armThread(params.session);\n" + steer))
-floor = "  const floor = Number(newest?.time?.created ?? 0);"
+floor = """    const running = busy(row);
+    // `busy` marks the start of the run in flight; one ms behind it includes the answer row that
+    // carries the run. An idle thread's floor sits at its last idle and excludes the old run.
+    const floor = running ? Number(row?.time?.busy ?? 0) - 1 : Number(row?.time?.idle ?? 0);"""
 assert floor in src
-open('.control-attach.ts','w').write(src.replace(floor, "  const floor = Date.now();"))
+control = src.replace(floor, """    const running = busy(row);
+    const newest = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=1`)).data?.[0];
+    const floor = Number(newest?.time?.created ?? 0);""", 1)
+arm = "    if (running) armThread(session, floor);"
+assert arm in control
+control = control.replace(arm, "    armThread(session, floor);", 1)
+restore = "      if (mine !== state || !busy(current)) return;"
+assert restore in control
+control = control.replace(restore, "      if (mine !== state) return;", 1)
+open('.control-attach.ts','w').write(control)
 PY
 ```
 
@@ -89,12 +101,14 @@ The control restores three defects: the steer re-arm (`one`), the old `busy` pre
 
 | Case | What it proves |
 | --- | --- |
-| `old` | a thread settled before attach gives no wake-up; a second attach says `already armed`; `/oc` marks it `attached` |
-| `live` | a mid-run thread with `busy > idle` attaches; one wake-up carries the answer row created before attach |
-| `escape` | a thread outside `OC_ROOT` is refused; nothing is armed; the command reports the failure |
+| `old` | an idle thread attaches with no watch; the settled run stays silent; `/oc` marks it `attached` |
+| `idle` | a short TTL passes with no wake-up: an idle attach arms nothing |
+| `live` | a mid-run thread with `busy > idle` attaches; its only assistant row sits at the floor and one wake-up carries its answer; a second attach says `already armed` |
 | `detach` | `oc_stop detach: true` drops the watch, keeps the run, and never posts `/interrupt` |
+| `escape` | a thread outside `OC_ROOT` is refused; nothing is armed; the command reports the failure |
+| `restore` | a reload restores a watch for a busy saved row only; an idle saved row gets none |
 
-The control uses floor `Date.now()`, so `live` must fail: it wakes without the answer row.
+The control carries three defects: the newest-row floor (`live`), the unconditional arm (`idle`), and the blind restore (`restore`).
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

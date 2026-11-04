@@ -45,7 +45,7 @@ The bridge adds nine tools and seven commands.
 | --- | --- |
 | `oc_models` | Lists the models the service serves for delegation, with each effort ladder |
 | `oc_open` | Opens a thread for one self-contained task, returns its id |
-| `oc_attach` | Adopts a thread the bridge did not open, arms one settle watch |
+| `oc_attach` | Adopts a thread the bridge did not open; arms a watch while it runs |
 | `oc_send` | Hands an instruction to a thread, returns at once |
 | `oc_steer` | Corrects a running thread in place; applies at the next step boundary |
 | `oc_wait` | Collects the settle inside the current turn, when a wake-up cannot arrive |
@@ -108,9 +108,11 @@ attached ses_… "attach-probe"
 model: opencode-go/glm-5.3-flash variant default · 8k tokens · open asks: none · idle
 ```
 
-It arms one watch with the floor at the newest row, so an answer from an earlier run is not reported
-as a fresh settle. `/oc-attach <ses_...>` does the same from the command line, and `/oc` marks
-adopted threads `attached`. `oc_stop` with `detach: true` drops the watch and leaves the run going.
+A running thread gets one watch with the floor just behind its current run, so the answer it already
+wrote is not lost, and an answer from an earlier run is not reported as a fresh settle. An idle
+thread gets no watch; the next `oc_send` arms one. `/oc-attach <ses_...>` does the same from the
+command line, and `/oc` marks adopted threads `attached`. A reload restores a watch only while the
+thread still runs. `oc_stop` with `detach: true` drops the watch and leaves the run going.
 
 ## Steering
 

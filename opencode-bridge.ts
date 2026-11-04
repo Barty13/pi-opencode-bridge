@@ -1136,7 +1136,7 @@ export default function (pi: ExtensionAPI) {
     drawHud();
   };
 
-  /** Adopt a thread the bridge did not open: one watch, floor at its newest row. */
+  /** Adopt a thread the bridge did not open: one watch while it runs, floor behind its in-flight rows. */
   const attach = async (session: string): Promise<string> => {
     const row = (await api<any>("GET", `/api/session/${session}`)).data;
     if (!underRoot(row)) {
@@ -1144,18 +1144,21 @@ export default function (pi: ExtensionAPI) {
     }
     await assertLocal(state, session);
     if (state.armed.has(session)) return `already armed: ${session}`;
-    const newest = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=1`)).data?.[0];
-    const floor = Number(newest?.time?.created ?? 0);
-    armThread(session, floor);
+    const running = busy(row);
+    // `busy` marks the start of the run in flight; one ms behind it includes the answer row that
+    // carries the run. An idle thread's floor sits at its last idle and excludes the old run.
+    const floor = running ? Number(row?.time?.busy ?? 0) - 1 : Number(row?.time?.idle ?? 0);
+    if (running) armThread(session, floor);
     state.known.add(session);
     state.attached.add(session);
     state.labels.set(session, String(row.model?.id ?? ""));
     const open = await asks(session).catch(() => null);
     const asksLine = open === null ? "open asks: unreadable" : open.length ? `open asks: ${open.length}` : "open asks: none";
     const model = `${row.model?.providerID ?? "?"}/${row.model?.id ?? "?"}`;
+    const note = running ? "" : "\nattached; idle, watch starts with your next oc_send";
     return `attached ${session} "${row.title ?? ""}"\nmodel: ${model} variant ${row.model?.variant ?? "default"} · ${
       tokenK(sizeOf(row))
-    } tokens · ${asksLine} · ${busy(row) ? "running" : "idle"}`;
+    } tokens · ${asksLine} · ${running ? "running" : "idle"}${note}`;
   };
 
   /** Footer count plus the table above the editor; a TUI timer refreshes the age and TTL. */
@@ -1205,23 +1208,29 @@ export default function (pi: ExtensionAPI) {
     backstop = null;
   };
 
-  pi.on("session_start", (_event, context) => {
+  pi.on("session_start", async (_event, context) => {
     ctx = context;
     // Panes need a terminal, so print, JSON, and RPC runs never open a column.
     panesOn = context.mode === "tui";
     reset();
+    const mine = state;
     // Restore armed floors from the last session; the deadline gets a fresh TTL.
     const saved = (context.sessionManager.getEntries()
       .findLast((e: any) => e.type === "custom" && e.customType === "oc-armed") as
       { data?: Array<{ session: string; floor: number; steers?: number; attached?: boolean }> } | undefined)?.data;
-    for (const row of saved ?? []) {
-      state.armed.set(row.session, {
+    // A thread that settled while Pi was down must not get a watch: it would expire into a false wake.
+    await Promise.all((saved ?? []).map(async (row) => {
+      if (mine !== state) return;
+      if (row.attached) mine.attached.add(row.session);
+      const current = (await api<any>("GET", `/api/session/${row.session}`).catch(() => null))?.data;
+      if (mine !== state || !busy(current)) return;
+      mine.armed.set(row.session, {
         floor: row.floor,
         deadline: Date.now() + WATCH_TTL_MS,
         steers: row.steers ?? 0,
       });
-      if (row.attached) state.attached.add(row.session);
-    }
+    }));
+    if (mine !== state) return;
     if (pi.getFlag("oc-auto") === true) state.mode = "unsupervised";
     abort?.abort();
     abort = new AbortController();
@@ -1387,7 +1396,7 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "oc_attach",
       label: "OC attach",
-      description: "Adopt a thread the bridge did not open; arms one settle watch.",
+      description: "Adopt a thread the bridge did not open; arms a watch while it runs.",
       namespace: ns,
       annotations: { openWorldHint: true },
       parameters: Type.Object(sessionParam),

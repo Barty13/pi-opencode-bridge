@@ -5,9 +5,12 @@
  *     tokens:{input,output,reasoning,cache:{read,write}}, outcome, time:{created,updated,busy,idle},
  *     title, location:{directory}}}
  *   A second turn mid-run keeps the old idle and writes a newer busy: busy > idle.
+ *   The first assistant row of that turn is created after busy: an attach floor on the newest
+ *   row drops the answer that the turn already wrote.
  *   GET /message?order=desc&limit=1 -> {data:[{id, time:{created}, type, ...}]}
  *
- * Cases: old, live, escape, detach. The control uses floor Date.now(); live must fail.
+ * Cases: old, idle, live, detach, escape, restore. The control carries three defects: a newest-row
+ * floor (live), an unconditional arm (idle), and a blind restore (restore).
  * Run:
  *   bun run checks/check-8-attach.ts
  *   BRIDGE=$PWD/.control-attach.ts bun run checks/check-8-attach.ts   # must fail
@@ -16,7 +19,7 @@ process.env.OC_HUD = "0";
 process.env.OC_DEBOUNCE_MS = "20";
 process.env.OC_BACKSTOP_MS = "100";
 process.env.OC_COMPACT_TOKENS = "0";
-process.env.OC_WATCH_TTL_S = "30";
+process.env.OC_WATCH_TTL_S = "1";
 
 import { chmodSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,14 +28,16 @@ import { join } from "node:path";
 const PORT = 8738;
 const MAIN = "ses_attach000000000000000000";
 const OUTSIDE = "ses_outside00000000000000000";
+const IDLE_RESTORE = "ses_restore000000000000000000";
 const ROOT = realpathSync(mkdtempSync(join(tmpdir(), "oc-root-")));
 const OUTSIDE_DIR = realpathSync(mkdtempSync(join(tmpdir(), "oc-outside-")));
 process.env.OC_ROOT = ROOT;
 
 let mainRow: any = {};
 let outsideRow: any = {};
-let newest: any = {};
+let idleRow: any = {};
 let rows: any[] = [];
+let idleRows: any[] = [];
 const interrupts: string[] = [];
 
 const rowFor = (id: string, dir: string, busy: number, idle: number, created: number) => ({
@@ -43,7 +48,7 @@ const rowFor = (id: string, dir: string, busy: number, idle: number, created: nu
   tokens: { input: 6181, output: 1308, reasoning: 46, cache: { read: 0, write: 0 } },
   outcome: "succeeded",
   time: { created, updated: Math.max(busy, idle), busy, idle },
-  title: id === MAIN ? "attach-probe" : "outside",
+  title: id === MAIN ? "attach-probe" : id === OUTSIDE ? "outside" : "restore-idle",
   location: { directory: dir },
 });
 
@@ -55,12 +60,14 @@ Bun.serve({
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify({ data }), { status, headers: { "content-type": "application/json" } });
     if (req.method === "POST" && p === "/api/session") return json({ id: MAIN, title: "attach-probe" });
-    if (req.method === "GET" && p === "/api/session") return json([mainRow]);
+    if (req.method === "GET" && p === "/api/session") return json([mainRow, idleRow]);
     if (req.method === "GET" && p === `/api/session/${MAIN}`) return json(mainRow);
     if (req.method === "GET" && p === `/api/session/${OUTSIDE}`) return json(outsideRow);
+    if (req.method === "GET" && p === `/api/session/${IDLE_RESTORE}`) return json(idleRow);
     if (p.endsWith("/message")) {
+      const list = p.startsWith(`/api/session/${IDLE_RESTORE}`) ? idleRows : rows;
       const limit = Number(new URL(req.url).searchParams.get("limit") ?? 0);
-      return json(limit === 1 ? [newest] : rows.slice(0, limit));
+      return json(limit > 0 ? list.slice(0, limit) : list);
     }
     if (req.method === "POST" && p.endsWith("/interrupt")) {
       interrupts.push(p);
@@ -88,6 +95,7 @@ const notices: string[] = [];
 const tools = new Map<string, any>();
 const commands = new Map<string, any>();
 const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+let entries: any[] = [];
 const piStub = {
   registerTool: (tool: any) => tools.set(tool.name, tool),
   registerCommand: (name: string, command: any) => commands.set(name, command),
@@ -107,7 +115,7 @@ const ctx = {
     setStatus: () => {},
     setWidget: () => {},
   },
-  sessionManager: { getEntries: () => [] },
+  sessionManager: { getEntries: () => entries },
 };
 
 /** The tool map holds only what the extension registered, so a miss is a broken check. */
@@ -150,14 +158,17 @@ const check = (name: string, ok: boolean, detail: string) => {
   if (!ok) failures.push(`${name}: ${detail}`);
 };
 
-// old: the newest row is the idle row, so the floor excludes the settled run.
+// old: an idle thread attaches with no watch. The old run must stay silent.
 const oldNow = Date.now();
 const oldIdle = oldNow - 1000;
 const oldBusy = oldNow - 5000;
 mainRow = rowFor(MAIN, ROOT, oldBusy, oldIdle, oldNow - 20_000);
-newest = { id: "msg_old_idle", type: "idle", outcome: "succeeded", time: { created: oldIdle } };
-rows = [newest, { type: "assistant", time: { created: oldIdle - 10 }, content: [{ type: "text", text: "OLD" }] }];
+rows = [
+  { id: "msg_old_idle", type: "idle", outcome: "succeeded", time: { created: oldIdle } },
+  { type: "assistant", time: { created: oldIdle - 10 }, content: [{ type: "text", text: "OLD" }] },
+];
 const oldBefore = sent.length;
+const oldAt = Date.now();
 const oldText = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
 console.log("old ->", oldText);
 check(
@@ -166,17 +177,52 @@ check(
     && oldText.includes("model: opencode-go/glm-5.3-flash variant default")
     && oldText.includes("8k tokens")
     && oldText.includes("open asks: none")
-    && oldText.includes("idle"),
+    && oldText.includes("idle")
+    && oldText.includes("attached; idle, watch starts with your next oc_send"),
   oldText,
 );
 await wait(300);
 check("old no wake", sent.length === oldBefore, `${sent.length - oldBefore}`);
-const again = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
-check("old already armed", again === `already armed: ${MAIN}`, again);
 await command("oc").handler("", ctx);
 check("old /oc attached", notices.join("\n").includes("attached"), notices.join("\n"));
 
+// idle: no watch means no fabricated wake when a short TTL passes.
+const idleDeadline = oldAt + 1500;
+if (Date.now() < idleDeadline) await wait(idleDeadline - Date.now());
+check("idle no expiry wake", sent.length === oldBefore, `${sent.length - oldBefore}`);
+
+// live: a second-turn run is in flight (busy > idle). Its first assistant row is already at the
+// floor and carries the answer, so a newest-row floor drops it.
+const liveNow = Date.now();
+const liveBusy = liveNow - 100;
+const liveIdle = liveNow - 5000;
+const answerAt = liveBusy + 16;
+mainRow = rowFor(MAIN, ROOT, liveBusy, liveIdle, liveNow - 20_000);
+rows = [{ id: "msg_live_answer", type: "assistant", time: { created: answerAt }, content: [{ type: "text", text: "DONE" }] }];
+const liveBefore = sent.length;
+const liveText = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
+console.log("live ->", liveText);
+check("live report", liveText.includes("running"), liveText);
+const liveAgain = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
+check("live already armed", liveAgain === `already armed: ${MAIN}`, liveAgain);
+const liveIdleAt = Date.now() + 200;
+mainRow = rowFor(MAIN, ROOT, liveBusy, liveIdleAt, liveNow - 20_000);
+rows = [
+  { type: "idle", outcome: "succeeded", time: { created: liveIdleAt } },
+  { id: "msg_live_answer", type: "assistant", time: { created: answerAt }, content: [{ type: "text", text: "DONE" }] },
+];
+const liveWake = await wake(liveBefore);
+check("live wake-ups", liveWake !== null && sent.length === liveBefore + 1, `${sent.length - liveBefore}`);
+check("live answer", liveWake?.includes("DONE") ?? false, liveWake ?? "(none)");
+
 // detach: drop the watch, keep the run, never call interrupt.
+const detachNow = Date.now();
+const detachBusy = detachNow - 100;
+const detachIdle = detachNow - 5000;
+mainRow = rowFor(MAIN, ROOT, detachBusy, detachIdle, detachNow - 20_000);
+rows = [];
+const detachAttach = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
+check("detach attach", detachAttach.includes("running"), detachAttach);
 const interruptsBefore = interrupts.length;
 const detach = await tool("oc_stop").execute("t", { session: MAIN, detach: true });
 console.log("detach ->", textOf(detach));
@@ -185,37 +231,13 @@ check("detach detail", detach.details?.detached === true, JSON.stringify(detach.
 check("detach no interrupt", interrupts.length === interruptsBefore, JSON.stringify(interrupts));
 const detachWake = sent.length;
 const detachedAt = Date.now() + 50;
-mainRow = rowFor(MAIN, ROOT, oldBusy, detachedAt, oldNow - 20_000);
+mainRow = rowFor(MAIN, ROOT, detachBusy, detachedAt, detachNow - 20_000);
 rows = [
   { type: "idle", outcome: "succeeded", time: { created: detachedAt } },
   { type: "assistant", time: { created: detachedAt - 10 }, content: [{ type: "text", text: "DETACHED" }] },
 ];
 await wait(300);
 check("detach no wake", sent.length === detachWake, `${sent.length - detachWake}`);
-
-// live: a second-turn run is in flight (busy > idle). The answer row lands after the newest
-// row snapshot but before attach's Date.now, so only the newest-row floor can include it.
-const liveNow = Date.now();
-const liveBusy = liveNow - 100;
-const liveIdle = liveNow - 5000;
-const newestAt = liveBusy + 4;
-mainRow = rowFor(MAIN, ROOT, liveBusy, liveIdle, liveNow - 20_000);
-newest = { type: "assistant", time: { created: newestAt }, content: [{ type: "text", text: "" }] };
-rows = [newest];
-const liveBefore = sent.length;
-const liveText = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
-console.log("live ->", liveText);
-check("live report", liveText.includes("running"), liveText);
-const answerAt = newestAt + 10;
-const liveIdleAt = Date.now() + 200;
-mainRow = rowFor(MAIN, ROOT, liveBusy, liveIdleAt, liveNow - 20_000);
-rows = [
-  { type: "idle", outcome: "succeeded", time: { created: liveIdleAt } },
-  { type: "assistant", time: { created: answerAt }, content: [{ type: "text", text: "DONE" }] },
-];
-const liveWake = await wake(liveBefore);
-check("live wake-ups", liveWake !== null && sent.length === liveBefore + 1, `${sent.length - liveBefore}`);
-check("live answer", liveWake?.includes("DONE") ?? false, liveWake ?? "(none)");
 
 // escape: the adopted thread sits outside OC_ROOT; refuse before arming.
 outsideRow = rowFor(OUTSIDE, OUTSIDE_DIR, oldBusy, oldIdle, oldNow - 20_000);
@@ -236,11 +258,40 @@ const noticesBefore = notices.length;
 await command("oc-attach").handler(OUTSIDE, ctx);
 check("escape command", notices.slice(noticesBefore).join("\n").includes("attach failed"), notices.slice(noticesBefore).join("\n"));
 
+// restore: a busy saved row gets a watch; an idle saved row does not.
+await fire("session_shutdown")({}, ctx);
+const restoreNow = Date.now();
+const restoreBusy = restoreNow - 100;
+const restoreIdle = restoreNow - 5000;
+mainRow = rowFor(MAIN, ROOT, restoreBusy, restoreIdle, restoreNow - 20_000);
+idleRow = rowFor(IDLE_RESTORE, ROOT, restoreIdle - 5000, restoreIdle, restoreNow - 20_000);
+rows = [];
+idleRows = [];
+entries = [{
+  type: "custom",
+  customType: "oc-armed",
+  data: [
+    { session: MAIN, floor: restoreIdle, steers: 0, attached: true },
+    { session: IDLE_RESTORE, floor: restoreIdle, steers: 0, attached: true },
+  ],
+}];
+await fire("session_start")({}, ctx);
+await command("oc").handler("", ctx);
+const restoreNotice = notices.at(-1) ?? "";
+console.log("restore ->", restoreNotice);
+check("restore one watch", restoreNotice.includes("armed: 1") && !restoreNotice.includes("armed: 2"), restoreNotice);
+check("restore attached", restoreNotice.includes(`${IDLE_RESTORE}`) && restoreNotice.includes("attached"), restoreNotice);
+const restoreDetach = await tool("oc_stop").execute("t", { session: MAIN, detach: true });
+check("restore detach", textOf(restoreDetach) === "detached; the run keeps going", textOf(restoreDetach));
+const restoreWake = sent.length;
+await wait(1500);
+check("restore no idle wake", sent.length === restoreWake, `${sent.length - restoreWake}`);
+
 await fire("session_shutdown")({}, ctx);
 
 if (failures.length) {
   console.log(`FAIL attach: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS attach: old is silent, live wakes with the answer, escape refuses, detach keeps the run");
+console.log("PASS attach: idle is silent, live keeps the at-floor answer, escape refuses, detach keeps the run, restore arms only busy rows");
 process.exit(0);
