@@ -28,7 +28,10 @@ assert digest in src
 open('.control-digest.ts','w').write(src.replace(digest, "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);"))
 steer = "          // A steer must not re-arm: the watch floor, deadline, claim, and report stay.\n          await postPrompt(params.session, { text: params.text, delivery: \"steer\" });"
 assert steer in src
-open('.control-steer.ts','w').write(src.replace(steer, "          armThread(params.session);\n" + steer))
+busy = "  return Number(row?.time?.busy ?? 0) > Number(row?.time?.idle ?? 0);"
+assert busy in src
+control = src.replace(busy, "  return Boolean(row?.time?.busy) && !row?.time?.idle;")
+open('.control-steer.ts','w').write(control.replace(steer, "          armThread(params.session);\n" + steer))
 PY
 ```
 
@@ -66,11 +69,12 @@ The control drops the compaction floor, so the `compact` case must fail.
 | Case | What it proves |
 | --- | --- |
 | `one` | a steer mid-run gives one wake-up and `steers 1` |
+| `rerun` | a second turn with `busy` newer than the earlier `idle` accepts the steer |
 | `twice` | two steers mid-run give `steers 2` and one wake-up |
 | `late` | a settled thread refuses the steer and posts nothing |
 | `nowatch` | a busy thread with no watch accepts the steer and names the missing wake-up |
 
-The control re-arms the watch on steer, so `one` must fail.
+The control re-arms the watch on steer and restores the old `busy` predicate, so `one` and `rerun` must fail.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

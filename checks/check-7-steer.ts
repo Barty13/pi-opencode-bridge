@@ -1,6 +1,7 @@
 /** oc_steer: a correction reaches a running thread without spending its watch.
  *
- * Cases: one, twice, late, nowatch. The control re-arms the watch on steer and must fail.
+ * Cases: one, rerun, twice, late, nowatch. The control re-arms the watch on steer and restores the
+ * old busy predicate; it must fail.
  * Run:
  *   bun run checks/check-7-steer.ts
  *   BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts   # must fail
@@ -22,7 +23,7 @@ process.env.OC_ROOT = ROOT;
 
 let rows: any[] = [];
 let idleAt = 0;
-let sessionBusy = false;
+let busyAt = 0;
 const posts: Array<{ text: string; delivery?: string }> = [];
 
 Bun.serve({
@@ -53,7 +54,7 @@ Bun.serve({
         title: "steer",
         outcome: "stop",
         location: { directory: ROOT },
-        time: { busy: sessionBusy ? 1 : 0, idle: sessionBusy ? 0 : idleAt },
+        time: { busy: busyAt, idle: idleAt },
       });
     }
     return json(null, 404);
@@ -128,7 +129,7 @@ const check = (name: string, ok: boolean, detail: string) => {
 await tool("oc_open").execute("o", { model: "stub/model-free", title: "steer" });
 
 // one: a steer mid-run keeps the watch and gives one wake-up.
-sessionBusy = true;
+busyAt = Date.now();
 await tool("oc_send").execute("t", { session: ID, text: "run one" });
 const oneAt = Date.now();
 await wait(20);
@@ -136,7 +137,7 @@ const oneText = textOf(await tool("oc_steer").execute("t", { session: ID, text: 
 console.log("one receipt ->", oneText);
 check("one receipt", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the next step boundary$/.test(oneText), oneText);
 check("one post", posts.at(-1)?.delivery === "steer" && posts.at(-1)?.text === "fix one", JSON.stringify(posts.at(-1)));
-sessionBusy = false;
+busyAt = 0;
 const oneBefore = sent.length;
 const oneSettleAt = oneAt + 1;
 rows = settleRows(oneSettleAt);
@@ -146,7 +147,7 @@ check("one wake-ups", oneWake !== null && sent.length === oneBefore + 1, `${sent
 check("one steers", oneWake?.includes("steers 1") ?? false, oneWake ?? "(none)");
 
 // twice: both steers are accepted; one wake-up carries steers 2.
-sessionBusy = true;
+busyAt = Date.now();
 await tool("oc_send").execute("t", { session: ID, text: "run two" });
 const twoAt = Date.now();
 await wait(20);
@@ -155,7 +156,7 @@ check("twice first", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the nex
 const twoSecond = textOf(await tool("oc_steer").execute("t", { session: ID, text: "fix two again" }));
 check("twice second", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the next step boundary$/.test(twoSecond), twoSecond);
 check("twice posts", posts.filter((post) => post.delivery === "steer").length === 3, JSON.stringify(posts));
-sessionBusy = false;
+busyAt = 0;
 const twoBefore = sent.length;
 const twoSettleAt = twoAt + 1;
 rows = settleRows(twoSettleAt);
@@ -163,6 +164,24 @@ idleAt = twoSettleAt;
 const twoWake = await wake(twoBefore);
 check("twice wake-ups", twoWake !== null && sent.length === twoBefore + 1, `${sent.length - twoBefore}`);
 check("twice steers", twoWake?.includes("steers 2") ?? false, twoWake ?? "(none)");
+
+// rerun: an earlier settle leaves idle set, and busy is newer, so the steer is admitted.
+busyAt = Date.now();
+await tool("oc_send").execute("t", { session: ID, text: "run three" });
+const rerunAt = Date.now();
+await wait(20);
+const rerunText = textOf(await tool("oc_steer").execute("t", { session: ID, text: "fix rerun" }));
+console.log("rerun receipt ->", rerunText);
+check("rerun receipt", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the next step boundary$/.test(rerunText), rerunText);
+check("rerun post", posts.at(-1)?.delivery === "steer" && posts.at(-1)?.text === "fix rerun", JSON.stringify(posts.at(-1)));
+busyAt = 0;
+const rerunBefore = sent.length;
+const rerunSettleAt = rerunAt + 1;
+rows = settleRows(rerunSettleAt);
+idleAt = rerunSettleAt;
+const rerunWake = await wake(rerunBefore);
+check("rerun wake-ups", rerunWake !== null && sent.length === rerunBefore + 1, `${sent.length - rerunBefore}`);
+check("rerun steers", rerunWake?.includes("steers 1") ?? false, rerunWake ?? "(none)");
 
 // late: the settle is reported and the watch is gone; the service says idle, so refuse.
 const latePosts = posts.filter((post) => post.delivery === "steer").length;
@@ -175,7 +194,7 @@ const recordText = textOf(await tool("oc_wait").execute("t", { session: ID, sinc
 check("late record no steers", !recordText.includes("steers "), recordText);
 
 // nowatch: the service says busy but no watch exists; post and name the missing wake-up.
-sessionBusy = true;
+busyAt = Date.now();
 const noWatchPosts = posts.filter((post) => post.delivery === "steer").length;
 const noWatch = await tool("oc_steer").execute("t", { session: ID, text: "no watch" });
 const noWatchText = textOf(noWatch);
@@ -183,7 +202,7 @@ console.log("nowatch ->", noWatchText);
 check("nowatch receipt", noWatch.isError !== true && noWatchText === "steer admitted (no watch, no wake-up)", noWatchText);
 check("nowatch post", posts.filter((post) => post.delivery === "steer").length === noWatchPosts + 1, JSON.stringify(posts));
 const noWatchWake = sent.length;
-sessionBusy = false;
+busyAt = 0;
 const noWatchAt = Date.now() + 50;
 rows = settleRows(noWatchAt);
 idleAt = noWatchAt;
@@ -196,5 +215,5 @@ if (failures.length) {
   console.log(`FAIL steer: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS steer: one steer gives steers 1, two steers give steers 2, a late steer refuses, a busy thread with no watch posts without a wake-up");
+console.log("PASS steer: one steer gives steers 1, a rerun steer is admitted, two steers give steers 2, a late steer refuses, a busy thread with no watch posts without a wake-up");
 process.exit(0);

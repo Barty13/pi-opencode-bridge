@@ -422,7 +422,7 @@ function underRoot(row: any): boolean {
 
 /** A run in flight must not be deleted out from under the model waiting on it. */
 function busy(row: any): boolean {
-  return Boolean(row?.time?.busy) && !row?.time?.idle;
+  return Number(row?.time?.busy ?? 0) > Number(row?.time?.idle ?? 0);
 }
 
 /** Why a thread stopped. Quota and provider failures land here, not on an HTTP status. */
