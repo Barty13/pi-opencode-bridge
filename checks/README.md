@@ -53,6 +53,7 @@ assert restore in control
 control = control.replace(restore, "      if (mine !== state || readFailed) return;", 1)
 open('.control-attach.ts','w').write(control)
 rewind_target = """        const current = (await api<any>("GET", `/api/session/${session}`)).data;
+        noteThread(state, current);
         // The run opener is the oldest user row at or after busy; a steer writes a newer user row.
         const floor = Number(current?.time?.busy ?? 0) - 1;
         const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
@@ -119,6 +120,9 @@ rewind_noui = '      throw new Error("the revert stays staged; the commit needs 
 assert rewind_noui in control
 control = control.replace(rewind_noui, '      throw new Error("supervised commit needs a terminal dialog; run /oc-auto for this session, then retry");', 1)
 open('.control-rewind.ts','w').write(control)
+budget_meter = "  const meter = limits?.data?.go?.rolling;"
+assert budget_meter in src
+open('.control-budget.ts','w').write(src.replace(budget_meter, "  const meter = limits?.data?.go?.weekly;", 1))
 PY
 ```
 
@@ -140,6 +144,8 @@ bun run checks/check-8-attach.ts
 BRIDGE=$PWD/.control-attach.ts bun run checks/check-8-attach.ts                   # must fail
 bun run checks/check-9-rewind.ts
 BRIDGE=$PWD/.control-rewind.ts bun run checks/check-9-rewind.ts                   # must fail
+bun run checks/check-10-budget.ts
+BRIDGE=$PWD/.control-budget.ts bun run checks/check-10-budget.ts                   # must fail
 ```
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
@@ -196,6 +202,20 @@ The control carries four defects: the newest-row floor (`live`), the uncondition
 | `noui` | no UI keeps the stage staged, says the commit needs a Pi TUI, and does not advise `/oc-auto` |
 
 The control carries four defects: the stage ask after the stage (`ask`), the newest-user-row target (`steered`), the untracked clear (`clear`), and the no-UI advice (`noui`).
+
+`check-10-budget.ts` runs the budget cases against a stub service:
+
+| Case | What it proves |
+| --- | --- |
+| `ok` | one open reads the meters once, the footer names rolling/weekly/monthly and the reset time, and the HUD row carries `tok` and a `~` estimate |
+| `cache` | two sends inside 30 s reuse one meter read; the request count in the stub stays at one |
+| `poll` | backstop sweeps read session detail but add zero meter requests |
+| `limited` | `limited: true` prints `LIMITED` in place of the percent in the notice and the footer |
+| `ceiling` | rolling 90 refuses both `oc_open` and `oc_send` at `OC_BUDGET_PCT=80`, names the reset time, and posts no prompt |
+| `tokens` | with 9k on the first thread and 8k on the second, `OC_BUDGET_TOKENS=15000` refuses the second and names the thread that crossed |
+| `usd` | a thread priced from `/api/model` carries `~`; a console budget prints exact `spent/limit` and per-model spent without `~` |
+
+The control reads `weekly` instead of `rolling` in the percent gate, so the `ceiling` case must fail.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

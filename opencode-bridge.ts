@@ -71,6 +71,10 @@ const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
 const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
 const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
 const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);
+// Quota ceilings, 0 turns each off. The percent reads the rolling meter; the token cap counts
+// threads this Pi session delegated to.
+const BUDGET_PCT = Number(process.env.OC_BUDGET_PCT ?? 0);
+const BUDGET_TOKENS = Number(process.env.OC_BUDGET_TOKENS ?? 0);
 // Only in-flight sends are armed, so the ceiling bounds a runaway loop of sends, not real work.
 const MAX_THREADS = 32;
 // `OC_HUD=0` leaves the footer and the table alone.
@@ -112,6 +116,38 @@ interface Watch {
   steers: number;
 }
 
+/** The last Session.Info numbers for one thread; the HUD prints these without a request. */
+interface ThreadInfo {
+  providerID: string;
+  model: string;
+  variant: string;
+  tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
+  /** Session.Info cost in USD; 0 when the service does not price the thread. */
+  cost: number;
+}
+
+/** One Go allowance meter from GET /api/experimental/usage/limits. */
+interface Meter {
+  percent: number;
+  limited: boolean;
+  resetsAt: number;
+}
+
+/** One console budget; `models` carries per-model spent when the budget names them. */
+interface Budget {
+  id: string;
+  limit: number;
+  spent: number;
+  models?: Array<{ providerID: string; modelID: string; name: string; spent?: number }>;
+}
+
+interface Limits {
+  data?: {
+    go?: { rolling?: Meter; weekly?: Meter; monthly?: Meter };
+    budgets?: Budget[];
+  } | null;
+}
+
 /** One thread's outcome, read at detect so a newer run cannot answer for an older settle. */
 interface Settle {
   session: string;
@@ -144,6 +180,10 @@ interface BridgeState {
   dirs: Map<string, string>;
   /** Model id each thread was opened with, so the HUD row says something useful. */
   labels: Map<string, string>;
+  /** Numbers from detail reads the bridge already makes; the HUD and oc_budget print these. */
+  info: Map<string, ThreadInfo>;
+  /** Threads this Pi session delegated to, for OC_BUDGET_TOKENS. */
+  delegated: Set<string>;
   /** Threads this run has touched; a reconnect rescans their open asks. */
   known: Set<string>;
   /** Threads adopted by oc_attach, so /oc can mark them. */
@@ -180,6 +220,8 @@ function freshState(): BridgeState {
     pendingAsks: [],
     dirs: new Map(),
     labels: new Map(),
+    info: new Map(),
+    delegated: new Set(),
     known: new Set(),
     attached: new Set(),
     staged: new Map(),
@@ -221,11 +263,19 @@ function disarm(state: BridgeState, session: string, settle?: Settle): void {
 }
 
 let service: Service | null = null;
-let modelCache: { at: number; ids: string[]; variants: Map<string, string[]> } = {
+let modelCache: {
+  at: number;
+  ids: string[];
+  variants: Map<string, string[]>;
+  costs: Map<string, any>;
+} = {
   at: 0,
   ids: [],
   variants: new Map(),
+  costs: new Map(),
 };
+/** Quota meters cached for 30 s. The footer and the HUD read this; only budget() fills it. */
+let limitsCache: { at: number; value: Limits | null } = { at: 0, value: null };
 
 /** Service url and password, read without blocking: a down service must not freeze the TUI. */
 async function discover(): Promise<Service> {
@@ -279,9 +329,11 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
 }
 
 /** Models the service serves for delegation, read live: ids keep their provider prefix and each model
- * carries its own ladder. `force` skips the cache, because oc_models is where the model reads
+ * carries its own ladder and list prices. `force` skips the cache, because oc_models is where the model reads
  * the list. exec runs async: a sync 5s call would freeze the TUI. */
-async function cheapModels(force = false): Promise<{ ids: string[]; variants: Map<string, string[]> }> {
+async function cheapModels(
+  force = false,
+): Promise<{ ids: string[]; variants: Map<string, string[]>; costs: Map<string, any> }> {
   if (!force && Date.now() - modelCache.at < 60_000) return modelCache;
   const { stdout } = await promisify(execFile)("opencode", ["models"], { encoding: "utf8", timeout: 5_000 });
   const ids = stdout
@@ -289,10 +341,61 @@ async function cheapModels(force = false): Promise<{ ids: string[]; variants: Ma
     .map((line) => line.trim())
     .filter((line) => line.startsWith("opencode-go/") || line.endsWith("-free"));
   const variants = new Map<string, string[]>();
+  const costs = new Map<string, any>();
   const rows = await api<any>("GET", "/api/model").catch(() => ({ data: [] as any[] }));
-  for (const row of rows.data ?? []) variants.set(`${row.providerID}/${row.modelID}`, (row.variants ?? []).map((v: any) => v.id));
-  modelCache = { at: Date.now(), ids, variants };
+  for (const row of rows.data ?? []) {
+    const key = `${row.providerID}/${row.modelID}`;
+    variants.set(key, (row.variants ?? []).map((v: any) => v.id));
+    costs.set(key, (row.cost ?? [])[0]);
+  }
+  modelCache = { at: Date.now(), ids, variants, costs };
   return modelCache;
+}
+
+/** Quota meters, cached for 30 s. Every open and send calls this, so the footer refreshes there;
+ * the backstop poll and the HUD timer read the cache and never ask. A failed read keeps the last
+ * snapshot and retries after the TTL: the route is advisory, so it must not block a send. */
+async function budget(force = false): Promise<Limits | null> {
+  if (!force && limitsCache.at && Date.now() - limitsCache.at < 30_000) return limitsCache.value;
+  try {
+    limitsCache = {
+      at: Date.now(),
+      // Advisory route: a wedged meter read must not hold a send for the 30 s api default.
+      value: await api<Limits>("GET", "/api/experimental/usage/limits", undefined, AbortSignal.timeout(5_000)),
+    };
+  } catch {
+    limitsCache = { at: Date.now(), value: limitsCache.value };
+  }
+  return limitsCache.value;
+}
+
+/** Local HH:MM for a reset time, so the footer and a refusal name the same clock. */
+function clockAt(ms: number): string {
+  return new Date(Number(ms)).toTimeString().slice(0, 5);
+}
+
+/** `weekly 45%`, or `weekly LIMITED`; a limited meter never prints its percent. */
+function meterText(label: string, meter: Meter | undefined): string {
+  if (!meter) return "";
+  return `${label} ${meter.limited ? "LIMITED" : `${Number(meter.percent ?? 0)}%`}`;
+}
+
+/** One footer line: rolling with its reset, then weekly and monthly. Null when the route gave none. */
+function meterLine(limits: Limits | null): string | null {
+  const go = limits?.data?.go;
+  if (!go?.rolling) return null;
+  return [
+    meterText("go rolling", go.rolling),
+    go.rolling.resetsAt ? `resets ${clockAt(go.rolling.resetsAt)}` : "",
+    meterText("weekly", go.weekly),
+    meterText("monthly", go.monthly),
+  ].filter(Boolean).join(" · ");
+}
+
+/** The rolling meter is the shortest window, so the percent ceiling reads it. */
+function rollingMeter(limits: Limits | null): Meter | null {
+  const meter = limits?.data?.go?.rolling;
+  return meter ?? null;
 }
 
 /** A bare id served by both providers is refused: picking one silently picks a biller.
@@ -352,6 +455,7 @@ async function assertLocal(state: BridgeState, session: string): Promise<void> {
   }
   state.local.add(session);
   state.dirs.set(session, dir);
+  noteThread(state, row);
 }
 
 /** Drop every per-thread record, so a deleted id leaves nothing behind in this Pi session. */
@@ -362,6 +466,8 @@ function forget(state: BridgeState, session: string): void {
   state.staged.delete(session);
   state.dirs.delete(session);
   state.labels.delete(session);
+  state.info.delete(session);
+  state.delegated.delete(session);
   state.reportedRun.delete(session);
   // A deleted thread's asks must stop occupying the queue and the reported set.
   const dropped = state.pendingAsks.filter((ask) => ask.session === session);
@@ -425,6 +531,74 @@ function clock(): string {
 function money(row: any): string {
   const t = row?.tokens ?? {};
   return `tokens in/out/reasoning ${t.input ?? 0}/${t.output ?? 0}/${t.reasoning ?? 0}, cache ${t.cache?.read ?? 0}, cost ${row?.cost ?? 0}`;
+}
+
+/** Record the Session.Info numbers a read already carries; this function never fetches. */
+function noteThread(state: BridgeState, row: any): void {
+  const id = String(row?.id ?? "");
+  if (!id) return;
+  const before = state.info.get(id);
+  const t = row?.tokens ?? {};
+  state.info.set(id, {
+    providerID: String(row?.model?.providerID ?? before?.providerID ?? ""),
+    model: String(row?.model?.id ?? before?.model ?? ""),
+    variant: String(row?.model?.variant ?? before?.variant ?? "default"),
+    tokens: {
+      input: Number(t.input ?? 0),
+      output: Number(t.output ?? 0),
+      reasoning: Number(t.reasoning ?? 0),
+      cache: { read: Number(t.cache?.read ?? 0), write: Number(t.cache?.write ?? 0) },
+    },
+    cost: Number(row?.cost ?? before?.cost ?? 0),
+  });
+}
+
+function threadTokens(info?: ThreadInfo): number {
+  return info ? sizeOf({ tokens: info.tokens }) : 0;
+}
+
+/** Session.Info cost when the service reports one, else a `~` list-price estimate from /api/model. */
+function threadCost(info: ThreadInfo | undefined, costs: Map<string, any>): string {
+  if (!info) return "-";
+  if (info.cost > 0) return `$${info.cost.toFixed(4)}`;
+  const price = costs.get(`${info.providerID}/${info.model}`);
+  if (!price) return "$0";
+  const t = info.tokens;
+  const value = (
+    t.input * Number(price.input ?? 0)
+    + (t.output + t.reasoning) * Number(price.output ?? 0)
+    + t.cache.read * Number(price.cache?.read ?? 0)
+    + t.cache.write * Number(price.cache?.write ?? 0)
+  ) / 1_000_000;
+  return `~$${value.toFixed(4)}`;
+}
+
+/** The first delegated thread whose cumulative total passes the cap; the refusal names it. */
+function tokenCeiling(state: BridgeState, ceiling: number): { session: string; total: number } | null {
+  let total = 0;
+  for (const session of state.delegated) {
+    total += threadTokens(state.info.get(session));
+    if (total >= ceiling) return { session, total };
+  }
+  return null;
+}
+
+/** Why an open or send is over budget, or null. Reads the meters through the 30 s cache. */
+async function budgetRefusal(state: BridgeState): Promise<string | null> {
+  const limits = await budget();
+  if (BUDGET_PCT) {
+    const meter = rollingMeter(limits);
+    if (meter && Number(meter.percent ?? 0) >= BUDGET_PCT) {
+      return `budget ceiling: go rolling ${Number(meter.percent ?? 0)}% ≥ OC_BUDGET_PCT ${BUDGET_PCT}%; resets ${clockAt(meter.resetsAt)}`;
+    }
+  }
+  if (BUDGET_TOKENS) {
+    const crossed = tokenCeiling(state, BUDGET_TOKENS);
+    if (crossed) {
+      return `budget ceiling: delegated ${tokenK(crossed.total)} tokens ≥ OC_BUDGET_TOKENS ${BUDGET_TOKENS}; ${crossed.session} crossed it`;
+    }
+  }
+  return null;
 }
 
 /** The service lists every project, and ?directory= is an exact match, so filter here. */
@@ -624,13 +798,20 @@ type Read = Settle | "gone" | null;
  * settled, so the window closes at both ends. `want` keeps the backstop poll cheap; only a report
  * reads the wide window and builds the digest. A 404 is final; anything else may pass on a retry.
  */
-async function readSettle(session: string, floor: number, want = 8, steers?: number): Promise<Read> {
+async function readSettle(
+  state: BridgeState,
+  session: string,
+  floor: number,
+  want = 8,
+  steers?: number,
+): Promise<Read> {
   let row: any;
   try {
     row = (await api<any>("GET", `/api/session/${session}`)).data;
   } catch (error) {
     return /HTTP 40[49]/.test(String(error)) ? "gone" : null;
   }
+  noteThread(state, row);
   const idleAt = Number(row?.time?.idle ?? 0);
   // A failed message read has no answer, so let the caller retry instead of reporting "(none)".
   const rows = await recentRows(session, want).catch(() => null);
@@ -878,7 +1059,7 @@ export default function (pi: ExtensionAPI) {
     const w = mine.armed.get(session);
     if (!w || mine.claimed.has(session) || mine.sending.has(session)) return;
     mine.claimed.add(session);
-    const read = await readSettle(session, w.floor, DIGEST_ROWS, w.steers).catch(() => null);
+    const read = await readSettle(mine, session, w.floor, DIGEST_ROWS, w.steers).catch(() => null);
     if (mine !== state) return;
     // A send during the read replaced that watch, so this result belongs to a run nobody waits on.
     if (mine.armed.get(session) !== w || mine.sending.has(session)) return void mine.claimed.delete(session);
@@ -916,7 +1097,7 @@ export default function (pi: ExtensionAPI) {
       mine.claimed.add(session);
       reads.push({ session, w });
     }
-    const results = await Promise.all(reads.map(({ session, w }) => readSettle(session, w.floor, 8, w.steers).catch(() => null)));
+    const results = await Promise.all(reads.map(({ session, w }) => readSettle(mine, session, w.floor, 8, w.steers).catch(() => null)));
     if (mine !== state) return;
     for (const [index, read] of results.entries()) {
       const { session, w } = reads[index];
@@ -932,7 +1113,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (read && read.idleAt > w.floor) {
         // The poll read 8 rows; read the wide window once for the report.
-        const wide = await readSettle(session, w.floor, DIGEST_ROWS, w.steers).catch(() => null);
+        const wide = await readSettle(mine, session, w.floor, DIGEST_ROWS, w.steers).catch(() => null);
         if (mine !== state) return;
         // A send or a stop during the wide read owns the thread now, so this settle is stale.
         if (mine.armed.get(session) !== w || mine.sending.has(session)) {
@@ -1166,10 +1347,13 @@ export default function (pi: ExtensionAPI) {
     // `busy` marks the start of the run in flight; one ms behind it includes the answer row that
     // carries the run. An idle thread's floor sits at its last idle and excludes the old run.
     const floor = running ? Number(row?.time?.busy ?? 0) - 1 : Number(row?.time?.idle ?? 0);
+    // Record the numbers before the HUD draw, so the first row already carries tok and cost.
+    noteThread(state, row);
+    state.labels.set(session, String(row.model?.id ?? ""));
     if (running) armThread(session, floor);
     state.known.add(session);
     state.attached.add(session);
-    state.labels.set(session, String(row.model?.id ?? ""));
+    state.delegated.add(session);
     const open = await asks(session).catch(() => null);
     const asksLine = open === null ? "open asks: unreadable" : open.length ? `open asks: ${open.length}` : "open asks: none";
     const model = `${row.model?.providerID ?? "?"}/${row.model?.id ?? "?"}`;
@@ -1210,17 +1394,25 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
-  /** Footer count plus the table above the editor; a TUI timer refreshes the age and TTL. */
+  /** Footer count plus the table above the editor; a TUI timer refreshes the age and TTL.
+   * The meter line and every row read cached numbers, so a tick makes no service call. */
   function drawHud(): void {
     const context = ctx;
     if (!HUD || !context || context.mode !== "tui") return;
     const now = Date.now();
     const rows = [...state.armed].map(([session, w]) => {
-      const label = state.labels.get(session) ?? state.dirs.get(session)?.split("/").pop() ?? "-";
-      return `${session}  ${Math.round((now - w.floor) / 1000)}s  left ${Math.max(0, Math.round((w.deadline - now) / 1000))}s  ${label}`;
+      const info = state.info.get(session);
+      const label = info?.model ?? state.labels.get(session) ?? state.dirs.get(session)?.split("/").pop() ?? "-";
+      const tok = info ? `  ${tokenK(threadTokens(info))} tok` : "";
+      const cost = info ? `  ${threadCost(info, modelCache.costs)}` : "";
+      return `${session}  ${Math.round((now - w.floor) / 1000)}s  left ${Math.max(0, Math.round((w.deadline - now) / 1000))}s  ${label}${tok}${cost}`;
     });
     const count = rows.length;
-    context.ui.setStatus("oc", count ? `${count} ${count === 1 ? "thread" : "threads"} running` : undefined);
+    const meters = meterLine(limitsCache.value);
+    const status = [meters, count ? `${count} ${count === 1 ? "thread" : "threads"} running` : ""]
+      .filter(Boolean)
+      .join(" · ");
+    context.ui.setStatus("oc", status || undefined);
     context.ui.setWidget("oc", count ? ["OpenCode threads", ...rows] : undefined, { placement: "aboveEditor" });
   }
 
@@ -1281,6 +1473,8 @@ export default function (pi: ExtensionAPI) {
       if (mine !== state) return;
       // A failed read may hide a live run, so keep the watch. Only a real idle row drops it.
       if (!readFailed && !busy(current)) return;
+      // The fetched row already carries the HUD numbers; do not ask again.
+      noteThread(mine, current);
       mine.armed.set(row.session, {
         floor: row.floor,
         deadline: Date.now() + WATCH_TTL_MS,
@@ -1414,6 +1608,14 @@ export default function (pi: ExtensionAPI) {
         ),
       }),
       async execute(_id, params) {
+        const refusal = await budgetRefusal(state);
+        if (refusal) {
+          return {
+            content: [{ type: "text", text: refusal }],
+            details: { session: "" },
+            isError: true,
+          };
+        }
         const model = await requireModel(params.model);
         const variant = pickVariant(params.variant, model.variants);
         const dir = directory(params.directory);
@@ -1426,8 +1628,10 @@ export default function (pi: ExtensionAPI) {
         const session = created.data.id as string;
         state.known.add(session);
         state.local.add(session);
+        state.delegated.add(session);
         state.dirs.set(session, dir);
         state.labels.set(session, model.id);
+        noteThread(state, created.data);
         let sent = "";
         if (params.brief) {
           // The thread exists, so a failed brief still has to hand back its id.
@@ -1487,6 +1691,15 @@ export default function (pi: ExtensionAPI) {
       async execute(_id, params) {
         await assertLocal(state, params.session);
         state.known.add(params.session);
+        state.delegated.add(params.session);
+        const refusal = await budgetRefusal(state);
+        if (refusal) {
+          return {
+            content: [{ type: "text", text: refusal }],
+            details: { session: params.session },
+            isError: true,
+          };
+        }
         const compactAt = await sendPrompt(params.session, { text: params.text });
         if (state.armed.has(params.session)) paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
         return {
@@ -1510,8 +1723,10 @@ export default function (pi: ExtensionAPI) {
       }),
       async execute(_id, params) {
         await assertLocal(state, params.session);
+        state.delegated.add(params.session);
         // The armed map can be stale: a steer to an idle thread starts an unwatched run.
         const row = (await api<any>("GET", `/api/session/${params.session}`)).data;
+        noteThread(state, row);
         if (!busy(row)) {
           return {
             content: [{ type: "text", text: "run already settled; oc_send starts a new one" }],
@@ -1637,6 +1852,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const current = (await api<any>("GET", `/api/session/${session}`)).data;
+        noteThread(state, current);
         // The run opener is the oldest user row at or after busy; a steer writes a newer user row.
         const floor = Number(current?.time?.busy ?? 0) - 1;
         const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
@@ -1739,6 +1955,7 @@ export default function (pi: ExtensionAPI) {
         // running owes this call its settle, so take a floor behind its in-flight rows and wait.
         if (!w && params.since === undefined) {
           const row = (await api<any>("GET", `/api/session/${params.session}`).catch(() => null))?.data;
+          noteThread(state, row);
           if (busy(row)) {
             try {
               armThread(params.session, Number(row?.time?.idle ?? 0));
@@ -1778,7 +1995,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
-        const read = settle ?? (await readSettle(params.session, floor, DIGEST_ROWS, w?.steers));
+        const read = settle ?? (await readSettle(mine, params.session, floor, DIGEST_ROWS, w?.steers));
         // The read spanned a session switch, so this result belongs to no live watch.
         if (mine !== state) return { content: [{ type: "text", text: "Pi session switched; retry" }], details: undefined };
         if (read === "gone" || read === null) {
@@ -2005,6 +2222,44 @@ export default function (pi: ExtensionAPI) {
       );
     },
   });
+
+  /** One line per live thread, the Go meters, then console budgets. An explicit command refreshes
+   * the meter cache; every other reader stays on the 30 s snapshot. */
+  const showBudget = async (context: ExtensionContext) => {
+    ctx = context;
+    await budget(true);
+    const all = ((await api<any>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot);
+    for (const row of all) noteThread(state, row);
+    const costs = (await cheapModels().catch(() => null))?.costs ?? modelCache.costs;
+    drawHud();
+    const live = all.filter(busy);
+    const lines = live.length
+      ? live.map((row: any) => {
+        const info = state.info.get(row.id);
+        const provider = info?.providerID ?? String(row?.model?.providerID ?? "");
+        const model = info?.model ?? String(row?.model?.id ?? "-");
+        const variant = info?.variant ?? String(row?.model?.variant ?? "default");
+        return `${row.id}  ${provider ? `${provider}/` : ""}${model} ${variant}  ${
+          tokenK(threadTokens(info))} tok  ${threadCost(info, costs)}`;
+      })
+      : ["live threads: none"];
+    const meters = meterLine(limitsCache.value) ?? "quota: unreadable";
+    const budgets = limitsCache.value?.data?.budgets ?? [];
+    const budgetLines = budgets.map((budget) => {
+      const models = (budget.models ?? [])
+        .map((model) => `${model.providerID}/${model.modelID} $${Number(model.spent ?? 0).toFixed(2)}`)
+        .join(", ");
+      return `budget ${budget.id}: $${Number(budget.spent ?? 0).toFixed(2)} / $${Number(budget.limit ?? 0).toFixed(2)}${
+        models ? ` · ${models}` : ""}`;
+    });
+    say(context, [...lines, meters, ...budgetLines].join("\n"));
+  };
+  const budgetCommand = {
+    description: "Quota meters, live thread cost, and console budgets",
+    handler: async (_args: string, context: ExtensionContext) => showBudget(context),
+  };
+  pi.registerCommand("oc-budget", budgetCommand);
+  pi.registerCommand("oc_budget", budgetCommand);
 
   pi.registerCommand("oc-attach", {
     description: "Adopt an existing thread under OC_ROOT",

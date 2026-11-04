@@ -39,7 +39,7 @@ Pi runs one turn at a time, and a turn is the unit that blocks. Delegation with 
 holds that turn for the whole run of the other model. Here the send returns in milliseconds. The
 finish arrives later, as one message, with the answer already inside it.
 
-The bridge adds ten tools and seven commands.
+The bridge adds ten tools and eight commands.
 
 | Tool | What it does |
 | --- | --- |
@@ -57,6 +57,7 @@ The bridge adds ten tools and seven commands.
 | Command | What it does |
 | --- | --- |
 | `/oc` | Status: mode, service, live threads; adopted threads marked `attached` |
+| `/oc-budget` | Quota meters, live thread cost, and console budgets (`/oc_budget` also works) |
 | `/oc-attach <ses_...>` | Adopts an existing thread under `OC_ROOT` |
 | `/oc-auto` | The model in this Pi session answers the asks |
 | `/oc-accept` | You answer the asks yourself |
@@ -194,6 +195,36 @@ postdates its last answer reads 0, so one compaction never triggers the next. Op
 second steer with 409, so parallel sends order one compaction. Your own `opencode.json` auto-compact
 stays in charge below the ceiling.
 
+## Budget
+
+`/oc-budget` reads `GET /api/experimental/usage/limits` and prints one row per live thread (model,
+variant, tokens, cost), then the Go meters, then any console `budgets[]` as `spent / limit` with
+per-model spent:
+
+```
+ses_…  opencode-go/glm-5.3-flash max  1.4M tok  ~$0.85
+go rolling 45% · resets 21:40 · weekly 45% · monthly 23%
+budget org_…: $1.25 / $10.00 · opencode-go/glm-5.3-flash $0.40
+```
+
+The meter read is cached for 30 s. `oc_open` and `oc_send` check it before the run and reuse the
+snapshot inside that window, so the footer shows the same numbers; `/oc-budget` refreshes it now.
+The HUD timer and the backstop poll never ask. A meter with `limited: true` prints `LIMITED` in
+place of its percent.
+
+The footer carries the meters and the armed count. Each HUD row carries the thread's `tok` and cost.
+Thread numbers come from `Session.Info` on detail reads the bridge already makes, so a sweep adds no
+request. A cost the service reports prints as exact USD. When the service reports 0, the command
+prices the tokens with `GET /api/model` and marks the estimate with `~`, because the console and the
+model list disagree on some ids. Console `budgets[]` are exact and carry no `~`.
+
+Two ceilings, both off at `0`:
+
+- `OC_BUDGET_PCT` refuses `oc_open` and `oc_send` while the Go rolling meter is at or above the
+  percent, and names `resetsAt`.
+- `OC_BUDGET_TOKENS` caps the tokens delegated by this Pi session. A send that would cross the cap
+  is refused and names the thread that crossed it.
+
 ## Supervision
 
 Every ask from a thread (a permission, a form) goes to you by default. `/oc-auto` hands asks to
@@ -222,6 +253,8 @@ own. Without `OC_ROOT` the root is the working directory at start.
 | `OC_WATCH_TTL_S` | `1800` | How long an armed thread waits before it expires |
 | `OC_WAIT_MAX_S` | `300` | Ceiling for `oc_wait` |
 | `OC_COMPACT_TOKENS` | `500000` | Thread size in tokens above which a send orders a compaction first; `0` turns the gate off |
+| `OC_BUDGET_PCT` | `0` | Refuse `oc_open` and `oc_send` while the Go rolling meter is at or above this percent; `0` turns the ceiling off |
+| `OC_BUDGET_TOKENS` | `0` | Cap the tokens delegated by this Pi session; a send past it names the thread that crossed; `0` turns the cap off |
 | `OC_SERVICE_FILE` | `~/.config/opencode/service.json` | Where to read the local service password |
 | `OC_RETENTION` | `{}` | Your own data-policy labels, JSON keyed by model id suffix, for example `{"<id>":"zero"}`. Display only. The bridge ships no model ids: read each policy from your provider and set it here. |
 

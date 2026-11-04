@@ -11,3 +11,4 @@ pnpm-workspace.yaml
 .control-steer.ts
 .control-attach.ts
 .control-rewind.ts
+.control-budget.ts
