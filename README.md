@@ -60,6 +60,14 @@ The bridge adds seven tools and six commands.
 | `/oc-clean [force]` | Lists or deletes finished threads |
 | `/oc-panes open\|close\|list` | Controls the Ghostty columns |
 
+## Install
+
+```bash
+$ pi install npm:@barty13/pi-opencode-bridge      # or: pi install <path to a clone>
+```
+
+An update takes effect on the next restart or resume: a running pi keeps the code it loaded.
+
 ## Requirements
 
 - **OpenCode already installed and signed in.** Free or licensed, your choice. The service must run:
