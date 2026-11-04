@@ -53,7 +53,7 @@ const ROOT = resolveRoot();
 // OC_SERVICE_FILE points at another service file; the checks need a stub, bun ignores HOME.
 const SERVICE_FILE = process.env.OC_SERVICE_FILE ?? join(homedir(), ".config", "opencode", "service.json");
 const MAX_TEXT = 4000;
-/** The settle ledger reads one window and prints one line, so a long run cannot grow the wake-up. */
+/** The settle report reads one 200-row window; the backstop poll stays at 8 rows. */
 const DIGEST_ROWS = 200;
 const DIGEST_MAX = 400;
 /** Data policy per model id, filled by the operator: OC_RETENTION='{"<id-suffix>":"zero"}'.
@@ -444,9 +444,10 @@ function firstLine(text: unknown): string {
 }
 
 /**
- * One line for the settle window: calls, tools, paths, failures, and open asks.
+ * One line for the settle window: calls, tools, failures, asks, then paths.
  * Live tool parts put the path at `state.input.path`, the shell exit at `state.metadata.exit`,
- * and the status at `state.status`; `executed` stays false on completed calls.
+ * and the status at `state.status`; `executed` stays false on completed calls. Only the path
+ * list shrinks, so the failure and ask sections survive the 400-char cap.
  */
 function digestLine(rows: any[], asks?: number): string {
   const tools = new Map<string, number>();
@@ -455,6 +456,7 @@ function digestLine(rows: any[], asks?: number): string {
   const fails: string[] = [];
   let calls = 0;
   let failed = 0;
+  let unfinished = 0;
   for (const row of rows) {
     if (row?.type !== "assistant") continue;
     for (const part of row.content ?? []) {
@@ -468,6 +470,10 @@ function digestLine(rows: any[], asks?: number): string {
         if (name === "write" || name === "edit") edits.push(input.path);
         else if (name === "read") reads.push(input.path);
       }
+      if (state.status === "running" || state.status === "streaming") {
+        unfinished++;
+        continue;
+      }
       const exit = Number(state.metadata?.exit ?? 0);
       if (state.status === "error" || (name === "shell" && exit !== 0)) {
         failed++;
@@ -478,18 +484,25 @@ function digestLine(rows: any[], asks?: number): string {
       }
     }
   }
-  const ok = calls - failed;
+  const ok = calls - failed - unfinished;
   const split = failed ? `${ok} ok, ${failed} err` : `${ok} ok`;
   const names = [...tools]
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .map(([name, count]) => `${name} ${count}`);
   const paths = [...new Set([...edits, ...reads])].slice(0, 10);
-  const line = `digest ${calls} ${calls === 1 ? "call" : "calls"} (${split}) · ${
-    names.length ? names.join(" · ") : "tools: none"
-  } · files: ${paths.length ? paths.join(", ") : "none"} · fails: ${fails.length ? fails.join("; ") : "none"}${
+  const head = `digest ${calls} ${calls === 1 ? "call" : "calls"} (${split})${
+    unfinished ? ` · unfinished: ${unfinished}` : ""
+  } · ${names.length ? names.join(" · ") : "tools: none"} · fails: ${fails.length ? fails.join("; ") : "none"}${
     asks !== undefined && asks > 0 ? ` · asks: ${asks}` : ""
-  }`;
-  return line.length > DIGEST_MAX ? `${line.slice(0, DIGEST_MAX - 1)}…` : line;
+  } · files: `;
+  const files = paths.length ? paths.join(", ") : "none";
+  if (head.length + files.length <= DIGEST_MAX) return head + files;
+  // Keep the failure and ask sections; drop paths from the end until the line fits.
+  for (let kept = paths.length - 1; kept > 0; kept--) {
+    const candidate = paths.slice(0, kept).join(", ");
+    if (head.length + candidate.length <= DIGEST_MAX) return head + candidate;
+  }
+  return `${head}none`;
 }
 
 /** One message row; `at` skips into the body for oc_read offset. */
@@ -563,9 +576,10 @@ type Read = Settle | "gone" | null;
 
 /**
  * What a thread produced after `floor`. Rows newer than the idle belong to a run that has not
- * settled, so the window closes at both ends. A 404 is final; anything else may pass on a retry.
+ * settled, so the window closes at both ends. `want` keeps the backstop poll cheap; only a report
+ * reads the wide window and builds the digest. A 404 is final; anything else may pass on a retry.
  */
-async function readSettle(session: string, floor: number): Promise<Read> {
+async function readSettle(session: string, floor: number, want = 8): Promise<Read> {
   let row: any;
   try {
     row = (await api<any>("GET", `/api/session/${session}`)).data;
@@ -574,7 +588,7 @@ async function readSettle(session: string, floor: number): Promise<Read> {
   }
   const idleAt = Number(row?.time?.idle ?? 0);
   // A failed message read has no answer, so let the caller retry instead of reporting "(none)".
-  const rows = await recentRows(session, DIGEST_ROWS).catch(() => null);
+  const rows = await recentRows(session, want).catch(() => null);
   if (rows === null) return null;
   const fresh = rows.filter((entry: any) => {
     const at = Number(entry?.time?.created ?? 0);
@@ -597,7 +611,7 @@ async function readSettle(session: string, floor: number): Promise<Read> {
     asks: open ?? [],
     asksUnknown: open === null,
     idleAt,
-    digest: digestLine(digestRows, open === null ? undefined : open.length),
+    digest: want >= DIGEST_ROWS ? digestLine(digestRows, open === null ? undefined : open.length) : undefined,
   };
 }
 
@@ -817,7 +831,7 @@ export default function (pi: ExtensionAPI) {
     const w = mine.armed.get(session);
     if (!w || mine.claimed.has(session) || mine.sending.has(session)) return;
     mine.claimed.add(session);
-    const read = await readSettle(session, w.floor).catch(() => null);
+    const read = await readSettle(session, w.floor, DIGEST_ROWS).catch(() => null);
     if (mine !== state) return;
     // A send during the read replaced that watch, so this result belongs to a run nobody waits on.
     if (mine.armed.get(session) !== w || mine.sending.has(session)) return void mine.claimed.delete(session);
@@ -870,9 +884,19 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
       if (read && read.idleAt > w.floor) {
+        // The poll read 8 rows; read the wide window once for the report.
+        const wide = await readSettle(session, w.floor, DIGEST_ROWS).catch(() => null);
+        if (mine !== state) return;
+        // A send or a stop during the wide read owns the thread now, so this settle is stale.
+        if (mine.armed.get(session) !== w || mine.sending.has(session)) {
+          mine.claimed.delete(session);
+          continue;
+        }
+        // A failed wide read still reports the settle; it just has no digest.
+        const settle = wide && wide !== "gone" ? wide : read;
         // Disarm here: the stream path does, and a watch left armed re-delivers every sweep.
-        dropThread(session, read);
-        deliverSettle(read);
+        dropThread(session, settle);
+        deliverSettle(settle);
       } else mine.claimed.delete(session);
     }
   };
@@ -1376,7 +1400,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
-        const read = settle ?? (await readSettle(params.session, floor));
+        const read = settle ?? (await readSettle(params.session, floor, DIGEST_ROWS));
         // The read spanned a session switch, so this result belongs to no live watch.
         if (mine !== state) return { content: [{ type: "text", text: "Pi session switched; retry" }], details: undefined };
         if (read === "gone" || read === null) {

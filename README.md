@@ -97,18 +97,20 @@ Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
 
 ## Run digest
 
-The settle body ends with one digest line when the bridge reads the window. The line comes from the
-same 200-row window that the settle read uses, so it adds no request and no model call.
+The settle body ends with one digest line when the bridge reports a settle. The backstop poll reads 8
+rows; a reported settle reads the 200-row window once, and the digest comes from that read. It adds
+no model call and no extra poll payload.
 
 ```
-digest 5 calls (5 ok) · shell 5 · files: none · fails: none
+digest 5 calls (5 ok) · shell 5 · fails: none · files: none
 ```
 
-The line gives the call count and the ok/error split, the calls per tool name, the first ten touched
-paths (edits before reads), and the first five failures (tool name and first error line). An open ask
-adds `asks: N`. The window starts after the newer of the watch floor and the newest compaction row,
-so a compacted context does not show calls from before the compaction. The line caps at 400
-characters.
+The line gives the call count and the ok/error split, the calls per tool name, the first five
+failures (tool name and first error line), the open ask count, and the touched paths (edits before
+reads, at most ten). A call that is still running adds `unfinished: N`. The path list shrinks to keep
+the line at or below 400 characters; the `fails:` and `asks:` sections stay. The window starts after
+the newer of the watch floor and the newest compaction row, so a compacted context does not show
+calls from before the compaction.
 
 ## Context ceiling
 

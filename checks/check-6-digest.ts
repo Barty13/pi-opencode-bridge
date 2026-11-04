@@ -6,7 +6,8 @@
  *   write input {path, content}; edit input {path, oldString, newString}; read input {path}
  *   shell input {command}, exit at state.metadata.exit. `executed` is false on completed calls.
  *
- * Cases: plain, compact, fail, wide. The control drops the compaction window and must fail compact.
+ * Cases: poll, plain, compact, fail, wide. The control drops the compaction window and must fail
+ * compact. The poll case proves the backstop reads 8 rows until a settle, then one 200-row window.
  * Run:
  *   bun run checks/check-6-digest.ts
  *   BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts
@@ -157,6 +158,14 @@ const PLAIN_CALLS = 5;
 const COMPACT_CALLS = 2;
 const FAIL_CALLS = 1;
 
+const pollFixture = () => {
+  const t = Date.now() + 5000;
+  return {
+    rows: [idleRow(t + 10), toolRow("shell", { command: "echo poll" }, t + 9, { metadata: { exit: 0 } }, "DONE")],
+    idleAt: t + 10,
+  };
+};
+
 const plainFixture = () => {
   const t = Date.now() + 5000;
   const rows: any[] = [idleRow(t + 10)];
@@ -195,7 +204,9 @@ const failFixture = () => {
   };
 };
 
-const WIDE_PATHS = Array.from({ length: 12 }, (_, i) => `p${i}`);
+const WIDE_PATHS = Array.from({ length: 12 }, (_, i) =>
+  `deep/nested/lane-${i}/src/module-${i}/component-with-a-long-name-${i}.ts`);
+const WIDE_UNFINISHED = 1;
 const WIDE_FAILS = [
   { name: "read", text: "e0" },
   { name: "read", text: "e1" },
@@ -218,19 +229,39 @@ const wideFixture = () => {
       ? toolRow("shell", { command: failure.text }, at--, { metadata: { exit: 3 } })
       : toolRow("read", { path: `q${i}` }, at--, { status: "error", error: { message: `${failure.text}\nmore` } }));
   }
-  for (let i = 0; i < 180; i++) rows.push(toolRow("shell", { command: `echo ${i}` }, at--, { metadata: { exit: 0 } }));
+  for (let i = 0; i < 180; i++) {
+    rows.push(toolRow("shell", { command: `echo ${i}` }, at--, i < WIDE_UNFINISHED ? { status: "streaming" } : { metadata: { exit: 0 } }));
+  }
   for (let i = 0; i < 100; i++) rows.push(toolRow("shell", { command: `old ${i}` }, at--, { metadata: { exit: 0 } }));
   return { rows, idleAt: t + 300 };
 };
 
 await tool("oc_open").execute("o", { model: "stub/model-free", title: "digest" });
 
+// poll: the backstop reads 8 rows until a settle, then one 200-row window.
+rows = [];
+idleAt = 0;
+permission = [];
+limits.length = 0;
+await tool("oc_send").execute("t", { session: ID, text: "poll" });
+await wait(600);
+check("poll no wide read", limits.filter((limit) => limit === 200).length === 0, JSON.stringify(limits));
+check("poll cheap", limits.length > 0 && limits.every((limit) => limit === 8), JSON.stringify(limits));
+const poll = pollFixture();
+rows = poll.rows;
+idleAt = poll.idleAt;
+const pollBefore = sent.length;
+const pollDigest = digestOf(await wake(pollBefore));
+console.log(`poll -> ${pollDigest}`);
+check("poll one wide read", limits.filter((limit) => limit === 200).length === 1, JSON.stringify(limits));
+check("poll digest", pollDigest.includes("1 call (1 ok)"), pollDigest);
+
 await runCase("plain", plainFixture, (digest) => {
-  check("plain", digest === `digest ${PLAIN_CALLS} calls (${PLAIN_CALLS} ok) · shell ${PLAIN_CALLS} · files: none · fails: none`, digest);
+  check("plain", digest === `digest ${PLAIN_CALLS} calls (${PLAIN_CALLS} ok) · shell ${PLAIN_CALLS} · fails: none · files: none`, digest);
 });
 
 await runCase("compact", compactFixture, (digest) => {
-  check("compact", digest === `digest ${COMPACT_CALLS} calls (${COMPACT_CALLS} ok) · edit 1 · read 1 · files: new.txt · fails: none`, digest);
+  check("compact", digest === `digest ${COMPACT_CALLS} calls (${COMPACT_CALLS} ok) · edit 1 · read 1 · fails: none · files: new.txt`, digest);
   check("compact hides old", !digest.includes("old.txt"), digest);
 });
 
@@ -250,20 +281,25 @@ const wideCalls = wideWindow.reduce(
 
 limits.length = 0;
 await runCase("wide", () => wide, (digest) => {
-  const files = digest.match(/files: ([^·]+)/)?.[1]?.trim() ?? "";
-  const fails = digest.match(/fails: (.+)$/)?.[1]?.trim() ?? "";
-  const shownPaths = WIDE_PATHS.slice(0, 10);
+  const files = digest.match(/files: (.+)$/)?.[1]?.trim() ?? "";
+  const fails = digest.match(/fails: (.*?) · files: /)?.[1]?.trim() ?? "";
+  const shownPaths = files.split(", ");
   const shownFails = WIDE_FAILS.slice(0, 5);
   check("wide window", digest.startsWith(`digest ${wideCalls} calls`), digest);
-  check("wide split", digest.includes(`(${wideCalls - WIDE_FAILS.length} ok, ${WIDE_FAILS.length} err)`), digest);
-  check("wide path order", files === shownPaths.join(", "), files);
+  check(
+    "wide split",
+    digest.includes(`(${wideCalls - WIDE_FAILS.length - WIDE_UNFINISHED} ok, ${WIDE_FAILS.length} err)`),
+    digest,
+  );
+  check("wide unfinished", digest.includes(`unfinished: ${WIDE_UNFINISHED}`), digest);
   check("wide fail order", fails === shownFails.map((failure) => `${failure.name}: ${failure.text}`).join("; "), fails);
-  check("wide path cap", files.split(", ").length === 10, files);
   check("wide fail cap", fails.split("; ").length === 5, fails);
-  check("wide path drop", !digest.includes("p10") && !digest.includes("p11"), digest);
   check("wide fail drop", !digest.includes("e5") && !digest.includes("e6"), digest);
+  check("wide path prefix", shownPaths.every((path, i) => path === WIDE_PATHS[i]), files);
+  check("wide path shrink", shownPaths.length < 10, files);
   check("wide length", digest.length <= 400, `${digest.length} chars`);
-  check("wide limit", limits.length > 0 && limits.every((limit) => limit === 200), JSON.stringify(limits));
+  check("wide fail survives", digest.includes("fails: "), digest);
+  check("wide limit", limits.filter((limit) => limit === 200).length === 1, JSON.stringify(limits));
 });
 
 await fire("session_shutdown")({}, ctx);
@@ -272,5 +308,5 @@ if (failures.length) {
   console.log(`FAIL digest: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log(`PASS digest: plain, compact, fail, wide; ${limits.length} window reads of 200 rows`);
+console.log(`PASS digest: poll, plain, compact, fail, wide; ${limits.filter((limit) => limit === 200).length} wide read on the wide settle`);
 process.exit(0);

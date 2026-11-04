@@ -47,10 +47,11 @@ BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts                 
 
 | Case | What it proves |
 | --- | --- |
-| `plain` | 5 shell calls print `digest 5 calls (5 ok) · shell 5 · files: none · fails: none` |
+| `poll` | N sweeps with no settle make no 200-row read; one settle makes exactly one |
+| `plain` | 5 shell calls print `digest 5 calls (5 ok) · shell 5 · fails: none · files: none` |
 | `compact` | an edit before the newest compaction row does not appear |
 | `fail` | the first error line lands in `fails`, and an open ask adds `asks: 1` |
-| `wide` | 300 rows cap at 10 paths and 5 failures, and the line stays at or below 400 chars |
+| `wide` | 300 rows with long paths: the path list shrinks, 5 failures survive, `unfinished: 1` shows, line ≤ 400 |
 
 The control drops the compaction floor, so the `compact` case must fail.
 
