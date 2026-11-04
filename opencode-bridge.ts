@@ -121,8 +121,8 @@ interface Settle {
   answer: string;
   asks: Ask[];
   idleAt: number;
-  /** Steers admitted for this run. */
-  steers: number;
+  /** Steers admitted for this run; absent when no live watch knew the count. */
+  steers?: number;
   /** Set when the watch expired with the run still going. */
   expired?: boolean;
   /** Set when the open-ask read failed, so "none" is not claimed as a fact. */
@@ -597,7 +597,7 @@ type Read = Settle | "gone" | null;
  * settled, so the window closes at both ends. `want` keeps the backstop poll cheap; only a report
  * reads the wide window and builds the digest. A 404 is final; anything else may pass on a retry.
  */
-async function readSettle(session: string, floor: number, want = 8, steers = 0): Promise<Read> {
+async function readSettle(session: string, floor: number, want = 8, steers?: number): Promise<Read> {
   let row: any;
   try {
     row = (await api<any>("GET", `/api/session/${session}`)).data;
@@ -639,7 +639,7 @@ function settleText(s: Settle): string {
   return [
     `outcome: ${s.outcome}${s.expired ? " (watch expired; restart with oc_send to read the record)" : ""}`,
     s.error ?? "error: none",
-    `steers ${s.steers}`,
+    ...(s.steers !== undefined && s.steers > 0 ? [`steers ${s.steers}`] : []),
     s.answer ? `answer:\n${truncate(s.answer)}` : "answer: (none)",
     s.asks.length ? `open asks:\n${s.asks.map((ask) => describe(ask)).join("\n")}` : s.asksUnknown ? "open asks: unreadable" : "open asks: none",
     ...(s.digest ? [s.digest] : []),
@@ -1383,12 +1383,31 @@ export default function (pi: ExtensionAPI) {
       }),
       async execute(_id, params) {
         await assertLocal(state, params.session);
-        const w = state.armed.get(params.session);
-        if (!w) {
+        // The armed map can be stale: a steer to an idle thread starts an unwatched run.
+        const row = (await api<any>("GET", `/api/session/${params.session}`)).data;
+        if (!busy(row)) {
           return {
-            content: [{ type: "text", text: "no run in flight; oc_send starts one" }],
+            content: [{ type: "text", text: "run already settled; oc_send starts a new one" }],
             details: { session: params.session, steered: false },
             isError: true,
+          };
+        }
+        const w = state.armed.get(params.session);
+        if (!w) {
+          try {
+            await postPrompt(params.session, { text: params.text, delivery: "steer" });
+          } catch (error) {
+            if (/HTTP 409/.test(String(error))) {
+              return {
+                content: [{ type: "text", text: "steer refused: HTTP 409; the run stays" }],
+                details: { session: params.session, steered: false },
+              };
+            }
+            throw error;
+          }
+          return {
+            content: [{ type: "text", text: "steer admitted (no watch, no wake-up)" }],
+            details: { session: params.session, steered: true },
           };
         }
         if (state.claimed.has(params.session)) {
@@ -1411,7 +1430,7 @@ export default function (pi: ExtensionAPI) {
         } catch (error) {
           if (/HTTP 409/.test(String(error))) {
             return {
-              content: [{ type: "text", text: "steer already pending" }],
+              content: [{ type: "text", text: "steer refused: HTTP 409; the run stays" }],
               details: { session: params.session, steered: false },
             };
           }
@@ -1488,7 +1507,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
-        const read = settle ?? (await readSettle(params.session, floor, DIGEST_ROWS, w?.steers ?? 0));
+        const read = settle ?? (await readSettle(params.session, floor, DIGEST_ROWS, w?.steers));
         // The read spanned a session switch, so this result belongs to no live watch.
         if (mine !== state) return { content: [{ type: "text", text: "Pi session switched; retry" }], details: undefined };
         if (read === "gone" || read === null) {

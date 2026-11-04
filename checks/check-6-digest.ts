@@ -141,7 +141,7 @@ const check = (name: string, ok: boolean, detail: string) => {
 const runCase = async (
   name: string,
   fixture: () => { rows: any[]; idleAt: number; permission?: any[] },
-  expect: (digest: string) => void,
+  expect: (digest: string, text: string) => void,
 ) => {
   // Rows land before the send, so the watch cannot read an empty window.
   const next = fixture();
@@ -150,9 +150,10 @@ const runCase = async (
   permission = next.permission ?? [];
   const before = sent.length;
   await tool("oc_send").execute("t", { session: ID, text: name });
-  const digest = digestOf(await wake(before));
+  const text = await wake(before);
+  const digest = digestOf(text);
   console.log(`${name} -> ${digest}`);
-  expect(digest);
+  expect(digest, text);
 };
 
 const PLAIN_CALLS = 5;
@@ -276,8 +277,9 @@ console.log(`poll -> ${pollDigest}`);
 check("poll one wide read", limits.filter((limit) => limit === 200).length === 1, JSON.stringify(limits));
 check("poll digest", pollDigest.includes("1 call (1 ok)"), pollDigest);
 
-await runCase("plain", plainFixture, (digest) => {
+await runCase("plain", plainFixture, (digest, text) => {
   check("plain", digest === `digest ${PLAIN_CALLS} calls (${PLAIN_CALLS} ok) · shell ${PLAIN_CALLS} · fails: none · files: none`, digest);
+  check("plain no steers", !text.includes("steers "), text);
 });
 
 await runCase("compact", compactFixture, (digest) => {

@@ -1,6 +1,6 @@
 /** oc_steer: a correction reaches a running thread without spending its watch.
  *
- * Cases: one, twice, idle. The control re-arms the watch on steer and must fail.
+ * Cases: one, twice, late, nowatch. The control re-arms the watch on steer and must fail.
  * Run:
  *   bun run checks/check-7-steer.ts
  *   BRIDGE=$PWD/.control-steer.ts bun run checks/check-7-steer.ts   # must fail
@@ -22,7 +22,7 @@ process.env.OC_ROOT = ROOT;
 
 let rows: any[] = [];
 let idleAt = 0;
-let steerReply: "ok" | "409" = "ok";
+let sessionBusy = false;
 const posts: Array<{ text: string; delivery?: string }> = [];
 
 Bun.serve({
@@ -36,12 +36,6 @@ Bun.serve({
     if (req.method === "POST" && p.endsWith("/prompt")) {
       const body = await req.json() as { text?: string; delivery?: string };
       posts.push({ text: String(body.text ?? ""), delivery: body.delivery });
-      if (body.delivery === "steer" && steerReply === "409") {
-        return new Response(JSON.stringify({ error: "steer pending" }), {
-          status: 409,
-          headers: { "content-type": "application/json" },
-        });
-      }
       return json({ accepted: true });
     }
     if (p.endsWith("/message")) {
@@ -54,7 +48,13 @@ Bun.serve({
     }
     if (p === "/api/model") return json([]);
     if (/^\/api\/session\/ses_/.test(p)) {
-      return json({ id: ID, title: "steer", outcome: "stop", location: { directory: ROOT }, time: { idle: idleAt } });
+      return json({
+        id: ID,
+        title: "steer",
+        outcome: "stop",
+        location: { directory: ROOT },
+        time: { busy: sessionBusy ? 1 : 0, idle: sessionBusy ? 0 : idleAt },
+      });
     }
     return json(null, 404);
   },
@@ -128,6 +128,7 @@ const check = (name: string, ok: boolean, detail: string) => {
 await tool("oc_open").execute("o", { model: "stub/model-free", title: "steer" });
 
 // one: a steer mid-run keeps the watch and gives one wake-up.
+sessionBusy = true;
 await tool("oc_send").execute("t", { session: ID, text: "run one" });
 const oneAt = Date.now();
 await wait(20);
@@ -135,6 +136,7 @@ const oneText = textOf(await tool("oc_steer").execute("t", { session: ID, text: 
 console.log("one receipt ->", oneText);
 check("one receipt", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the next step boundary$/.test(oneText), oneText);
 check("one post", posts.at(-1)?.delivery === "steer" && posts.at(-1)?.text === "fix one", JSON.stringify(posts.at(-1)));
+sessionBusy = false;
 const oneBefore = sent.length;
 const oneSettleAt = oneAt + 1;
 rows = settleRows(oneSettleAt);
@@ -143,33 +145,50 @@ const oneWake = await wake(oneBefore);
 check("one wake-ups", oneWake !== null && sent.length === oneBefore + 1, `${sent.length - oneBefore}`);
 check("one steers", oneWake?.includes("steers 1") ?? false, oneWake ?? "(none)");
 
-// twice: a second steer gets 409 and does not count; one wake-up still.
+// twice: both steers are accepted; one wake-up carries steers 2.
+sessionBusy = true;
 await tool("oc_send").execute("t", { session: ID, text: "run two" });
 const twoAt = Date.now();
 await wait(20);
-steerReply = "ok";
 const twoFirst = textOf(await tool("oc_steer").execute("t", { session: ID, text: "fix two" }));
 check("twice first", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the next step boundary$/.test(twoFirst), twoFirst);
-steerReply = "409";
 const twoSecond = textOf(await tool("oc_steer").execute("t", { session: ID, text: "fix two again" }));
-check("twice second", twoSecond === "steer already pending", twoSecond);
+check("twice second", /^steer admitted at \d{2}:\d{2}:\d{2} · applies at the next step boundary$/.test(twoSecond), twoSecond);
 check("twice posts", posts.filter((post) => post.delivery === "steer").length === 3, JSON.stringify(posts));
-steerReply = "ok";
+sessionBusy = false;
 const twoBefore = sent.length;
 const twoSettleAt = twoAt + 1;
 rows = settleRows(twoSettleAt);
 idleAt = twoSettleAt;
 const twoWake = await wake(twoBefore);
 check("twice wake-ups", twoWake !== null && sent.length === twoBefore + 1, `${sent.length - twoBefore}`);
-check("twice steers", twoWake?.includes("steers 1") ?? false, twoWake ?? "(none)");
+check("twice steers", twoWake?.includes("steers 2") ?? false, twoWake ?? "(none)");
 
-// idle: no watch, clear error, no post.
-const idlePosts = posts.filter((post) => post.delivery === "steer").length;
-const idle = await tool("oc_steer").execute("t", { session: ID, text: "too late" });
-const idleText = textOf(idle);
-console.log("idle ->", idleText);
-check("idle error", idle.isError === true && idleText.includes("no run in flight"), idleText);
-check("idle no post", posts.filter((post) => post.delivery === "steer").length === idlePosts, JSON.stringify(posts));
+// late: the settle is reported and the watch is gone; the service says idle, so refuse.
+const latePosts = posts.filter((post) => post.delivery === "steer").length;
+const late = await tool("oc_steer").execute("t", { session: ID, text: "too late" });
+const lateText = textOf(late);
+console.log("late ->", lateText);
+check("late error", late.isError === true && lateText === "run already settled; oc_send starts a new one", lateText);
+check("late no post", posts.filter((post) => post.delivery === "steer").length === latePosts, JSON.stringify(posts));
+const recordText = textOf(await tool("oc_wait").execute("t", { session: ID, since: 1 }));
+check("late record no steers", !recordText.includes("steers "), recordText);
+
+// nowatch: the service says busy but no watch exists; post and name the missing wake-up.
+sessionBusy = true;
+const noWatchPosts = posts.filter((post) => post.delivery === "steer").length;
+const noWatch = await tool("oc_steer").execute("t", { session: ID, text: "no watch" });
+const noWatchText = textOf(noWatch);
+console.log("nowatch ->", noWatchText);
+check("nowatch receipt", noWatch.isError !== true && noWatchText === "steer admitted (no watch, no wake-up)", noWatchText);
+check("nowatch post", posts.filter((post) => post.delivery === "steer").length === noWatchPosts + 1, JSON.stringify(posts));
+const noWatchWake = sent.length;
+sessionBusy = false;
+const noWatchAt = Date.now() + 50;
+rows = settleRows(noWatchAt);
+idleAt = noWatchAt;
+await wait(300);
+check("nowatch no wake", sent.length === noWatchWake, `${sent.length - noWatchWake}`);
 
 await fire("session_shutdown")({}, ctx);
 
@@ -177,5 +196,5 @@ if (failures.length) {
   console.log(`FAIL steer: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS steer: one steer wakes once, a second steer answers 409 and wakes once, an idle steer posts nothing");
+console.log("PASS steer: one steer gives steers 1, two steers give steers 2, a late steer refuses, a busy thread with no watch posts without a wake-up");
 process.exit(0);

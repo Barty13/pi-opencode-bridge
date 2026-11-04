@@ -98,16 +98,20 @@ Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
 
 ## Steering
 
-`oc_steer` corrects a running thread in place. It does not re-arm the watch, so the run still gives
-one wake-up. The receipt is:
+`oc_steer` corrects a running thread in place. It asks the service first: an idle thread answers
+`run already settled; oc_send starts a new one`. A busy thread with a watch accepts the steer; a busy
+thread with no watch accepts it too, with `steer admitted (no watch, no wake-up)`. A watched run is
+not re-armed, so it still gives one wake-up. The receipts are:
 
 ```
 steer admitted at 14:03:07 · applies at the next step boundary
+steer admitted (no watch, no wake-up)
 ```
 
-Admission is not application: the steer lands at the next step boundary. A second steer while one is
-pending answers `steer already pending`, and the run keeps going. The settle body reports `steers N`
-for the run. A steer on a settled thread answers `no run in flight; oc_send starts one`.
+Any number of steers are accepted; each applies at its own step boundary. The settle body reports
+`steers N` when the run admitted at least one steer. A record read with no live watch omits the count,
+because the bridge cannot know it. If the service answers HTTP 409, the receipt names the status and
+the run stays.
 
 ## Run digest
 

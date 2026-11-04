@@ -26,7 +26,7 @@ open('.control-nogate.ts','w').write(src.replace(ceiling, "const COMPACT_TOKENS 
 digest = "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));"
 assert digest in src
 open('.control-digest.ts','w').write(src.replace(digest, "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);"))
-steer = '          await postPrompt(params.session, { text: params.text, delivery: "steer" });'
+steer = "          // A steer must not re-arm: the watch floor, deadline, claim, and report stay.\n          await postPrompt(params.session, { text: params.text, delivery: \"steer\" });"
 assert steer in src
 open('.control-steer.ts','w').write(src.replace(steer, "          armThread(params.session);\n" + steer))
 PY
@@ -66,8 +66,9 @@ The control drops the compaction floor, so the `compact` case must fail.
 | Case | What it proves |
 | --- | --- |
 | `one` | a steer mid-run gives one wake-up and `steers 1` |
-| `twice` | the second steer answers 409 and the run still gives one wake-up |
-| `idle` | a steer on a settled thread errors and posts nothing |
+| `twice` | two steers mid-run give `steers 2` and one wake-up |
+| `late` | a settled thread refuses the steer and posts nothing |
+| `nowatch` | a busy thread with no watch accepts the steer and names the missing wake-up |
 
 The control re-arms the watch on steer, so `one` must fail.
 
