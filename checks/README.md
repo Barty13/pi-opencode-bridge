@@ -46,9 +46,11 @@ control = src.replace(floor, """    const running = busy(row);
 arm = "    if (running) armThread(session, floor);"
 assert arm in control
 control = control.replace(arm, "    armThread(session, floor);", 1)
-restore = "      if (mine !== state || !busy(current)) return;"
+restore = """      if (mine !== state) return;
+      // A failed read may hide a live run, so keep the watch. Only a real idle row drops it.
+      if (!readFailed && !busy(current)) return;"""
 assert restore in control
-control = control.replace(restore, "      if (mine !== state) return;", 1)
+control = control.replace(restore, "      if (mine !== state || readFailed) return;", 1)
 open('.control-attach.ts','w').write(control)
 PY
 ```
@@ -107,8 +109,9 @@ The control restores three defects: the steer re-arm (`one`), the old `busy` pre
 | `detach` | `oc_stop detach: true` drops the watch, keeps the run, and never posts `/interrupt` |
 | `escape` | a thread outside `OC_ROOT` is refused; nothing is armed; the command reports the failure |
 | `restore` | a reload restores a watch for a busy saved row only; an idle saved row gets none |
+| `readfail` | a failed status read during restore keeps the watch; `/oc` still counts it |
 
-The control carries three defects: the newest-row floor (`live`), the unconditional arm (`idle`), and the blind restore (`restore`).
+The control carries four defects: the newest-row floor (`live`), the unconditional arm (`idle`), the blind restore (`restore`), and the dropped watch on a failed read (`readfail`).
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

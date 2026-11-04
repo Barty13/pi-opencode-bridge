@@ -112,7 +112,8 @@ A running thread gets one watch with the floor just behind its current run, so t
 wrote is not lost, and an answer from an earlier run is not reported as a fresh settle. An idle
 thread gets no watch; the next `oc_send` arms one. `/oc-attach <ses_...>` does the same from the
 command line, and `/oc` marks adopted threads `attached`. A reload restores a watch only while the
-thread still runs. `oc_stop` with `detach: true` drops the watch and leaves the run going.
+thread still runs; a failed status read keeps it. `oc_stop` with `detach: true` drops the watch and
+leaves the run going.
 
 ## Steering
 

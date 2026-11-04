@@ -9,8 +9,9 @@
  *   row drops the answer that the turn already wrote.
  *   GET /message?order=desc&limit=1 -> {data:[{id, time:{created}, type, ...}]}
  *
- * Cases: old, idle, live, detach, escape, restore. The control carries three defects: a newest-row
- * floor (live), an unconditional arm (idle), and a blind restore (restore).
+ * Cases: old, idle, live, detach, escape, restore, readfail. The control carries four defects: a
+ * newest-row floor (live), an unconditional arm (idle), a blind restore (restore), and a dropped
+ * watch on a failed restore read (readfail).
  * Run:
  *   bun run checks/check-8-attach.ts
  *   BRIDGE=$PWD/.control-attach.ts bun run checks/check-8-attach.ts   # must fail
@@ -29,6 +30,7 @@ const PORT = 8738;
 const MAIN = "ses_attach000000000000000000";
 const OUTSIDE = "ses_outside00000000000000000";
 const IDLE_RESTORE = "ses_restore000000000000000000";
+const READFAIL = "ses_readfail00000000000000000";
 const ROOT = realpathSync(mkdtempSync(join(tmpdir(), "oc-root-")));
 const OUTSIDE_DIR = realpathSync(mkdtempSync(join(tmpdir(), "oc-outside-")));
 process.env.OC_ROOT = ROOT;
@@ -36,6 +38,7 @@ process.env.OC_ROOT = ROOT;
 let mainRow: any = {};
 let outsideRow: any = {};
 let idleRow: any = {};
+let readFailRow: any = {};
 let rows: any[] = [];
 let idleRows: any[] = [];
 const interrupts: string[] = [];
@@ -48,7 +51,7 @@ const rowFor = (id: string, dir: string, busy: number, idle: number, created: nu
   tokens: { input: 6181, output: 1308, reasoning: 46, cache: { read: 0, write: 0 } },
   outcome: "succeeded",
   time: { created, updated: Math.max(busy, idle), busy, idle },
-  title: id === MAIN ? "attach-probe" : id === OUTSIDE ? "outside" : "restore-idle",
+  title: id === MAIN ? "attach-probe" : id === OUTSIDE ? "outside" : id === IDLE_RESTORE ? "restore-idle" : "readfail",
   location: { directory: dir },
 });
 
@@ -60,10 +63,11 @@ Bun.serve({
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify({ data }), { status, headers: { "content-type": "application/json" } });
     if (req.method === "POST" && p === "/api/session") return json({ id: MAIN, title: "attach-probe" });
-    if (req.method === "GET" && p === "/api/session") return json([mainRow, idleRow]);
+    if (req.method === "GET" && p === "/api/session") return json([mainRow, idleRow, readFailRow]);
     if (req.method === "GET" && p === `/api/session/${MAIN}`) return json(mainRow);
     if (req.method === "GET" && p === `/api/session/${OUTSIDE}`) return json(outsideRow);
     if (req.method === "GET" && p === `/api/session/${IDLE_RESTORE}`) return json(idleRow);
+    if (req.method === "GET" && p === `/api/session/${READFAIL}`) return json(null, 500);
     if (p.endsWith("/message")) {
       const list = p.startsWith(`/api/session/${IDLE_RESTORE}`) ? idleRows : rows;
       const limit = Number(new URL(req.url).searchParams.get("limit") ?? 0);
@@ -287,11 +291,27 @@ const restoreWake = sent.length;
 await wait(1500);
 check("restore no idle wake", sent.length === restoreWake, `${sent.length - restoreWake}`);
 
+// readfail: a failed status read keeps the watch; only a real idle row drops it.
+await fire("session_shutdown")({}, ctx);
+const failNow = Date.now();
+readFailRow = rowFor(READFAIL, ROOT, failNow - 100, failNow - 5000, failNow - 20_000);
+entries = [{
+  type: "custom",
+  customType: "oc-armed",
+  data: [{ session: READFAIL, floor: failNow - 5000, steers: 0, attached: true }],
+}];
+await fire("session_start")({}, ctx);
+await command("oc").handler("", ctx);
+const readfailNotice = notices.at(-1) ?? "";
+console.log("readfail ->", readfailNotice);
+check("readfail armed", readfailNotice.includes("armed: 1"), readfailNotice);
+check("readfail listed", readfailNotice.includes(READFAIL), readfailNotice);
+
 await fire("session_shutdown")({}, ctx);
 
 if (failures.length) {
   console.log(`FAIL attach: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS attach: idle is silent, live keeps the at-floor answer, escape refuses, detach keeps the run, restore arms only busy rows");
+console.log("PASS attach: idle is silent, live keeps the at-floor answer, escape refuses, detach keeps the run, restore arms only busy rows, a failed read keeps the watch");
 process.exit(0);

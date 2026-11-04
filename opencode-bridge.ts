@@ -1222,8 +1222,16 @@ export default function (pi: ExtensionAPI) {
     await Promise.all((saved ?? []).map(async (row) => {
       if (mine !== state) return;
       if (row.attached) mine.attached.add(row.session);
-      const current = (await api<any>("GET", `/api/session/${row.session}`).catch(() => null))?.data;
-      if (mine !== state || !busy(current)) return;
+      let current: any = null;
+      let readFailed = false;
+      try {
+        current = (await api<any>("GET", `/api/session/${row.session}`)).data;
+      } catch {
+        readFailed = true;
+      }
+      if (mine !== state) return;
+      // A failed read may hide a live run, so keep the watch. Only a real idle row drops it.
+      if (!readFailed && !busy(current)) return;
       mine.armed.set(row.session, {
         floor: row.floor,
         deadline: Date.now() + WATCH_TTL_MS,
