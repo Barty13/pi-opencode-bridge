@@ -53,6 +53,9 @@ const ROOT = resolveRoot();
 // OC_SERVICE_FILE points at another service file; the checks need a stub, bun ignores HOME.
 const SERVICE_FILE = process.env.OC_SERVICE_FILE ?? join(homedir(), ".config", "opencode", "service.json");
 const MAX_TEXT = 4000;
+/** The settle ledger reads one window and prints one line, so a long run cannot grow the wake-up. */
+const DIGEST_ROWS = 200;
+const DIGEST_MAX = 400;
 /** Data policy per model id, filled by the operator: OC_RETENTION='{"<id-suffix>":"zero"}'.
   * Read the policy from your provider's model page; this bridge ships no ids. Match is by exact
   * id suffix, so a new model gets no label rather than another model's policy. Display only. */
@@ -120,6 +123,8 @@ interface Settle {
   expired?: boolean;
   /** Set when the open-ask read failed, so "none" is not claimed as a fact. */
   asksUnknown?: boolean;
+  /** One-line run ledger from the window read; absent when no window was read. */
+  digest?: string;
 }
 
 interface BridgeState {
@@ -433,6 +438,60 @@ function partLine(part: any): string {
   return `[${part.type}] ${clip(JSON.stringify(part))}`;
 }
 
+/** First line of a tool error, so one failure cannot fill the ledger. */
+function firstLine(text: unknown): string {
+  return String(text ?? "").split("\n")[0].trim();
+}
+
+/**
+ * One line for the settle window: calls, tools, paths, failures, and open asks.
+ * Live tool parts put the path at `state.input.path`, the shell exit at `state.metadata.exit`,
+ * and the status at `state.status`; `executed` stays false on completed calls.
+ */
+function digestLine(rows: any[], asks?: number): string {
+  const tools = new Map<string, number>();
+  const edits: string[] = [];
+  const reads: string[] = [];
+  const fails: string[] = [];
+  let calls = 0;
+  let failed = 0;
+  for (const row of rows) {
+    if (row?.type !== "assistant") continue;
+    for (const part of row.content ?? []) {
+      if (part?.type !== "tool") continue;
+      const state = part.state ?? {};
+      const name = String(part.name ?? "?");
+      const input = state.input ?? {};
+      calls++;
+      tools.set(name, (tools.get(name) ?? 0) + 1);
+      if (typeof input.path === "string" && input.path) {
+        if (name === "write" || name === "edit") edits.push(input.path);
+        else if (name === "read") reads.push(input.path);
+      }
+      const exit = Number(state.metadata?.exit ?? 0);
+      if (state.status === "error" || (name === "shell" && exit !== 0)) {
+        failed++;
+        if (fails.length < 5) {
+          const reason = firstLine(state.error?.message) || (name === "shell" && exit !== 0 ? `exit ${exit}` : "error");
+          fails.push(`${name}: ${reason}`);
+        }
+      }
+    }
+  }
+  const ok = calls - failed;
+  const split = failed ? `${ok} ok, ${failed} err` : `${ok} ok`;
+  const names = [...tools]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([name, count]) => `${name} ${count}`);
+  const paths = [...new Set([...edits, ...reads])].slice(0, 10);
+  const line = `digest ${calls} ${calls === 1 ? "call" : "calls"} (${split}) · ${
+    names.length ? names.join(" · ") : "tools: none"
+  } · files: ${paths.length ? paths.join(", ") : "none"} · fails: ${fails.length ? fails.join("; ") : "none"}${
+    asks !== undefined && asks > 0 ? ` · asks: ${asks}` : ""
+  }`;
+  return line.length > DIGEST_MAX ? `${line.slice(0, DIGEST_MAX - 1)}…` : line;
+}
+
 /** One message row; `at` skips into the body for oc_read offset. */
 function rowBlock(row: any, full: boolean, at: number): string {
   if (row.type === "user") return `[user] ${truncate(String(row.text ?? ""), at)}`;
@@ -515,7 +574,7 @@ async function readSettle(session: string, floor: number): Promise<Read> {
   }
   const idleAt = Number(row?.time?.idle ?? 0);
   // A failed message read has no answer, so let the caller retry instead of reporting "(none)".
-  const rows = await recentRows(session).catch(() => null);
+  const rows = await recentRows(session, DIGEST_ROWS).catch(() => null);
   if (rows === null) return null;
   const fresh = rows.filter((entry: any) => {
     const at = Number(entry?.time?.created ?? 0);
@@ -526,6 +585,9 @@ async function readSettle(session: string, floor: number): Promise<Read> {
   // A run's own idle row carries its outcome, and the session row can still hold the one before.
   const idle = fresh.find((entry: any) => entry.type === "idle") ?? null;
   const open = await asks(session).catch(() => null);
+  // A compaction hides the context before it, so the ledger starts after the newest one.
+  const compactAt = Number(fresh.find((entry: any) => entry.type === "compaction")?.time?.created ?? 0);
+  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));
   return {
     session,
     title: String(row?.title ?? ""),
@@ -535,6 +597,7 @@ async function readSettle(session: string, floor: number): Promise<Read> {
     asks: open ?? [],
     asksUnknown: open === null,
     idleAt,
+    digest: digestLine(digestRows, open === null ? undefined : open.length),
   };
 }
 
@@ -545,6 +608,7 @@ function settleText(s: Settle): string {
     s.error ?? "error: none",
     s.answer ? `answer:\n${truncate(s.answer)}` : "answer: (none)",
     s.asks.length ? `open asks:\n${s.asks.map((ask) => describe(ask)).join("\n")}` : s.asksUnknown ? "open asks: unreadable" : "open asks: none",
+    ...(s.digest ? [s.digest] : []),
   ].join("\n\n");
 }
 

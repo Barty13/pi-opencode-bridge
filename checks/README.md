@@ -23,6 +23,9 @@ open('.control-compact.ts','w').write(src.replace(gate, ""))
 ceiling = "const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);"
 assert ceiling in src
 open('.control-nogate.ts','w').write(src.replace(ceiling, "const COMPACT_TOKENS = 0;  // CONTROL: gate off"))
+digest = "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));"
+assert digest in src
+open('.control-digest.ts','w').write(src.replace(digest, "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);"))
 PY
 ```
 
@@ -36,7 +39,20 @@ BRIDGE=file://$PWD/.control-bridge.ts CASE=dup bun run checks/check-3-unit.ts   
 BRIDGE=file://$PWD/.control-compact.ts bun run checks/check-1-compact.ts          # must fail
 bun run checks/check-4-gate.ts
 BRIDGE=$PWD/.control-nogate.ts bun run checks/check-4-gate.ts                     # must fail
+bun run checks/check-6-digest.ts
+BRIDGE=$PWD/.control-digest.ts bun run checks/check-6-digest.ts                   # must fail
 ```
+
+`check-6-digest.ts` runs the settle ledger cases against a stub service:
+
+| Case | What it proves |
+| --- | --- |
+| `plain` | 5 shell calls print `digest 5 calls (5 ok) · shell 5 · files: none · fails: none` |
+| `compact` | an edit before the newest compaction row does not appear |
+| `fail` | the first error line lands in `fails`, and an open ask adds `asks: 1` |
+| `wide` | 300 rows cap at 10 paths and 5 failures, and the line stays at or below 400 chars |
+
+The control drops the compaction floor, so the `compact` case must fail.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

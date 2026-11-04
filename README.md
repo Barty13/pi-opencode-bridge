@@ -95,6 +95,21 @@ to end. An escape (abort) holds the batch, so a wake-up cannot reopen a conversa
 
 Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
 
+## Run digest
+
+The settle body ends with one digest line when the bridge reads the window. The line comes from the
+same 200-row window that the settle read uses, so it adds no request and no model call.
+
+```
+digest 5 calls (5 ok) · shell 5 · files: none · fails: none
+```
+
+The line gives the call count and the ok/error split, the calls per tool name, the first ten touched
+paths (edits before reads), and the first five failures (tool name and first error line). An open ask
+adds `asks: N`. The window starts after the newer of the watch floor and the newest compaction row,
+so a compacted context does not show calls from before the compaction. The line caps at 400
+characters.
+
 ## Context ceiling
 
 A thread that grew past `OC_COMPACT_TOKENS` compacts before it takes your next instruction. The
