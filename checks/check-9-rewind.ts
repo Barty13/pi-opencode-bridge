@@ -12,8 +12,9 @@
  *   A stage, a commit, or a clear on a busy thread answers 409 SessionBusyError; fork answers 200.
  *   GET /message?order=desc&limit=200 carries user rows with their ids.
  *
- * Cases: stage, clear, ask, commit, branch, armed. The control drops the supervised ask, so the
- * ask case must fail.
+ * Cases: stage, steered, window, clear, ask, commit, branch, armed, noui. The control carries four
+ * defects: the stage ask after the stage (ask), the newest-user-row target (steered), the untracked
+ * clear (clear), and the no-UI advice (noui).
  * Run:
  *   bun run checks/check-9-rewind.ts
  *   BRIDGE=$PWD/.control-rewind.ts bun run checks/check-9-rewind.ts   # must fail
@@ -38,9 +39,10 @@ process.env.OC_ROOT = ROOT;
 const NOW = Date.now();
 const IDLE_AT = NOW - 1000;
 const BUSY_AT = NOW - 4000;
+let busyAt = BUSY_AT;
 
-/** Rows of the last run, newest first; the newest user row is its target. */
-const setRun = (base = Date.now()) => {
+/** Rows of the last run, newest first; the oldest user row at or after busy is the target. */
+const setRun = (base = Date.now(), opts: { steer?: boolean } = {}) => {
   rows = [
     { id: "msg_rewind_idle", type: "idle", outcome: "succeeded", time: { created: base - 1000 } },
     {
@@ -49,6 +51,9 @@ const setRun = (base = Date.now()) => {
       time: { created: base - 1400, completed: base - 1200 },
       content: [{ type: "text", text: "DONE" }],
     },
+    ...(opts.steer
+      ? [{ id: "msg_rewind_steer", type: "user", time: { created: base - 1600 }, text: "steer: focus" }]
+      : []),
     {
       id: "msg_rewind_shell",
       type: "assistant",
@@ -98,7 +103,7 @@ const parentRow = () => ({
   cost: 0.0031,
   tokens: { input: 6181, output: 1308, reasoning: 46, cache: { read: 1200, write: 0 } },
   outcome: "succeeded",
-  time: { created: NOW - 60_000, updated: IDLE_AT, busy: BUSY_AT, idle: IDLE_AT },
+  time: { created: NOW - 60_000, updated: IDLE_AT, busy: busyAt, idle: IDLE_AT },
   title: "rewind-probe",
   location: { directory: ROOT },
 });
@@ -260,11 +265,13 @@ const resetTrace = () => { trace.length = 0; confirms.length = 0; };
 const streamDeadline = Date.now() + 2000;
 while (!calls.some((call) => call.path === "/api/event") && Date.now() < streamDeadline) await wait(20);
 
-// stage: the default posts files:true at the newest user row and names the paths the digest saw.
+// stage: the default posts files:true at the run opener and names the paths and digest.
+// The ask order gets its own case; this case proves the stage body and receipt.
 resetTrace();
+confirmAnswer = true;
 const stageText = textOf(await tool("oc_rewind").execute("t", { session: ID }));
 console.log("stage ->", stageText);
-check("stage trace", trace.join(",") === "stage", trace.join(","));
+check("stage trace", trace.includes("stage") && !trace.includes("commit"), trace.join(","));
 const stageCall = calls.filter((call) => call.path.endsWith("/revert/stage")).at(-1);
 check(
   "stage body",
@@ -283,13 +290,23 @@ check(
   stageText,
 );
 check("stage hint", stageText.includes("staged; clear restores these files"), stageText);
+check(
+  "stage ask",
+  confirms.length === 1
+    && confirms[0].includes("Stage the revert")
+    && confirms[0].includes("msg_rewind_user")
+    && confirms[0].includes("src/note.txt")
+    && confirms[0].includes("restored at once"),
+  confirms.join("\n"),
+);
 
-// stage files:false: the flag reaches the wire, and the receipt says the files stay.
+// stage files:false: the flag reaches the wire, the receipt says the files stay, and no ask runs.
 resetTrace();
 const keptText = textOf(await tool("oc_rewind").execute("t", { session: ID, files: false }));
 console.log("stage kept ->", keptText);
 const keptCall = calls.filter((call) => call.path.endsWith("/revert/stage")).at(-1);
 check("stage kept trace", trace.join(",") === "stage", trace.join(","));
+check("stage kept no ask", confirms.length === 0, confirms.join("\n"));
 check("stage kept body", keptCall?.body?.files === false, JSON.stringify(keptCall));
 check(
   "stage kept receipt",
@@ -299,7 +316,41 @@ check(
   keptText,
 );
 
-// clear: DELETE /revert drops the staged revert and the files go back to the run's state.
+// steered: a steer writes a newer user row; the oldest user row at or after busy is the opener.
+resetTrace();
+setRun(Date.now(), { steer: true });
+const steeredText = textOf(await tool("oc_rewind").execute("t", { session: ID }));
+console.log("steered ->", steeredText);
+const steeredCall = calls.filter((call) => call.path.endsWith("/revert/stage")).at(-1);
+check(
+  "steered target",
+  steeredText.includes("rewound") && steeredText.includes("msg_rewind_user") && !steeredText.includes("msg_rewind_steer"),
+  steeredText,
+);
+check("steered body", steeredCall?.body?.messageID === "msg_rewind_user", JSON.stringify(steeredCall));
+
+// window: no user row sits at or after busy; refuse with the window wording and no stage call.
+busyAt = Date.now() - 1000;
+setRun();
+resetTrace();
+let windowError = "";
+try {
+  await tool("oc_rewind").execute("t", { session: ID });
+} catch (error) {
+  windowError = error instanceof Error ? error.message : String(error);
+}
+console.log("window ->", windowError);
+check(
+  "window wording",
+  windowError
+    === "the opening user row of the last run sits older than the 200-row window; fork with branch:true, or rewind a shorter run",
+  windowError,
+);
+check("window no stage", trace.length === 0, trace.join(","));
+busyAt = BUSY_AT;
+setRun();
+
+// clear: a tracked stage deletes; a second clear has no tracked stage and changes nothing.
 resetTrace();
 const clearText = textOf(await tool("oc_rewind").execute("t", { session: ID, clear: true }));
 console.log("clear ->", clearText);
@@ -316,29 +367,82 @@ check(
   clearText,
 );
 
-// ask: supervised commit stages, asks the human with the paths, then commits. No answer, no commit.
+resetTrace();
+const noClearBefore = calls.length;
+const noClear = await tool("oc_rewind").execute("t", { session: ID, clear: true });
+const noClearText = textOf(noClear);
+console.log("clear none ->", noClearText);
+check("clear none trace", trace.join(",") === "", trace.join(","));
+check("clear none no call", calls.length === noClearBefore, JSON.stringify(calls.slice(noClearBefore)));
+check("clear none receipt", noClearText === "no rewind staged in this session; nothing cleared", noClearText);
+check("clear none files", noClear.details?.files === false, JSON.stringify(noClear.details));
+
+// ask: a supervised file stage asks before the rewrite; refusal leaves the tree alone.
 resetTrace();
 confirmAnswer = true;
-const askText = textOf(await tool("oc_rewind").execute("t", { session: ID, commit: true }));
-console.log("ask ->", askText);
-check("ask trace", trace.join(",") === "stage,ask,commit", trace.join(","));
+const askStageText = textOf(await tool("oc_rewind").execute("t", { session: ID }));
+console.log("ask stage ->", askStageText);
+check("ask stage trace", trace.join(",") === "ask,stage", trace.join(","));
 check(
-  "ask question",
+  "ask stage question",
   confirms.length === 1
-    && confirms[0].includes("Commit the revert")
+    && confirms[0].includes("Stage the revert")
     && confirms[0].includes("msg_rewind_user")
-    && confirms[0].includes("src/note.txt"),
+    && confirms[0].includes("src/note.txt")
+    && confirms[0].includes("restored at once")
+    && confirms[0].includes("clear reverses the stage"),
   confirms.join("\n"),
 );
-check("ask receipt", askText.includes("committed; the run's messages after msg_rewind_user are gone"), askText);
+check("ask stage receipt", askStageText.includes("staged; clear restores these files"), askStageText);
 
 resetTrace();
 confirmAnswer = false;
-const deny = await tool("oc_rewind").execute("t", { session: ID, commit: true });
-const denyText = textOf(deny);
-console.log("deny ->", denyText);
-check("ask deny trace", trace.join(",") === "stage,ask", trace.join(","));
-check("ask deny receipt", deny.isError === true && denyText.includes("commit refused"), denyText);
+const denyStage = await tool("oc_rewind").execute("t", { session: ID });
+const denyStageText = textOf(denyStage);
+console.log("ask deny stage ->", denyStageText);
+check("ask deny stage trace", trace.join(",") === "ask", trace.join(","));
+check(
+  "ask deny stage receipt",
+  denyStage.isError === true && denyStageText.includes("stage refused; nothing changed"),
+  denyStageText,
+);
+confirmAnswer = true;
+
+// supervised commit: one question covers the file stage and the commit.
+resetTrace();
+const askText = textOf(await tool("oc_rewind").execute("t", { session: ID, commit: true }));
+console.log("ask commit ->", askText);
+check("ask commit trace", trace.join(",") === "ask,stage,commit", trace.join(","));
+check(
+  "ask commit question",
+  confirms.length === 1
+    && confirms[0].includes("msg_rewind_user")
+    && confirms[0].includes("src/note.txt")
+    && confirms[0].includes("commit makes it permanent")
+    && confirms[0].includes("cannot be undone"),
+  confirms.join("\n"),
+);
+check("ask commit receipt", askText.includes("committed; the run's messages after msg_rewind_user are gone"), askText);
+
+// files:false has no stage question, so the commit asks here.
+resetTrace();
+const keptAskText = textOf(await tool("oc_rewind").execute("t", { session: ID, commit: true, files: false }));
+console.log("ask kept commit ->", keptAskText);
+check("ask kept trace", trace.join(",") === "stage,ask,commit", trace.join(","));
+check(
+  "ask kept question",
+  confirms.length === 1 && confirms[0].includes("Commit the revert") && confirms[0].includes("msg_rewind_user"),
+  confirms.join("\n"),
+);
+check("ask kept receipt", keptAskText.includes("committed; the run's messages after msg_rewind_user are gone"), keptAskText);
+
+resetTrace();
+confirmAnswer = false;
+const denyCommit = await tool("oc_rewind").execute("t", { session: ID, commit: true, files: false });
+const denyCommitText = textOf(denyCommit);
+console.log("ask deny commit ->", denyCommitText);
+check("ask deny commit trace", trace.join(",") === "stage,ask", trace.join(","));
+check("ask deny commit receipt", denyCommit.isError === true && denyCommitText.includes("commit refused"), denyCommitText);
 confirmAnswer = true;
 
 // commit: auto mode posts the stage then the commit, in that order, with no ask between them.
@@ -386,11 +490,32 @@ check("armed zero calls", calls.length === before, JSON.stringify(calls.slice(be
 check("armed zero routes", trace.length === 0, trace.join(","));
 await tool("oc_stop").execute("t", { session: ID, detach: true });
 
+// noui: without a UI a supervised commit refuses, keeps the stage staged, and does not advise auto.
+await command("oc-accept").handler("", ctx);
+ctx.hasUI = false;
+resetTrace();
+let nouiError = "";
+try {
+  await tool("oc_rewind").execute("t", { session: ID, commit: true, files: false });
+} catch (error) {
+  nouiError = error instanceof Error ? error.message : String(error);
+}
+ctx.hasUI = true;
+console.log("noui ->", nouiError);
+check(
+  "noui message",
+  nouiError.includes("the revert stays staged") && nouiError.includes("decision in a Pi TUI"),
+  nouiError,
+);
+check("noui no advice", !nouiError.includes("/oc-auto"), nouiError);
+check("noui trace", trace.join(",") === "stage", trace.join(","));
+check("noui no commit", !trace.includes("commit"), trace.join(","));
+
 await fire("session_shutdown")({}, ctx);
 
 if (failures.length) {
   console.log(`FAIL rewind: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS rewind: stage names the target and paths, files:false keeps them, clear deletes the stage, supervised commit asks before it commits, auto commits after the stage, branch forks before the target and attaches, an armed watch refuses with zero calls");
+console.log("PASS rewind: a file stage asks before the rewrite, a steer does not become the target, an old opener gets the window wording, clear tracks the stage, supervised commit asks before it commits, auto commits after the stage, branch forks before the target and attaches, an armed watch refuses with zero calls, no UI keeps the stage without auto advice");
 process.exit(0);

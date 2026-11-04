@@ -135,9 +135,9 @@ the run stays.
 
 ## Rewind
 
-`oc_rewind` undoes the last run of a thread. It reads the newest `user` row and stages a revert at
-that boundary. The default stage restores the run's file edits at once; the receipt names the target
-message and the paths the digest saw:
+`oc_rewind` undoes the last run of a thread. It takes the oldest `user` row at or after the run's
+`busy` mark, so a steer row does not become the boundary. The default stage restores the run's file
+edits at once; the receipt names the target message and the paths the digest saw:
 
 ```
 rewound ses_… to msg_…
@@ -146,11 +146,16 @@ digest 2 calls (1 ok, 1 err) · shell 1 · write 1 · fails: shell: exit 1 · fi
 staged; clear restores these files, commit makes it permanent.
 ```
 
-`files: false` stages the message revert and keeps the files. `commit: true` stages, then posts
-`/revert/commit`: the run's messages after the target go away and the staged file changes stay.
-Supervised mode asks first in a dialog that names the target and the paths; auto mode posts straight
-through. `clear: true` drops the staged revert with `DELETE /revert`, so the files go back to the
-run's state.
+`files: false` stages the message revert and keeps the files. In supervised mode a file stage asks
+before the rewrite; the question names the target and the digest paths, and says `clear` reverses the
+stage. The same question covers a requested commit, which cannot be undone. Auto mode posts through.
+A `files: false` commit asks at the commit. `commit: true` posts `/revert/commit`: the run's messages
+after the target go away and the staged file changes stay.
+
+`clear: true` drops a stage this Pi session made with `DELETE /revert`, so the files go back to the
+run's state. With no tracked stage it makes no call and says nothing was cleared. Without a UI, a
+supervised commit keeps the stage and says the decision needs a Pi TUI. A thread whose opening user
+row sits below the 200-row window gets a fork hint instead of a false "no user message".
 
 `branch: true` is the undo that keeps the history: it forks with `POST /fork {before}` and attaches
 the child. There is no `unrevert` route, so a committed revert is final.

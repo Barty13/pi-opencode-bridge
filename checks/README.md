@@ -52,17 +52,73 @@ restore = """      if (mine !== state) return;
 assert restore in control
 control = control.replace(restore, "      if (mine !== state || readFailed) return;", 1)
 open('.control-attach.ts','w').write(control)
-rewind = '''        const filesLabel = kept ? "kept (files:false)" : paths.length ? paths.join(", ") : "none";
-        if (!(await confirmCommit(session, target, filesLabel))) {
+rewind_target = """        const current = (await api<any>("GET", `/api/session/${session}`)).data;
+        // The run opener is the oldest user row at or after busy; a steer writes a newer user row.
+        const floor = Number(current?.time?.busy ?? 0) - 1;
+        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
+        const at = rows.findLastIndex((row: any) =>
+          row.type === "user" && Number(row?.time?.created ?? 0) >= floor
+        );
+        if (at < 0) {
+          throw new Error(
+            `the opening user row of the last run sits older than the ${DIGEST_ROWS}-row window; fork with branch:true, or rewind a shorter run`,
+          );
+        }"""
+assert rewind_target in src
+control = src.replace(rewind_target, """        // The newest user row opens the last run; the rows newer than it carry that run's tools.
+        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
+        const at = rows.findIndex((row: any) => row.type === "user");
+        if (at < 0) throw new Error(`thread ${session} has no user message to rewind`);""", 1)
+rewind_clear = """        if (params.clear) {
+          // Only a stage this session made can be cleared; the service answers 204 even with nothing staged.
+          const tracked = state.staged.get(session);
+          if (!tracked) {
+            return {
+              content: [{ type: "text", text: "no rewind staged in this session; nothing cleared" }],
+              details: { session, rewound: false, target: "", branch: "", files: false },
+            };
+          }
+          await revert("DELETE", `/api/session/${session}/revert`);
+          state.staged.delete(session);
           return {
-            content: [{ type: "text", text: "commit refused; the revert stays staged. clear restores the files." }],
-            details: { session, rewound: true, target, branch: "" },
+            content: [{ type: "text", text: `cleared the staged revert on ${session}; files are back at the run's state` }],
+            details: { session, rewound: false, target: "", branch: "", files: true },
+          };
+        }"""
+assert rewind_clear in control
+control = control.replace(rewind_clear, """        if (params.clear) {
+          await revert("DELETE", `/api/session/${session}/revert`);
+          return {
+            content: [{ type: "text", text: `cleared the staged revert on ${session}; files are back at the run's state` }],
+            details: { session, rewound: false, target: "", branch: "", files: true },
+          };
+        }""", 1)
+rewind_ask = """        // The stage rewrites files at once, so the human decision comes before the POST.
+        if (!kept && !(await confirmStage(session, target, digestLabel, params.commit === true))) {
+          return {
+            content: [{ type: "text", text: "stage refused; nothing changed." }],
+            details: { session, rewound: false, target: "", branch: "", files: false },
             isError: true,
           };
         }
-'''
-assert rewind in src
-open('.control-rewind.ts','w').write(src.replace(rewind, "", 1))
+        const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
+        const paths = pathsOf(stage);
+        state.staged.set(session, target);"""
+assert rewind_ask in control
+control = control.replace(rewind_ask, """        const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
+        const paths = pathsOf(stage);
+        state.staged.set(session, target);
+        if (!kept && !(await confirmStage(session, target, digestLabel, params.commit === true))) {
+          return {
+            content: [{ type: "text", text: "stage refused; nothing changed." }],
+            details: { session, rewound: false, target: "", branch: "", files: false },
+            isError: true,
+          };
+        }""", 1)
+rewind_noui = '      throw new Error("the revert stays staged; the commit needs a decision in a Pi TUI");'
+assert rewind_noui in control
+control = control.replace(rewind_noui, '      throw new Error("supervised commit needs a terminal dialog; run /oc-auto for this session, then retry");', 1)
+open('.control-rewind.ts','w').write(control)
 PY
 ```
 
@@ -130,14 +186,16 @@ The control carries four defects: the newest-row floor (`live`), the uncondition
 
 | Case | What it proves |
 | --- | --- |
-| `stage` | the default posts `{messageID, files:true}` at the newest user row and names the target, the paths, and the digest; `files:false` keeps the files |
-| `clear` | `DELETE /revert` drops the staged revert |
-| `ask` | supervised commit posts stage, then the human ask naming the target and paths, then commit; a no posts no commit |
+| `stage` | the default posts `{messageID, files:true}` at the run opener and names the target, paths, and digest; `files:false` keeps the files with no ask |
+| `steered` | a steer user row does not become the target; no user row at or after `busy` gives the window wording and no stage call |
+| `clear` | a tracked stage deletes with `DELETE /revert`; a second clear makes no call and reports no file change |
+| `ask` | a supervised file stage asks before the stage, one question covers a commit, refusal calls no stage, and `files:false` keeps the commit ask |
 | `commit` | auto mode posts stage then commit, in that order, with no ask |
 | `branch` | the fork body carries `before`, the child is attached, and `/oc` marks it |
 | `armed` | an armed watch refuses the rewind with zero service calls |
+| `noui` | no UI keeps the stage staged, says the commit needs a Pi TUI, and does not advise `/oc-auto` |
 
-The control drops the supervised ask, so the `ask` case must fail.
+The control carries four defects: the stage ask after the stage (`ask`), the newest-user-row target (`steered`), the untracked clear (`clear`), and the no-UI advice (`noui`).
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

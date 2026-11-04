@@ -148,6 +148,8 @@ interface BridgeState {
   known: Set<string>;
   /** Threads adopted by oc_attach, so /oc can mark them. */
   attached: Set<string>;
+  /** Revert target staged in this Pi session per thread, so clear knows what it drops. */
+  staged: Map<string, string>;
   /** Threads owed a wake-up. The only floor source: a send sets it, a settle or stop clears it. */
   armed: Map<string, Watch>;
   /** Threads whose settle is being read, so stream and backstop settle one thread once. */
@@ -180,6 +182,7 @@ function freshState(): BridgeState {
     labels: new Map(),
     known: new Set(),
     attached: new Set(),
+    staged: new Map(),
     armed: new Map(),
     claimed: new Set(),
     sending: new Map(),
@@ -356,6 +359,7 @@ function forget(state: BridgeState, session: string): void {
   state.local.delete(session);
   state.known.delete(session);
   state.attached.delete(session);
+  state.staged.delete(session);
   state.dirs.delete(session);
   state.labels.delete(session);
   state.reportedRun.delete(session);
@@ -530,6 +534,20 @@ function digestLine(rows: any[], asks?: number): string {
   // Last resort: the head alone is longer than the cap.
   const last = line(fails.slice(0, 1), "none");
   return last.length > DIGEST_MAX ? `${last.slice(0, DIGEST_MAX - 1)}…` : last;
+}
+
+/** Paths the digest saw, in row order, for the stage question before any file changes. */
+function touchedPaths(rows: any[]): string[] {
+  const paths: string[] = [];
+  for (const row of rows) {
+    if (row?.type !== "assistant") continue;
+    for (const part of row.content ?? []) {
+      if (part?.type !== "tool") continue;
+      const path = part.state?.input?.path;
+      if (typeof path === "string" && path) paths.push(path);
+    }
+  }
+  return [...new Set(paths)];
 }
 
 /** One message row; `at` skips into the body for oc_read offset. */
@@ -1161,13 +1179,30 @@ export default function (pi: ExtensionAPI) {
     } tokens · ${asksLine} · ${running ? "running" : "idle"}${note}`;
   };
 
+  /** The human gate for a file stage: supervised mode asks first, auto mode posts through.
+   * The stage rewrites the working tree at once, so the question names the target and the paths. */
+  const confirmStage = async (session: string, target: string, files: string, commit: boolean): Promise<boolean> => {
+    if (state.mode === "unsupervised") return true;
+    const context = ctx;
+    if (!context?.hasUI) {
+      throw new Error("supervised stage needs a decision in a Pi TUI; nothing changed");
+    }
+    const tail = commit
+      ? "clear reverses the stage; commit makes it permanent and cannot be undone."
+      : "clear reverses the stage.";
+    return context.ui.confirm(
+      "OpenCode rewind",
+      `Stage the revert of ${session} to ${target}?\nFiles from the digest: ${files}\nThe run's edits are restored at once. ${tail}`,
+    );
+  };
+
   /** The human gate for a commit: supervised mode confirms in a dialog, auto mode posts through.
    * A commit cannot be undone, so the question names the target and the paths. */
   const confirmCommit = async (session: string, target: string, files: string): Promise<boolean> => {
     if (state.mode === "unsupervised") return true;
     const context = ctx;
     if (!context?.hasUI) {
-      throw new Error("supervised commit needs a terminal dialog; run /oc-auto for this session, then retry");
+      throw new Error("the revert stays staged; the commit needs a decision in a Pi TUI");
     }
     return context.ui.confirm(
       "OpenCode rewind",
@@ -1561,19 +1596,10 @@ export default function (pi: ExtensionAPI) {
               type: "text",
               text: `rewind refused: ${session} has an armed watch (${left}s left). Stop it with oc_stop, or drop the watch with oc_stop detach:true, then retry.`,
             }],
-            details: { session, rewound: false, target: "", branch: "" },
+            details: { session, rewound: false, target: "", branch: "", files: false },
             isError: true,
           };
         }
-        // The newest user row opens the last run; the rows newer than it carry that run's tools.
-        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
-        const at = rows.findIndex((row: any) => row.type === "user");
-        if (at < 0) throw new Error(`thread ${session} has no user message to rewind`);
-        const target = String(rows[at].id);
-        const runRows = rows.slice(0, at);
-        // A compaction hides the context before it, so the ledger starts after the newest one.
-        const compactAt = Number(runRows.find((row: any) => row.type === "compaction")?.time?.created ?? 0);
-        const digest = digestLine(runRows.filter((row: any) => Number(row?.time?.created ?? 0) > compactAt));
         const revert = async (method: string, path: string, body?: unknown): Promise<any> => {
           try {
             return await api<any>(method, path, body);
@@ -1595,12 +1621,41 @@ export default function (pi: ExtensionAPI) {
           return `files restored: ${shown.join(", ")}${paths.length > 10 ? ` (+${paths.length - 10} more)` : ""}`;
         };
         if (params.clear) {
+          // Only a stage this session made can be cleared; the service answers 204 even with nothing staged.
+          const tracked = state.staged.get(session);
+          if (!tracked) {
+            return {
+              content: [{ type: "text", text: "no rewind staged in this session; nothing cleared" }],
+              details: { session, rewound: false, target: "", branch: "", files: false },
+            };
+          }
           await revert("DELETE", `/api/session/${session}/revert`);
+          state.staged.delete(session);
           return {
             content: [{ type: "text", text: `cleared the staged revert on ${session}; files are back at the run's state` }],
-            details: { session, rewound: false, target: "", branch: "" },
+            details: { session, rewound: false, target: "", branch: "", files: true },
           };
         }
+        const current = (await api<any>("GET", `/api/session/${session}`)).data;
+        // The run opener is the oldest user row at or after busy; a steer writes a newer user row.
+        const floor = Number(current?.time?.busy ?? 0) - 1;
+        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
+        const at = rows.findLastIndex((row: any) =>
+          row.type === "user" && Number(row?.time?.created ?? 0) >= floor
+        );
+        if (at < 0) {
+          throw new Error(
+            `the opening user row of the last run sits older than the ${DIGEST_ROWS}-row window; fork with branch:true, or rewind a shorter run`,
+          );
+        }
+        const target = String(rows[at].id);
+        const runRows = rows.slice(0, at);
+        // A compaction hides the context before it, so the ledger starts after the newest one.
+        const compactAt = Number(runRows.find((row: any) => row.type === "compaction")?.time?.created ?? 0);
+        const digestRows = runRows.filter((row: any) => Number(row?.time?.created ?? 0) > compactAt);
+        const digest = digestLine(digestRows);
+        const digestPaths = touchedPaths(digestRows);
+        const digestLabel = digestPaths.length ? digestPaths.join(", ") : "none";
         if (params.branch) {
           // The only undo route: copy the history before the target and attach the child.
           const forked = await api<any>("POST", `/api/session/${session}/fork`, { before: target });
@@ -1611,11 +1666,20 @@ export default function (pi: ExtensionAPI) {
           );
           return {
             content: [{ type: "text", text: `forked ${session} before ${target}: ${child}\n${attached}` }],
-            details: { session, rewound: false, target, branch: child },
+            details: { session, rewound: false, target, branch: child, files: false },
+          };
+        }
+        // The stage rewrites files at once, so the human decision comes before the POST.
+        if (!kept && !(await confirmStage(session, target, digestLabel, params.commit === true))) {
+          return {
+            content: [{ type: "text", text: "stage refused; nothing changed." }],
+            details: { session, rewound: false, target: "", branch: "", files: false },
+            isError: true,
           };
         }
         const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
         const paths = pathsOf(stage);
+        state.staged.set(session, target);
         const head = [`rewound ${session} to ${target}`, fileLine(paths), digest];
         if (!params.commit) {
           return {
@@ -1628,24 +1692,26 @@ export default function (pi: ExtensionAPI) {
                   : "staged; clear restores these files, commit makes it permanent.",
               ].join("\n"),
             }],
-            details: { session, rewound: true, target, branch: "" },
+            details: { session, rewound: true, target, branch: "", files: !kept },
           };
         }
         const filesLabel = kept ? "kept (files:false)" : paths.length ? paths.join(", ") : "none";
-        if (!(await confirmCommit(session, target, filesLabel))) {
+        // A file stage already asked, and that question named the commit; files:false asks here.
+        if (kept && !(await confirmCommit(session, target, filesLabel))) {
           return {
             content: [{ type: "text", text: "commit refused; the revert stays staged. clear restores the files." }],
-            details: { session, rewound: true, target, branch: "" },
+            details: { session, rewound: true, target, branch: "", files: !kept },
             isError: true,
           };
         }
         await revert("POST", `/api/session/${session}/revert/commit`);
+        state.staged.delete(session);
         return {
           content: [{
             type: "text",
             text: [...head, `committed; the run's messages after ${target} are gone.`].join("\n"),
           }],
-          details: { session, rewound: true, target, branch: "" },
+          details: { session, rewound: true, target, branch: "", files: !kept },
         };
       },
     }),
