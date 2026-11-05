@@ -10,6 +10,8 @@ Delegate threads from a [Pi](https://github.com/badlogic/pi-mono) session to a l
 service. `oc_open` returns while the thread still runs. When the thread settles, Pi opens a new
 turn with the answer. Your main session keeps working, and you keep the terminal.
 
+Read [docs/manual.md](docs/manual.md) for the full manual: watch lifecycle, wake-up format, tools, commands, budget, and environment.
+
 ```
 $ pi install npm:@barty13/pi-opencode-bridge
 ```

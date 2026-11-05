@@ -13,3 +13,4 @@ pnpm-workspace.yaml
 .control-rewind.ts
 .control-budget.ts
 .control-fanout.ts
+.control-manual.ts

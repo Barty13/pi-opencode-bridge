@@ -206,9 +206,21 @@ assert fan_seq in fan
 fan = fan.replace(fan_seq, "", 1)
 open('.control-fanout.ts','w').write(fan)
 PY
+
+# Stage 12: the manual control carries two defects.
+python3 - <<'PY'
+src = open('docs/manual.md').read()
+start = src.index('### `oc_fanout`')
+end = src.index('### Commands')
+assert 0 <= start < end
+out = src[:start] + src[end:]
+row = '| `OC_DEBOUNCE_MS` | bridge | `400` |'
+assert row in out
+open('.control-manual.ts','w').write(out.replace(row, '| `OC_DEBOUNCE_MS` | bridge | `500` |', 1))
+PY
 ```
 
-Run from this directory. `BRIDGE` points a check at a control build.
+Run from the package root. `BRIDGE` points a check at a control build.
 
 ```sh
 for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts; done
@@ -230,6 +242,8 @@ bun run checks/check-10-budget.ts
 BRIDGE=$PWD/.control-budget.ts bun run checks/check-10-budget.ts                   # must fail
 bun run checks/check-11-fanout.ts
 BRIDGE=$PWD/.control-fanout.ts bun run checks/check-11-fanout.ts                  # must fail
+bun run checks/check-12-manual.ts
+BRIDGE=$PWD/.control-manual.ts bun run checks/check-12-manual.ts                  # must fail
 ```
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
@@ -317,6 +331,17 @@ The control carries three defects: the weekly percent gate (`ceiling`), the `$0`
 The control carries five defects: the fan-out hold, so every member wakes alone (`merge`, `fail`); the
 live-thread cap (`cap`); the Go-member quota skip (`quota`); the judge (`judge`); and the counter
 restore (`reload`).
+
+`check-12-manual.ts` runs the doc-rot cases against `docs/manual.md`:
+
+| Case | What it proves |
+| --- | --- |
+| `inventory` | every tool in `opencode-bridge.ts` has a heading or table row; every `OC_*` and `BRIDGE` variable has a table row; the manual names no unknown one |
+| `commands` | every registered slash command appears |
+| `env` | every table row exists in the code, with the same default string |
+| `links` | `README.md` links `docs/manual.md`, and all eleven section headings are present |
+
+The control carries two defects: the `oc_fanout` section is gone (`inventory`), and `OC_DEBOUNCE_MS` reads `500` (`env`). Both cases must fail. The stage-12 control is a copy of the manual, not a build of the extension; `BRIDGE` names the manual under test.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
