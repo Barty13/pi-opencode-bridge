@@ -215,11 +215,13 @@ const wake = async (before: number, timeout = 5000): Promise<string | null> => {
   return sent.length > before ? sent[before] : null;
 };
 
-/** Settle one thread: real idle and assistant rows, a tool part for the digest, real timestamps. */
+/** Settle one thread: real idle and assistant rows, a tool part for the digest, real timestamps.
+ * The watch floor sits just before the prompt POST, so anchor the settle after that POST. A row
+ * stamped at the arm millisecond falls outside the window, and no later row would ever wake it. */
 const settle = (id: string, answer: string, opts: { outcome?: string; error?: string } = {}) => {
   const row = sessions.get(id);
   if (!row) throw new Error(`settle: no session ${id}`);
-  const now = Date.now();
+  const now = Math.max(Date.now(), Number(row.time.busy ?? 0)) + 1;
   row.time.idle = now;
   row.time.busy = row.time.busy ?? now - 1000;
   row.outcome = opts.outcome ?? "succeeded";
@@ -236,7 +238,7 @@ const settle = (id: string, answer: string, opts: { outcome?: string; error?: st
     {
       id: `${id}_answer`,
       type: "assistant",
-      time: { created: now - 1 },
+      time: { created: now },
       content: [
         {
           type: "tool",
@@ -271,7 +273,6 @@ const reloadSecondId = created[reloadSecondCreates]?.id ?? "";
 // Drop the restored first watch; settle the second fan-out so no deadline lands in a later case.
 await tool("oc_stop").execute("t", { session: reloadFirstId, detach: true });
 const reloadBefore = sent.length;
-await wait(10);
 settle(reloadSecondId, "RELOAD-B");
 const reloadWake = await wake(reloadBefore);
 check("reload settles", (reloadWake?.includes("RELOAD-B") ?? false), reloadWake ?? "(none)");
@@ -284,8 +285,6 @@ const mergeText = textOf(mergeRes);
 console.log("merge receipt ->", mergeText);
 const mergeIds = created.slice(mergeCreates).map((entry) => entry.id);
 check("merge receipt", mergeRes.isError !== true && /fan_\d+/.test(mergeText) && mergeIds.length === 3, mergeText);
-// One tick past the arm floor: the settle window takes rows strictly newer than the floor.
-await wait(10);
 settle(mergeIds[0], "ALPHA");
 await wait(140);
 check("merge holds first", sent.length === mergeBefore, `${sent.length - mergeBefore}`);
@@ -324,7 +323,6 @@ const failText = textOf(failRes);
 console.log("fail receipt ->", failText);
 const failIds = created.slice(failCreates).map((entry) => entry.id);
 check("fail receipt", failRes.isError !== true && failIds.length === 3, failText);
-await wait(10);
 settle(failIds[0], "A-OK");
 settle(failIds[1], "", { outcome: "failed", error: "boom" });
 await wait(140);
@@ -376,7 +374,6 @@ check(
 );
 check("quota creates two", quotaIds.length === 2, String(quotaIds.length));
 check("quota prompts two", prompts.length === quotaPrompts + 2, `${prompts.length - quotaPrompts}`);
-await wait(10);
 settle(quotaIds[0], "FREE-ONE");
 settle(quotaIds[1], "FREE-TWO");
 const quotaWake = await wake(quotaBefore);
@@ -406,7 +403,6 @@ const judgeText = textOf(judgeRes);
 console.log("judge receipt ->", judgeText);
 const judgeIds = created.slice(judgeCreates).map((entry) => entry.id);
 check("judge receipt", judgeRes.isError !== true && judgeIds.length === 3, judgeText);
-await wait(10);
 settle(judgeIds[0], "ANSWER-A");
 settle(judgeIds[1], "ANSWER-B");
 settle(judgeIds[2], "ANSWER-C");
