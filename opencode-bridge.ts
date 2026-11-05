@@ -165,6 +165,81 @@ interface Settle {
   asksUnknown?: boolean;
   /** One-line run ledger from the window read; absent when no window was read. */
   digest?: string;
+  /** Fan-out sections in caller order; a composite report carries no single answer. */
+  fan?: FanSection[];
+  /** Every thread the composite report covers, so each run is marked reported once. */
+  runs?: RunMark[];
+  /** Judge verdict or skip line, appended after the sections. */
+  verdict?: string;
+}
+
+/** One fan-out section: what the member ran, spent, and answered. */
+interface FanSection {
+  session: string;
+  model: string;
+  variant: string;
+  outcome: string;
+  tokens: string;
+  cost: string;
+  digest?: string;
+  answer: string;
+  error?: string | null;
+  /** Why there is no run: a quota skip or a failed create or send. */
+  note?: string;
+  asks: Ask[];
+  /** Set when the member's open-ask read failed, so "none" is not claimed as a fact. */
+  asksUnknown?: boolean;
+}
+
+/** One run marker for reportedRun; a fan-out report covers several sessions. */
+interface RunMark {
+  session: string;
+  idleAt: number;
+}
+
+/** One fan-out member; `session` is empty when no thread was created. */
+interface FanMember {
+  session: string;
+  model: string;
+  variant: string;
+  settle: Settle | null;
+  skip: string | null;
+  fail: string | null;
+  deadline: number;
+}
+
+/** The optional judge thread: one more run whose answer ranks the members. */
+interface FanJudge {
+  session: string;
+  model: string;
+  variant: string;
+  settle: Settle | null;
+  note: string | null;
+  deadline: number;
+}
+
+/** One fan-out: members in caller order, one report when every member is terminal. */
+interface Fanout {
+  id: string;
+  title: string;
+  brief: string;
+  dir: string;
+  members: FanMember[];
+  judgeModel: FanPlan | null;
+  judge: FanJudge | null;
+  /** Members and judge still running; zero means the report is due. */
+  waiting: number;
+  /** `building` holds the report until every member is registered. */
+  phase: "building" | "members" | "judge" | "done";
+  /** Per-member deadline: the base ttl times the member count. */
+  ttlMs: number;
+}
+
+/** One resolved model and variant for a fan-out member. */
+interface FanPlan {
+  providerID: string;
+  id: string;
+  variant?: string;
 }
 
 interface BridgeState {
@@ -190,6 +265,12 @@ interface BridgeState {
   attached: Set<string>;
   /** Revert target staged in this Pi session per thread, so clear knows what it drops. */
   staged: Map<string, string>;
+  /** Live fan-outs by id; a member settle waits here, not in the batch. */
+  fanouts: Map<string, Fanout>;
+  /** Thread id -> fan-out id, so a settle reaches its one report. */
+  fanMember: Map<string, string>;
+  /** Fan-out counter for this Pi session. */
+  fanSeq: number;
   /** Threads owed a wake-up. The only floor source: a send sets it, a settle or stop clears it. */
   armed: Map<string, Watch>;
   /** Threads whose settle is being read, so stream and backstop settle one thread once. */
@@ -225,6 +306,9 @@ function freshState(): BridgeState {
     known: new Set(),
     attached: new Set(),
     staged: new Map(),
+    fanouts: new Map(),
+    fanMember: new Map(),
+    fanSeq: 0,
     armed: new Map(),
     claimed: new Set(),
     sending: new Map(),
@@ -584,22 +668,34 @@ function tokenCeiling(state: BridgeState, ceiling: number): { session: string; t
   return null;
 }
 
-/** Why an open or send is over budget, or null. Reads the meters through the 30 s cache. */
-async function budgetRefusal(state: BridgeState): Promise<string | null> {
-  const limits = await budget();
-  if (BUDGET_PCT) {
-    const meter = rollingMeter(limits);
-    if (meter && Number(meter.percent ?? 0) >= BUDGET_PCT) {
-      return `budget ceiling: go rolling ${Number(meter.percent ?? 0)}% ≥ OC_BUDGET_PCT ${BUDGET_PCT}%; resets ${clockAt(meter.resetsAt)}`;
-    }
-  }
-  if (BUDGET_TOKENS) {
-    const crossed = tokenCeiling(state, BUDGET_TOKENS);
-    if (crossed) {
-      return `budget ceiling: delegated ${tokenK(crossed.total)} tokens ≥ OC_BUDGET_TOKENS ${BUDGET_TOKENS}; ${crossed.session} crossed it`;
-    }
+/** The rolling-meter ceiling, or null. `oc_open` and `oc_send` refuse; a fan-out skips a Go member. */
+function rollingRefusal(limits: Limits | null): string | null {
+  if (!BUDGET_PCT) return null;
+  const meter = rollingMeter(limits);
+  if (meter && Number(meter.percent ?? 0) >= BUDGET_PCT) {
+    return `budget ceiling: go rolling ${Number(meter.percent ?? 0)}% ≥ OC_BUDGET_PCT ${BUDGET_PCT}%; resets ${clockAt(meter.resetsAt)}`;
   }
   return null;
+}
+
+/** The delegated-token ceiling, or null. */
+function tokenRefusal(state: BridgeState): string | null {
+  if (!BUDGET_TOKENS) return null;
+  const crossed = tokenCeiling(state, BUDGET_TOKENS);
+  if (crossed) {
+    return `budget ceiling: delegated ${tokenK(crossed.total)} tokens ≥ OC_BUDGET_TOKENS ${BUDGET_TOKENS}; ${crossed.session} crossed it`;
+  }
+  return null;
+}
+
+/** Why an open or send is over budget, or null. Reads the meters through the 30 s cache. */
+async function budgetRefusal(state: BridgeState): Promise<string | null> {
+  return rollingRefusal(await budget()) ?? tokenRefusal(state);
+}
+
+/** The Go rolling meter bills the subscription, so only a billed Go member is skipped by it. */
+function memberRefusal(limits: Limits | null, providerID: string, id: string): string | null {
+  return providerID === "opencode-go" && !id.endsWith("-free") ? rollingRefusal(limits) : null;
 }
 
 /** The service lists every project, and ?directory= is an exact match, so filter here. */
@@ -843,8 +939,33 @@ async function readSettle(
   };
 }
 
+/** One merged fan-out report: every section in caller order, then the judge. */
+function fanoutText(s: Settle): string {
+  const lines = [`outcome: fan-out ${s.fan?.length ?? 0} models`];
+  for (const section of s.fan ?? []) {
+    const head = [
+      `model: ${section.model}`,
+      `variant: ${section.variant}`,
+      `outcome: ${section.outcome}`,
+      section.tokens,
+      section.cost,
+    ].filter(Boolean).join(" · ");
+    lines.push("", head);
+    if (section.note) lines.push(`note: ${section.note}`);
+    if (section.error) lines.push(section.error);
+    if (section.digest) lines.push(section.digest);
+    if (section.answer) lines.push(`answer:\n${truncate(section.answer)}`);
+    else if (!section.note && !section.error) lines.push("answer: (none)");
+    if (section.asks.length) lines.push(`open asks: ${section.asks.length}`);
+    else if (section.asksUnknown) lines.push("open asks: unreadable");
+  }
+  if (s.verdict) lines.push("", s.verdict);
+  return lines.join("\n");
+}
+
 /** Report shape shared by oc_wait and the wake-up, so the two cannot drift apart. */
 function settleText(s: Settle): string {
+  if (s.fan) return fanoutText(s);
   return [
     `outcome: ${s.outcome}${s.expired ? " (watch expired; restart with oc_send to read the record)" : ""}`,
     s.error ?? "error: none",
@@ -857,7 +978,7 @@ function settleText(s: Settle): string {
 
 function batchLine(s: Settle): string {
   const body = settleText(s).split("\n").map((line) => `  ${line}`).join("\n");
-  return `- ${s.session}${s.title ? ` ${s.title}` : ""}:\n${body}`;
+  return `- ${s.session}${s.title && s.title !== s.session ? ` ${s.title}` : ""}:\n${body}`;
 }
 
 async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promise<string> {
@@ -1014,13 +1135,18 @@ export default function (pi: ExtensionAPI) {
     if (!batch.length || !context) return;
     // Print and JSON have no idle agent, and a message there can extend a run that meant to exit.
     if (context.mode === "print" || context.mode === "json") return;
-    const count = batch.length === 1 ? "One OpenCode thread" : `${batch.length} OpenCode threads`;
+    const count = batch.length === 1
+      ? (batch[0].fan ? `Fan-out ${batch[0].session}` : "One OpenCode thread")
+      : `${batch.length} OpenCode threads`;
     const head = `${count}${waited ? " settled while the run was cancelled" : " settled"}:`;
     const text = `${head}\n${batch.map(batchLine).join("\n")}\n\nRead a thread with oc_read, then continue the task that started it.`;
     for (const settle of batch) {
       markReported(settle.asks);
+      for (const section of settle.fan ?? []) markReported(section.asks);
       // This message is the report for these runs; a later oc_wait must not repeat them.
-      mine.reportedRun.set(settle.session, settle.idleAt);
+      for (const run of settle.runs ?? [{ session: settle.session, idleAt: settle.idleAt }]) {
+        mine.reportedRun.set(run.session, run.idleAt);
+      }
     }
     // prompt() ignores deliverAs while idle and queues on it while busy (agent-session.js:1664-1677),
     // so one call covers both states.
@@ -1033,12 +1159,21 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** Hand a settle to a waiting oc_wait, or queue it for the next batch turn. */
-  const deliverSettle = (settle: Settle) => {
+  const deliverSettle = async (settle: Settle): Promise<void> => {
     const mine = state;
     mine.claimed.delete(settle.session);
     // A settled thread with no open ask needs no rescan, so release it from the reconnect list.
     if (!settle.asks.length && !settle.asksUnknown) mine.known.delete(settle.session);
     paneCall(["rm", settle.session]);
+    // A fan-out member is held until every member is terminal: one report per fan-out.
+    const fanId = mine.fanMember.get(settle.session);
+    if (fanId) {
+      const fan = mine.fanouts.get(fanId);
+      if (fan) {
+        await acceptFanout(mine, fan, settle);
+        return;
+      }
+    }
     const waiters = mine.waiters.get(settle.session);
     if (waiters?.length) {
       mine.waiters.delete(settle.session);
@@ -1049,6 +1184,249 @@ export default function (pi: ExtensionAPI) {
     mine.batch.push(settle);
     armFlush(mine);
   };
+
+  /** One section from a member; skipped and failed members keep their place in the report. */
+  function fanSection(mine: BridgeState, member: FanMember): FanSection {
+    const settle = member.settle;
+    const info = member.session ? mine.info.get(member.session) : undefined;
+    const variant = info?.variant ?? member.variant;
+    if (!settle) {
+      return {
+        session: member.session,
+        model: member.model,
+        variant,
+        outcome: member.skip ? "skipped" : "failed",
+        tokens: "",
+        cost: "",
+        answer: "",
+        note: member.skip ?? member.fail ?? "no run",
+        asks: [],
+      };
+    }
+    return {
+      session: member.session,
+      model: member.model,
+      variant,
+      outcome: settle.expired ? "expired" : settle.outcome,
+      tokens: `${tokenK(threadTokens(info))} tokens`,
+      cost: threadCost(info, modelCache.costs),
+      digest: settle.digest,
+      answer: settle.answer,
+      error: settle.error,
+      asks: settle.asks,
+      asksUnknown: settle.asksUnknown,
+    };
+  }
+
+  /** The one composite settle: sections in caller order, then the judge verdict. */
+  function fanReport(mine: BridgeState, fan: Fanout): Settle {
+    const sections = fan.members.map((member) => fanSection(mine, member));
+    const runs: RunMark[] = [];
+    for (const member of fan.members) {
+      if (member.settle) runs.push({ session: member.session, idleAt: member.settle.idleAt });
+    }
+    if (fan.judge?.settle) runs.push({ session: fan.judge.session, idleAt: fan.judge.settle.idleAt });
+    const idleAt = runs.reduce((max, run) => Math.max(max, run.idleAt), Date.now());
+    const judge = fan.judge;
+    const verdict = judge
+      ? `judge ${judge.model}: ${
+        judge.settle
+          ? (judge.settle.expired ? "expired; no verdict" : truncate(judge.settle.answer) || "(no verdict)")
+          : judge.note ?? "no verdict"
+      }`
+      : undefined;
+    return {
+      session: fan.id,
+      title: fan.title,
+      outcome: `${sections.length} models`,
+      error: null,
+      answer: "",
+      asks: [],
+      idleAt,
+      runs,
+      fan: sections,
+      verdict,
+    };
+  }
+
+  /** One report for the whole fan-out: waiters first, else the shared batch. */
+  function emitFanout(mine: BridgeState, fan: Fanout): void {
+    if (fan.phase === "done") return;
+    fan.phase = "done";
+    const report = fanReport(mine, fan);
+    const waiters: Array<(settle: Settle | null) => void> = [];
+    for (const member of fan.members) {
+      const list = mine.waiters.get(member.session);
+      if (list?.length) {
+        waiters.push(...list);
+        mine.waiters.delete(member.session);
+      }
+    }
+    if (fan.judge) {
+      const list = mine.waiters.get(fan.judge.session);
+      if (list?.length) {
+        waiters.push(...list);
+        mine.waiters.delete(fan.judge.session);
+      }
+    }
+    mine.fanouts.delete(fan.id);
+    for (const member of fan.members) mine.fanMember.delete(member.session);
+    if (fan.judge) mine.fanMember.delete(fan.judge.session);
+    if (waiters.length) {
+      markReported(report.asks);
+      for (const section of report.fan ?? []) markReported(section.asks);
+      for (const done of waiters) done(report);
+      return;
+    }
+    mine.batch.push(report);
+    armFlush(mine);
+  }
+
+  /** The judge prompt: every answer, labelled by model, with the brief to rank against. */
+  function judgePrompt(fan: Fanout): string {
+    const answers = fan.members.map((member) => {
+      const answer = member.settle?.answer ?? "(no answer)";
+      return `### ${member.model}\n${answer}`;
+    });
+    return [
+      "Judge these answers to the same brief. Rank them best to worst.",
+      "Reply with one line per model, best first: rank · model · reason.",
+      "",
+      "Brief:",
+      fan.brief,
+      "",
+      "Answers:",
+      ...answers,
+    ].join("\n");
+  }
+
+  /** After the members, open one judge thread; its settle joins the same report. */
+  async function startJudge(mine: BridgeState, fan: Fanout): Promise<void> {
+    const plan = fan.judgeModel;
+    if (!plan) return emitFanout(mine, fan);
+    const skip = memberRefusal(limitsCache.value, plan.providerID, plan.id);
+    if (skip) {
+      fan.judge = {
+        session: "", model: `${plan.providerID}/${plan.id}`, variant: plan.variant ?? "default",
+        settle: null, note: `skipped: ${skip}`, deadline: Date.now(),
+      };
+      fan.waiting = 0;
+      return emitFanout(mine, fan);
+    }
+    const dir = fan.dir;
+    let session = "";
+    try {
+      const created = await api<any>("POST", "/api/session", {
+        title: `${fan.id} judge`,
+        model: { id: plan.id, providerID: plan.providerID, ...(plan.variant ? { variant: plan.variant } : {}) },
+        location: { directory: dir },
+      });
+      if (mine !== state) return;
+      session = String(created.data.id);
+      noteThread(mine, created.data);
+      mine.local.add(session);
+      mine.known.add(session);
+      mine.delegated.add(session);
+      mine.dirs.set(session, dir);
+      mine.labels.set(session, plan.id);
+      fan.judge = {
+        session,
+        model: `${plan.providerID}/${plan.id}`,
+        variant: plan.variant ?? String(created.data.model?.variant ?? "default"),
+        settle: null,
+        note: null,
+        deadline: Date.now() + fan.ttlMs,
+      };
+      mine.fanMember.set(session, fan.id);
+      fan.waiting = 1;
+      try {
+        await sendPrompt(session, { text: judgePrompt(fan) }, fan.ttlMs);
+        if (mine.armed.has(session)) paneCall(["add", session, dir]);
+      } catch (error) {
+        // A 4xx dropped the watch; a timeout may still run, so its deadline keeps the place.
+        if (!mine.armed.has(session)) {
+          fan.judge.note = `failed: ${error instanceof Error ? error.message : String(error)}`;
+          fan.waiting = 0;
+        }
+      }
+    } catch (error) {
+      if (mine !== state) return;
+      fan.judge = {
+        session, model: `${plan.providerID}/${plan.id}`, variant: plan.variant ?? "default",
+        settle: null, note: `failed: ${error instanceof Error ? error.message : String(error)}`, deadline: Date.now(),
+      };
+      fan.waiting = 0;
+      emitFanout(mine, fan);
+      return;
+    }
+    if (fan.waiting === 0) emitFanout(mine, fan);
+  }
+
+  /** A member settle lands here; the report fires only when every member is terminal. */
+  async function acceptFanout(mine: BridgeState, fan: Fanout, settle: Settle): Promise<void> {
+    if (fan.phase === "done") return;
+    const member = fan.members.find((entry) => entry.session === settle.session);
+    if (member) {
+      if (member.settle) return;
+      member.settle = settle;
+      fan.waiting--;
+    } else if (fan.judge && fan.judge.session === settle.session) {
+      if (fan.judge.settle) return;
+      fan.judge.settle = settle;
+      fan.waiting--;
+    } else {
+      return;
+    }
+    await finishFanout(mine, fan);
+  }
+
+  /** Move from members to judge to one report; `building` holds everything until all register. */
+  async function finishFanout(mine: BridgeState, fan: Fanout): Promise<void> {
+    if (fan.phase === "building" || fan.phase === "done" || fan.waiting > 0) return;
+    if (fan.phase === "members") {
+      if (fan.judgeModel) {
+        fan.phase = "judge";
+        await startJudge(mine, fan);
+        return;
+      }
+      emitFanout(mine, fan);
+      return;
+    }
+    if (fan.phase === "judge") emitFanout(mine, fan);
+  }
+
+  /** Fan-out deadlines: a deleted or unwatched member still expires, so the report is complete. */
+  async function sweepFanouts(mine: BridgeState): Promise<void> {
+    const now = Date.now();
+    for (const fan of [...mine.fanouts.values()]) {
+      if (fan.phase === "building" || fan.phase === "done") continue;
+      let changed = false;
+      for (const member of fan.members) {
+        if (member.settle || member.skip || member.fail || now <= member.deadline) continue;
+        member.settle = {
+          session: member.session, title: "", outcome: "unknown", error: null, answer: "",
+          asks: [], asksUnknown: true, idleAt: now, expired: true,
+        };
+        // Keep any oc_wait: the composite report is that waiter's answer.
+        unwatch(mine, member.session);
+        fan.waiting--;
+        changed = true;
+      }
+      if (fan.judge && !fan.judge.settle && !fan.judge.note && now > fan.judge.deadline) {
+        fan.judge.settle = {
+          session: fan.judge.session, title: "", outcome: "unknown", error: null, answer: "",
+          asks: [], asksUnknown: true, idleAt: now, expired: true,
+        };
+        unwatch(mine, fan.judge.session);
+        fan.waiting--;
+        changed = true;
+      }
+      if (changed) {
+        drawHud();
+        await finishFanout(mine, fan);
+      }
+    }
+  }
 
   /**
    * One detector for the stream and the backstop. Claim is synchronous, so the two cannot read the
@@ -1073,7 +1451,7 @@ export default function (pi: ExtensionAPI) {
     // An event that predates the send reports another run, so it must not spend the watch.
     if (read.idleAt <= w.floor) return void mine.claimed.delete(session);
     dropThread(session, read);
-    deliverSettle(read);
+    await deliverSettle(read);
   };
 
   /** Backstop for frames the volatile stream dropped, and for watches that outlive their run.
@@ -1090,7 +1468,7 @@ export default function (pi: ExtensionAPI) {
         };
         // Pass the settle, so an oc_wait holding this thread gets it instead of null.
         dropThread(session, expired);
-        deliverSettle(expired);
+        await deliverSettle(expired);
         continue;
       }
       if (mine.sending.has(session) || mine.claimed.has(session)) continue;
@@ -1125,9 +1503,10 @@ export default function (pi: ExtensionAPI) {
         const settle = wide && wide !== "gone" ? wide : read;
         // Disarm here: the stream path does, and a watch left armed re-delivers every sweep.
         dropThread(session, settle);
-        deliverSettle(settle);
+        await deliverSettle(settle);
       } else mine.claimed.delete(session);
     }
+    await sweepFanouts(mine);
   };
 
   /** Wait for the next settle of this thread. Timeout or abort unregisters and keeps the watch. */
@@ -1289,7 +1668,11 @@ export default function (pi: ExtensionAPI) {
    * returns. A definitive 4xx means the prompt never landed, so the watch goes with it; a timeout
    * keeps the watch, because the service may be running that prompt.
    */
-  const sendPrompt = async (session: string, body: Record<string, unknown>): Promise<number> => {
+  const sendPrompt = async (
+    session: string,
+    body: Record<string, unknown>,
+    ttlMs = WATCH_TTL_MS,
+  ): Promise<number> => {
     // Read the size before taking state: a session switch during the read must not leave the send
     // armed in the state it replaced.
     const size = COMPACT_TOKENS ? await readContext(session).then((read) => read.size).catch(() => 0) : 0;
@@ -1297,7 +1680,7 @@ export default function (pi: ExtensionAPI) {
     const previous = mine.armed.get(session);
     const compactAt = size > COMPACT_TOKENS ? size : 0;
     if (compactAt) await api("POST", `/api/session/${session}/compact`, { delivery: "steer" }).catch(() => {});
-    armThread(session);
+    armThread(session, Date.now(), ttlMs);
     mine.sending.set(session, (mine.sending.get(session) ?? 0) + 1);
     try {
       await postPrompt(session, body);
@@ -1318,13 +1701,13 @@ export default function (pi: ExtensionAPI) {
     return compactAt;
   };
 
-  const armThread = (session: string, floor = Date.now()): void => {
+  const armThread = (session: string, floor = Date.now(), ttlMs = WATCH_TTL_MS): void => {
     const now = Date.now();
     if (!state.armed.has(session) && state.armed.size >= MAX_THREADS) {
       // Refuse rather than evict: an evicted watch loses that thread's wake-up in silence.
       throw new Error(`${MAX_THREADS} threads in flight; wait for one to settle with oc_wait.`);
     }
-    state.armed.set(session, { floor, deadline: now + WATCH_TTL_MS, steers: 0 });
+    state.armed.set(session, { floor, deadline: now + ttlMs, steers: 0 });
     // A new run owes its own report, so the marker of the run before it no longer applies.
     state.reportedRun.delete(session);
     drawHud();
@@ -1435,7 +1818,7 @@ export default function (pi: ExtensionAPI) {
   const startBackstop = () => {
     stopBackstop();
     backstop = setInterval(() => {
-      if (sweeping || !state.armed.size) return;
+      if (sweeping || (!state.armed.size && !state.fanouts.size)) return;
       sweeping = true;
       void sweep()
         .catch(() => {})
@@ -1674,6 +2057,183 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "oc_fanout",
+      label: "OC fanout",
+      description: "Send one brief to N models; one merged report wakes this session after every member settles or expires.",
+      namespace: ns,
+      annotations: { openWorldHint: true },
+      parameters: Type.Object({
+        brief: Type.String({ description: "Same instruction for every model" }),
+        models: Type.Array(
+          Type.String({ description: "Model id from oc_models, with or without its provider prefix" }),
+          { description: "One thread per model, in report order" },
+        ),
+        variant: Type.Optional(
+          Type.String({ description: "Effort from each model's ladder in oc_models. Defaults to high when offered." }),
+        ),
+        judge: Type.Optional(
+          Type.String({ description: "Model id that ranks the answers after the members finish" }),
+        ),
+        directory: Type.Optional(
+          Type.String({ description: `Subfolder of ${ROOT}. Defaults to ${ROOT}.` }),
+        ),
+        ttl_s: Type.Optional(
+          Type.Number({ description: "Member deadline in seconds; default OC_WATCH_TTL_S × N, capped at OC_WAIT_MAX_S × N." }),
+        ),
+      }),
+      async execute(_id, params) {
+        const brief = params.brief.trim();
+        if (!brief) throw new Error("oc_fanout needs a non-empty brief");
+        const requested = (params.models ?? []).map((model) => model.trim()).filter(Boolean);
+        if (!requested.length) throw new Error("oc_fanout needs at least one model");
+        if (new Set(requested).size !== requested.length) throw new Error("oc_fanout models must be unique");
+        const dir = directory(params.directory);
+        // The cap runs before any create, so a refusal leaves the service untouched.
+        const active = await api<any>("GET", "/api/session/active");
+        // Active runs and this bridge's own armed watches are both live; the larger count wins.
+        const live = Math.max(Object.keys(active?.data ?? {}).length, state.armed.size);
+        if (live + requested.length > MAX_THREADS) {
+          return {
+            content: [{
+              type: "text",
+              text: `fan-out refused: ${live} live threads + ${requested.length} new exceed ${MAX_THREADS}`,
+            }],
+            details: { fanout: "", sessions: [] as string[] },
+            isError: true,
+          };
+        }
+        // Resolve every model before the first create: a bad id refuses the whole fan-out.
+        const plans: FanPlan[] = [];
+        for (const id of requested) {
+          const model = await requireModel(id);
+          plans.push({
+            providerID: model.providerID,
+            id: model.id,
+            variant: pickVariant(params.variant, model.variants),
+          });
+        }
+        let judgePlan: FanPlan | null = null;
+        if (params.judge) {
+          const model = await requireModel(params.judge);
+          judgePlan = {
+            providerID: model.providerID,
+            id: model.id,
+            variant: pickVariant(params.variant, model.variants),
+          };
+        }
+        const blocked = tokenRefusal(state);
+        if (blocked) {
+          return {
+            content: [{ type: "text", text: blocked }],
+            details: { fanout: "", sessions: [] as string[] },
+            isError: true,
+          };
+        }
+        const limits = await budget();
+        // The default deadline scales with N; an explicit ttl_s sets every member's deadline.
+        const requestedTtl = params.ttl_s ?? (WATCH_TTL_MS / 1000) * requested.length;
+        const baseS = Number.isFinite(requestedTtl) ? Math.max(requestedTtl, 0) : 0;
+        const ttlMs = Math.min(baseS, WAIT_MAX_S * requested.length) * 1000;
+        const fan: Fanout = {
+          id: `fan_${++state.fanSeq}`,
+          title: "",
+          brief,
+          dir,
+          members: [],
+          judgeModel: judgePlan,
+          judge: null,
+          waiting: 0,
+          phase: "building",
+          ttlMs,
+        };
+        fan.title = fan.id;
+        state.fanouts.set(fan.id, fan);
+        const lines: string[] = [];
+        for (const plan of plans) {
+          const model = `${plan.providerID}/${plan.id}`;
+          const variant = plan.variant ?? "default";
+          const skip = memberRefusal(limits, plan.providerID, plan.id);
+          const member: FanMember = {
+            session: "",
+            model,
+            variant,
+            settle: null,
+            skip: skip ? skip : null,
+            fail: null,
+            deadline: Date.now() + ttlMs,
+          };
+          fan.members.push(member);
+          if (skip) {
+            lines.push(`${model}  variant ${variant}  skipped: ${skip}`);
+            continue;
+          }
+          let created: any;
+          try {
+            created = await api<any>("POST", "/api/session", {
+              title: `${fan.id} · ${plan.id}`,
+              model: { id: plan.id, providerID: plan.providerID, ...(plan.variant ? { variant: plan.variant } : {}) },
+              location: { directory: dir },
+            });
+          } catch (error) {
+            member.fail = error instanceof Error ? error.message : String(error);
+            lines.push(`${model}  variant ${variant}  failed: ${member.fail}`);
+            continue;
+          }
+          const session = String(created.data.id);
+          member.session = session;
+          member.deadline = Date.now() + ttlMs;
+          state.fanMember.set(session, fan.id);
+          fan.waiting++;
+          state.known.add(session);
+          state.local.add(session);
+          state.delegated.add(session);
+          state.dirs.set(session, dir);
+          state.labels.set(session, plan.id);
+          noteThread(state, created.data);
+          try {
+            await sendPrompt(session, { text: brief }, ttlMs);
+            if (state.armed.has(session)) paneCall(["add", session, dir]);
+            lines.push(`${session}  ${model}  variant ${variant}  brief sent`);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            // A 4xx dropped the watch; a timeout may still run, so its deadline keeps the place.
+            if (!state.armed.has(session)) {
+              member.fail = message;
+              fan.waiting--;
+            }
+            lines.push(`${session}  ${model}  variant ${variant}  brief failed: ${message}`);
+          }
+        }
+        if (judgePlan) {
+          lines.push(`judge: ${judgePlan.providerID}/${judgePlan.id} variant ${judgePlan.variant ?? "default"} queued after the members`);
+        }
+        fan.phase = "members";
+        const started = fan.members.filter((member) => member.session && !member.fail).length;
+        if (!started) {
+          state.fanouts.delete(fan.id);
+          for (const member of fan.members) {
+            if (member.session) state.fanMember.delete(member.session);
+          }
+          return {
+            content: [{ type: "text", text: [`${fan.id}: no member started`, ...lines].join("\n") }],
+            details: { fanout: fan.id, sessions: [] as string[] },
+            isError: true,
+          };
+        }
+        if (fan.waiting === 0) void finishFanout(state, fan);
+        return {
+          content: [{ type: "text", text: [`${fan.id}: ${started} of ${plans.length} started`, ...lines].join("\n") }],
+          details: {
+            fanout: fan.id,
+            sessions: fan.members.map((member) => member.session).filter(Boolean),
+          },
+        };
       },
     }),
   );
@@ -1970,12 +2530,16 @@ export default function (pi: ExtensionAPI) {
         }
         const floor = params.since ?? w?.floor ?? 0;
         // A settle that already reached the batch is this call's answer: take it, do not wake twice.
-        const queued = mine.batch.findIndex((entry) => entry.session === params.session);
+        // A fan-out report covers several sessions, so match any run it names.
+        const queued = mine.batch.findIndex((entry) =>
+          entry.session === params.session || (entry.runs ?? []).some((run) => run.session === params.session)
+        );
         let settle = queued >= 0 ? mine.batch.splice(queued, 1)[0] : null;
         // was: if (settle) mine.claimed.delete(...) — dead: every batch append clears the claim (:698).
         if (settle && !mine.batch.length) mine.batchWaited = false;
         // `since` reads the record instead of waiting, and a thread with no watch owes no wake-up.
-        if (!settle && w && params.since === undefined) {
+        // A fan-out member waits for the composite report even after its own watch is spent.
+        if (!settle && (w || mine.fanMember.has(params.session)) && params.since === undefined) {
           const limit = Math.min(Math.max(params.timeoutSec ?? WAIT_MAX_S, 0), WAIT_MAX_S);
           settle = await waitForSettle(mine, params.session, limit, signal);
         }
@@ -1990,10 +2554,13 @@ export default function (pi: ExtensionAPI) {
             details: { session: params.session, settled: false, asks: [] as Ask[] },
           };
         }
-        if (!settle && params.since === undefined && mine.armed.has(params.session)) {
+        if (!settle && params.since === undefined && (mine.armed.has(params.session) || mine.fanMember.has(params.session))) {
           const seconds = Math.min(Math.max(params.timeoutSec ?? WAIT_MAX_S, 0), WAIT_MAX_S);
+          const tail = mine.fanMember.has(params.session)
+            ? "the fan-out waits for its members"
+            : "the watch stays armed";
           return {
-            content: [{ type: "text", text: `still running after ${seconds}s; the watch stays armed` }],
+            content: [{ type: "text", text: `still running after ${seconds}s; ${tail}` }],
             details: { session: params.session, settled: false, asks: [] as Ask[] },
           };
         }
@@ -2027,7 +2594,8 @@ export default function (pi: ExtensionAPI) {
         // One run reaches the model once. The wake-up already carried this run, so point at it
         // instead of handing out a second copy. `since` names a point on purpose, so that call reads
         // the record freely.
-        if (settle === null && params.since === undefined && mine.reportedRun.get(params.session) === read.idleAt) {
+        const marker = read.runs?.find((run) => run.session === params.session)?.idleAt ?? read.idleAt;
+        if (settle === null && params.since === undefined && mine.reportedRun.get(params.session) === marker) {
           return {
             content: [{
               type: "text",
@@ -2036,8 +2604,12 @@ export default function (pi: ExtensionAPI) {
             details: { session: params.session, settled: false, asks: read.asks },
           };
         }
-        // This call is the first report of this run, so mark it: the wake-up channel is now spent.
-        if (params.since === undefined) mine.reportedRun.set(params.session, read.idleAt);
+        // This call is the first report of these runs, so mark every one: the wake-up channel is spent.
+        if (params.since === undefined) {
+          for (const run of read.runs ?? [{ session: read.session, idleAt: read.idleAt }]) {
+            mine.reportedRun.set(run.session, run.idleAt);
+          }
+        }
         // The answer reached Pi, so the column has nothing left to show live. Keep the watch only when
         // a newer run is still going, so a finished run never wakes twice.
         const armedNow = mine.armed.get(params.session);

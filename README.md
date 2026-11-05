@@ -39,13 +39,14 @@ Pi runs one turn at a time, and a turn is the unit that blocks. Delegation with 
 holds that turn for the whole run of the other model. Here the send returns in milliseconds. The
 finish arrives later, as one message, with the answer already inside it.
 
-The bridge adds ten tools and eight commands.
+The bridge adds eleven tools and eight commands.
 
 | Tool | What it does |
 | --- | --- |
 | `oc_models` | Lists the models the service serves for delegation, with each effort ladder |
 | `oc_open` | Opens a thread for one self-contained task, returns its id |
 | `oc_attach` | Adopts a thread the bridge did not open; arms a watch while it runs |
+| `oc_fanout` | Sends one brief to N models; one merged report holds every section |
 | `oc_send` | Hands an instruction to a thread, returns at once |
 | `oc_steer` | Corrects a running thread in place; applies at the next step boundary |
 | `oc_rewind` | Undoes the last run: stage a revert, commit it, fork before it, or clear a stage |
@@ -226,6 +227,38 @@ Two ceilings, both off at `0`:
 - `OC_BUDGET_TOKENS` caps the tokens of threads this Pi session opened. A send that would cross the
   cap is refused and names the thread that crossed it. `oc_attach` does not add a thread's history
   to the cap; `/oc-budget` still lists adopted live threads with their cost.
+
+## Fan-out
+
+`oc_fanout` sends the same brief to N models, one thread each, in the same directory. It returns
+at once with a receipt and the thread ids. Every member runs the `oc_models` check and the variant
+ladder, then arms a watch. The thread ids sit under one fan-out id, `fan_<n>`.
+
+When every member reports or expires, one wake-up carries one report. The sections keep the model
+order the caller gave, and each section gives the model, variant, outcome, tokens, cost, digest
+from the run ledger, then the answer. A member that fails, expires, or is skipped keeps its section,
+so the report is always complete. Deleting a member outside the bridge leaves its watch to the
+deadline, and the section reads `expired`.
+
+```
+fan_1: 3 of 3 started
+ses_…  opencode-go/glm-5.3-flash  variant max   brief sent
+ses_…  opencode-go/deepseek-v4.1-flash  variant max   brief sent
+ses_…  opencode/an-example-free  variant high   brief sent
+```
+
+`judge: "<id>"` opens one more thread after the members finish. Its prompt carries the brief and
+every answer, and its ranking appends to the same report. The judge is a member of the fan-out, so
+one wake-up still covers the whole run.
+
+The fan-out refuses before any create when the live threads on the service plus N exceed 32; the
+receipt names both counts. When the Go rolling meter sits at or above `OC_BUDGET_PCT`, a Go member
+is skipped with the ceiling and its reset time; free members still run, and the report names the
+skip.
+
+The member deadline is `OC_WATCH_TTL_S × N`, capped at `OC_WAIT_MAX_S × N`. `ttl_s` sets every
+member's deadline directly, still capped at `OC_WAIT_MAX_S × N`. A member that runs past its deadline
+holds an `expired` section instead of delaying the report forever.
 
 ## Supervision
 

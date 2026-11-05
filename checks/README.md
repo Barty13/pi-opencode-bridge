@@ -10,7 +10,7 @@ pairs = [
  ("      if (mine.armed.get(session) !== w || mine.sending.has(session)) {\n        mine.claimed.delete(session);  // or detect/sweep skip it until the 30 min TTL (:701, :732)\n        continue;\n      }", "      if (mine.armed.get(session) !== w || mine.sending.has(session)) continue;"),
  ("      else if (/HTTP 4\\d\\d/.test(String(error))) dropThread(session);\n", ""),
  ('session, title: "", outcome: "unknown", error: null, answer: "", asks: [],\n          asksUnknown: true, idleAt: Date.now(), steers: w.steers, expired: true,', 'session, title: "", outcome: "running", error: null, answer: "", asks: [], idleAt: Date.now(), steers: w.steers, expired: true,'),
- ("      markReported(settle.asks);\n      // This message is the report for these runs; a later oc_wait must not repeat them.\n      mine.reportedRun.set(settle.session, settle.idleAt);", "      markReported(settle.asks);"),
+ ("      markReported(settle.asks);\n      for (const section of settle.fan ?? []) markReported(section.asks);\n      // This message is the report for these runs; a later oc_wait must not repeat them.\n      for (const run of settle.runs ?? [{ session: settle.session, idleAt: settle.idleAt }]) {\n        mine.reportedRun.set(run.session, run.idleAt);\n      }", "      markReported(settle.asks);\n      for (const section of settle.fan ?? []) markReported(section.asks);"),
 ]
 out = src
 for pat, rep in pairs:
@@ -134,6 +134,71 @@ control = control.replace(budget_attach, """    state.known.add(session);
     state.attached.add(session);
     state.delegated.add(session);""", 1)
 open('.control-budget.ts','w').write(control)
+fan_hold = """    // A fan-out member is held until every member is terminal: one report per fan-out.
+    const fanId = mine.fanMember.get(settle.session);
+    if (fanId) {
+      const fan = mine.fanouts.get(fanId);
+      if (fan) {
+        await acceptFanout(mine, fan, settle);
+        return;
+      }
+    }
+"""
+assert fan_hold in src
+fan = src.replace(fan_hold, "", 1)
+fan_cap = """        const active = await api<any>("GET", "/api/session/active");
+        // Active runs and this bridge's own armed watches are both live; the larger count wins.
+        const live = Math.max(Object.keys(active?.data ?? {}).length, state.armed.size);
+        if (live + requested.length > MAX_THREADS) {
+          return {
+            content: [{
+              type: "text",
+              text: `fan-out refused: ${live} live threads + ${requested.length} new exceed ${MAX_THREADS}`,
+            }],
+            details: { fanout: "", sessions: [] as string[] },
+            isError: true,
+          };
+        }
+"""
+assert fan_cap in fan
+fan = fan.replace(fan_cap, "", 1)
+fan_skip = """          const skip = memberRefusal(limits, plan.providerID, plan.id);
+          const member: FanMember = {
+            session: "",
+            model,
+            variant,
+            settle: null,
+            skip: skip ? skip : null,
+            fail: null,
+            deadline: Date.now() + ttlMs,
+          };
+          fan.members.push(member);
+          if (skip) {
+            lines.push(`${model}  variant ${variant}  skipped: ${skip}`);
+            continue;
+          }
+"""
+assert fan_skip in fan
+fan = fan.replace(fan_skip, """          const member: FanMember = {
+            session: "",
+            model,
+            variant,
+            settle: null,
+            skip: null,
+            fail: null,
+            deadline: Date.now() + ttlMs,
+          };
+          fan.members.push(member);
+""", 1)
+fan_judge = """      if (fan.judgeModel) {
+        fan.phase = "judge";
+        await startJudge(mine, fan);
+        return;
+      }
+"""
+assert fan_judge in fan
+fan = fan.replace(fan_judge, "", 1)
+open('.control-fanout.ts','w').write(fan)
 PY
 ```
 
@@ -157,6 +222,8 @@ bun run checks/check-9-rewind.ts
 BRIDGE=$PWD/.control-rewind.ts bun run checks/check-9-rewind.ts                   # must fail
 bun run checks/check-10-budget.ts
 BRIDGE=$PWD/.control-budget.ts bun run checks/check-10-budget.ts                   # must fail
+bun run checks/check-11-fanout.ts
+BRIDGE=$PWD/.control-fanout.ts bun run checks/check-11-fanout.ts                  # must fail
 ```
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
@@ -229,6 +296,19 @@ The control carries four defects: the stage ask after the stage (`ask`), the new
 | `attachcap` | an adopted heavy thread stays out of the token census: its first send goes through, and `/oc-budget` still lists it with cost |
 
 The control carries three defects: the weekly percent gate (`ceiling`), the `$0` no-price fallback (`noprice`), and the attached-thread census (`attachcap`).
+
+`check-11-fanout.ts` runs the fan-out cases against a stub service:
+
+| Case | What it proves |
+| --- | --- |
+| `merge` | three staggered members give one wake-up, sections in caller order, with tokens, cost, digest, and answer |
+| `fail` | one failed member and one expired member keep their sections in the same single report |
+| `cap` | 30 live threads plus 3 new is refused with the count, before any create or prompt |
+| `quota` | rolling 90 at `OC_BUDGET_PCT=80` skips the Go member, still creates and prompts both free members, and names the skip |
+| `judge` | the judge thread receives all three answers, and its verdict joins the same report |
+
+The control carries four defects: the fan-out hold, so every member wakes alone (`merge`, `fail`); the
+live-thread cap (`cap`); the Go-member quota skip (`quota`); and the judge (`judge`).
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
