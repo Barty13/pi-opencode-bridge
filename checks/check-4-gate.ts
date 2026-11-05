@@ -47,6 +47,9 @@ Bun.serve({
 const bin = mkdtempSync(join(tmpdir(), "fakeoc-"));
 writeFileSync(join(bin, "opencode"), `#!/bin/sh\nif [ "$1" = "models" ]; then echo opencode-go/glm-5.3-flash; else echo http://127.0.0.1:${PORT}; fi\n`);
 chmodSync(join(bin, "opencode"), 0o755);
+// The service password file sits in the real home, and bun ignores a fake HOME, so point at a stub.
+process.env.OC_SERVICE_FILE = join(bin, "service.json");
+writeFileSync(process.env.OC_SERVICE_FILE, '{"password":"stub"}');
 process.env.PATH = `${bin}:${process.env.PATH}`;
 
 const tools = new Map<string, any>();

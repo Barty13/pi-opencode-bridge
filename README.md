@@ -12,12 +12,11 @@ turn with the answer. Your main session keeps working, and you keep the terminal
 
 ## Install and requirements
 
-Install from git first. The npm registry still holds the older published build, `0.1.2`, so an npm
-install today gives you the code before this program.
+Install from npm. For the newest work on `main`, install from git instead.
 
 ```sh
-$ pi install git:github.com/Barty13/pi-opencode-bridge
-$ pi install npm:@barty13/pi-opencode-bridge   # older published build, 0.1.2
+$ pi install npm:@barty13/pi-opencode-bridge                  # 0.2.0
+$ pi install git:github.com/Barty13/pi-opencode-bridge         # main, ahead of npm
 ```
 
 - **OpenCode already installed and signed in.** Free or licensed, your choice. Start the service
