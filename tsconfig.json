@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["opencode-bridge.ts", "oc-rpc.ts", "checks/check-3-unit.ts", "checks/check-1-compact.ts", "checks/check-6-digest.ts", "checks/check-7-steer.ts", "checks/check-8-attach.ts", "checks/check-9-rewind.ts", "checks/check-10-budget.ts", "checks/check-11-fanout.ts", "checks/check-12-manual.ts"]
+  "include": ["opencode-bridge.ts", "oc-rpc.ts", "checks/check-3-unit.ts", "checks/check-1-compact.ts", "checks/check-6-digest.ts", "checks/check-7-steer.ts", "checks/check-8-attach.ts", "checks/check-9-rewind.ts", "checks/check-10-budget.ts", "checks/check-11-fanout.ts", "checks/check-12-docs.ts"]
 }
