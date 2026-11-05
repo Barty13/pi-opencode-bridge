@@ -188,7 +188,9 @@ check(
 await wait(300);
 check("old no wake", sent.length === oldBefore, `${sent.length - oldBefore}`);
 await command("oc").handler("", ctx);
-check("old /oc attached", notices.join("\n").includes("attached"), notices.join("\n"));
+const oldOc = notices.at(-1) ?? "";
+check("old /oc attached", oldOc.includes("attached"), oldOc);
+check("old /oc outcome", oldOc.includes(`${MAIN}  succeeded`), oldOc);
 
 // idle: no watch means no fabricated wake when a short TTL passes.
 const idleDeadline = oldAt + 1500;
@@ -207,6 +209,10 @@ const liveBefore = sent.length;
 const liveText = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
 console.log("live ->", liveText);
 check("live report", liveText.includes("running"), liveText);
+// `/oc` must not repeat the previous run's outcome while the thread is busy.
+await command("oc").handler("", ctx);
+const liveOc = notices.at(-1) ?? "";
+check("live /oc running", liveOc.includes(`${MAIN}  running`) && !liveOc.includes(`${MAIN}  succeeded`), liveOc);
 const liveAgain = textOf(await tool("oc_attach").execute("t", { session: MAIN }));
 check("live already armed", liveAgain === `already armed: ${MAIN}`, liveAgain);
 const liveIdleAt = Date.now() + 200;

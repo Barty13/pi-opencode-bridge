@@ -2794,7 +2794,7 @@ export default function (pi: ExtensionAPI) {
           `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
           `served: ${(await cheapModels()).ids.join(", ")}`,
           ...rows.map((row: any) =>
-            `${row.id}  ${row.outcome ?? "-"}  ${row.model?.id ?? "-"}  ${row.title ?? ""}${
+            `${row.id}  ${busy(row) ? "running" : (row.outcome ?? "-")}  ${row.model?.id ?? "-"}  ${row.title ?? ""}${
               state.attached.has(row.id) ? "  attached" : ""
             }`
           ),

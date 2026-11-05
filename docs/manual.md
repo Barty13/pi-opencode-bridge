@@ -105,6 +105,12 @@ The answer body passes through `truncate`: it stops at 4000 characters and ends 
 
 A fan-out report uses a different body: `outcome: fan-out N models`, then one section per member in caller order, then the judge verdict. Section 7 gives the shape.
 
+### Digest line
+
+The digest starts after the newer of the watch floor and the newest compaction row, so a compacted context does not show calls from before the compaction. The bridge reads the 200-row window once for the report. The line gives the call count and the ok/error split, the calls per tool name, the first five failures (tool name and first error line, each reason capped at 120 characters), the open ask count when it is above zero, and the touched paths (edits before reads, at most ten). A running call adds `unfinished: N`.
+
+The line stays at or below 400 characters. The path list shrinks first, then the failure list. A last-resort cut keeps one failure. A watch that expires has no digest. On the backstop path, a wide read that fails falls back to the 8-row settle, so that report has no digest.
+
 ## Supervision
 
 The bridge has two modes. `supervised` is the default. `unsupervised` sends each ask to the model in this Pi session. `/oc-auto` selects unsupervised and flushes queued asks. `/oc-accept` selects supervised. The flag `--oc-auto` starts a session in unsupervised mode. Every session start resets the mode to supervised and drops per-thread state, so an old run cannot answer for a new session.
@@ -397,7 +403,7 @@ served: opencode-go/glm-5.3-flash, opencode-go/deepseek-v4.1-flash
 ses_…  running  glm-5.3-flash  refactor-parser  attached
 ```
 
-The `batched` part appears only when the batch is not empty. The thread line shows `id`, `outcome`, model id, title, and `attached`.
+The `batched` part appears only when the batch is not empty. The thread line shows `id`, `status`, model id, title, and `attached`. `status` reads `running` while the thread is busy; otherwise it reads the stored outcome.
 
 #### `/oc-budget` and `/oc_budget`
 
