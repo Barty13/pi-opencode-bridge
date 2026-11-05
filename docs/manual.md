@@ -26,7 +26,7 @@ Two checks keep threads inside the root. `directory()` handles a create path. It
 
 A thread outside the root is refused with `Thread ses_… sits in <dir>, outside <root>.` `directory()` and `assertLocal()` compare real paths, so a symlink cannot pass a thread outside the root. The list in `/oc` and the delete pass in `/oc-clean` filter the raw reported directory with `underRoot()`.
 
-The root must be a git repository for `oc_rewind` to restore files. The bridge does not check this; the service does. In a root without git, the stage answers HTTP 200 with `files: []`, the working tree does not move, and the receipt says `files restored: none`. The message half still works: `commit` removes the run's messages after the target, `clear` drops the stage, and `branch` forks. The digest still names the paths that the run touched. Make the root a git repository before the run if you need file restore. This machine uses `~/Pi`, a git repository since 2026-11-05 (`655bfb9`).
+The root must be a git repository for `oc_rewind` to restore files. The bridge does not check this; the service does. In a root without git, the stage answers HTTP 200 with `files: []`, the working tree does not move, and the receipt says `no git history for this root, messages reverted, files untouched: <paths>` when the digest named paths; with no paths it says `files restored: none`. The message half still works: `commit` removes the run's messages after the target, `clear` drops the stage, and `branch` forks. The digest still names the paths that the run touched. Make the root a git repository before the run if you need file restore. This machine uses `~/Pi`, a git repository since 2026-11-05 (`655bfb9`).
 
 Threads can write files. Point `OC_ROOT` at a scratch tree that you own.
 
@@ -349,7 +349,7 @@ attached ses_…
 
 A file stage asks in supervised mode before the POST. A commit after a `files: false` stage asks at the commit. See section 6.
 
-Fails when the thread is outside the root, a watch is armed, the service answers 409 because the run is live, or the opening row is outside the window. A file stage in a root without git answers 200 with no files; the receipt says `files restored: none` and the tree does not move. The message revert still works. See section 3.
+Fails when the thread is outside the root, a watch is armed, the service answers 409 because the run is live, or the opening row is outside the window. A file stage in a root without git answers 200 with no files. When the digest named paths, the receipt says `no git history for this root, messages reverted, files untouched: <paths>`; with no paths it says `files restored: none`. The tree does not move. The message revert still works. See section 3.
 
 ### `oc_fanout`
 
@@ -535,7 +535,8 @@ The TUI checks need a real model: `OC_CHECK_MODEL=<id from oc_models> bash check
 | `outcome: unknown (watch expired; restart with oc_send to read the record)` | The run passed `OC_WATCH_TTL_S` with no settle. | Read the record with `oc_read`. Raise `OC_WATCH_TTL_S` and restart Pi for long runs. Use `oc_send` to start a new run with a new watch. |
 | `run already settled; oc_send starts a new one` | `oc_steer` found `busy <= idle`; the run is over. | Use `oc_send` for a new run. Use `oc_read` for the answer. |
 | `already armed: ses_…` | `oc_attach` found a live watch. | Use the watch with `oc_read` or `oc_wait`. To replace it, run `oc_stop detach: true`, then attach again. |
-| `files restored: none` | The root is not a git repository, the run made no file edits, or the target has no file changes. | Make the root a git repository before the run. Or accept the message revert. `files: false` prints `files kept (files:false)`. |
+| `no git history for this root, messages reverted, files untouched: <paths>` | The root is not a git repository, so the stage returned no files. | Make the root a git repository before the run. The messages are already reverted. |
+| `files restored: none` | The run made no file edits, or the target has no file changes. | Accept the message revert. `files: false` prints `files kept (files:false)`. |
 | A budget refusal names a ceiling with quota left. | `OC_BUDGET_TOKENS` sums the whole history of every delegated thread; `OC_BUDGET_PCT` reads the rolling meter, not the weekly or monthly meter; the meter snapshot can be 30 s old. | Run `/oc-budget` to force a read. Delete or clean heavy threads. Raise the cap or set it to `0`, then restart Pi. Wait for the reset. |
 | `OpenCode service not reachable` | The service is down, the port changed, or the password file is wrong. | Run `opencode service status` and `opencode serve --service`. Check `OC_SERVICE_FILE`. Restart the service. |
 | `open asks: unreadable` | The ask read failed during the settle. | Read the thread with `oc_read`. Retry `oc_wait` or `oc_reply`. |

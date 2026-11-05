@@ -12,9 +12,9 @@
  *   A stage, a commit, or a clear on a busy thread answers 409 SessionBusyError; fork answers 200.
  *   GET /message?order=desc&limit=200 carries user rows with their ids.
  *
- * Cases: stage, steered, window, clear, ask, commit, branch, armed, noui. The control carries four
- * defects: the stage ask after the stage (ask), the newest-user-row target (steered), the untracked
- * clear (clear), and the no-UI advice (noui).
+ * Cases: stage, steered, window, clear, ask, commit, nogitroot, branch, armed, noui. The control
+ * carries four defects: the stage ask after the stage (ask), the newest-user-row target (steered),
+ * the untracked clear (clear), and the no-UI advice (noui).
  * Run:
  *   bun run checks/check-9-rewind.ts
  *   BRIDGE=$PWD/.control-rewind.ts bun run checks/check-9-rewind.ts   # must fail
@@ -40,6 +40,8 @@ const NOW = Date.now();
 const IDLE_AT = NOW - 1000;
 const BUSY_AT = NOW - 4000;
 let busyAt = BUSY_AT;
+/** Return no files from the stage, as a root without git history does. */
+let noGit = false;
 
 /** Rows of the last run, newest first; the oldest user row at or after busy is the target. */
 const setRun = (base = Date.now(), opts: { steer?: boolean } = {}) => {
@@ -150,7 +152,7 @@ Bun.serve({
       return json({
         messageID: body.messageID,
         snapshot: "640ba63b141ba35b527fee65e78140148c8d0a5b",
-        files: body.files
+        files: body.files && !noGit
           ? [{
             file: "src/note.txt",
             patch: "diff --git a/src/note.txt b/src/note.txt\nindex ce01362..df967b9 100644\n--- a/src/note.txt\n+++ b/src/note.txt\n@@ -1 +1 @@\n-hello\n+base\n",
@@ -453,6 +455,23 @@ console.log("commit ->", commitText);
 check("commit trace", trace.join(",") === "stage,commit", trace.join(","));
 check("commit receipt", commitText.includes("committed"), commitText);
 
+// nogitroot: the digest names a path, the stage returns no files, and the receipt names the root.
+noGit = true;
+setRun();
+resetTrace();
+const noGitText = textOf(await tool("oc_rewind").execute("t", { session: ID }));
+console.log("nogitroot ->", noGitText);
+const noGitCall = calls.filter((call) => call.path.endsWith("/revert/stage")).at(-1);
+check("nogitroot body", noGitCall?.body?.files === true, JSON.stringify(noGitCall));
+check(
+  "nogitroot receipt",
+  noGitText.includes("no git history for this root")
+    && noGitText.includes("files untouched: src/note.txt")
+    && !noGitText.includes("files restored: none"),
+  noGitText,
+);
+noGit = false;
+
 // branch: fork with before, then attach the child; /oc marks it attached.
 resetTrace();
 const branchText = textOf(await tool("oc_rewind").execute("t", { session: ID, branch: true }));
@@ -517,5 +536,5 @@ if (failures.length) {
   console.log(`FAIL rewind: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS rewind: a file stage asks before the rewrite, a steer does not become the target, an old opener gets the window wording, clear tracks the stage, supervised commit asks before it commits, auto commits after the stage, branch forks before the target and attaches, an armed watch refuses with zero calls, no UI keeps the stage without auto advice");
+console.log("PASS rewind: a file stage asks before the rewrite, a steer does not become the target, an old opener gets the window wording, clear tracks the stage, supervised commit asks before it commits, auto commits after the stage, a no-git stage names the untouched paths, branch forks before the target and attaches, an armed watch refuses with zero calls, no UI keeps the stage without auto advice");
 process.exit(0);

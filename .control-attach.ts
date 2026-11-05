@@ -2413,9 +2413,14 @@ export default function (pi: ExtensionAPI) {
         const kept = params.files === false;
         const pathsOf = (stage: any): string[] =>
           (stage?.data?.files ?? []).map((file: any) => String(file?.file ?? "")).filter(Boolean);
-        const fileLine = (paths: string[]): string => {
+        const fileLine = (paths: string[], named: string[]): string => {
           if (kept) return "files kept (files:false)";
-          if (!paths.length) return "files restored: none";
+          if (!paths.length) {
+            if (named.length) {
+              return `no git history for this root, messages reverted, files untouched: ${named.join(", ")}`;
+            }
+            return "files restored: none";
+          }
           const shown = paths.slice(0, 10).map((path) => (path.length > 120 ? `${path.slice(0, 119)}…` : path));
           return `files restored: ${shown.join(", ")}${paths.length > 10 ? ` (+${paths.length - 10} more)` : ""}`;
         };
@@ -2480,7 +2485,7 @@ export default function (pi: ExtensionAPI) {
         const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
         const paths = pathsOf(stage);
         state.staged.set(session, target);
-        const head = [`rewound ${session} to ${target}`, fileLine(paths), digest];
+        const head = [`rewound ${session} to ${target}`, fileLine(paths, digestPaths), digest];
         if (!params.commit) {
           return {
             content: [{
