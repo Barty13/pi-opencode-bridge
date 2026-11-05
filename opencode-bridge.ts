@@ -557,12 +557,13 @@ function threadTokens(info?: ThreadInfo): number {
   return info ? sizeOf({ tokens: info.tokens }) : 0;
 }
 
-/** Session.Info cost when the service reports one, else a `~` list-price estimate from /api/model. */
+/** Session.Info cost when the service reports one, else a `~` list-price estimate from /api/model.
+ * With no price row there is no dollar figure at all, so the row keeps only its token count. */
 function threadCost(info: ThreadInfo | undefined, costs: Map<string, any>): string {
-  if (!info) return "-";
+  if (!info) return "";
   if (info.cost > 0) return `$${info.cost.toFixed(4)}`;
   const price = costs.get(`${info.providerID}/${info.model}`);
-  if (!price) return "$0";
+  if (!price) return "";
   const t = info.tokens;
   const value = (
     t.input * Number(price.input ?? 0)
@@ -1353,7 +1354,7 @@ export default function (pi: ExtensionAPI) {
     if (running) armThread(session, floor);
     state.known.add(session);
     state.attached.add(session);
-    state.delegated.add(session);
+    // Adopt is not delegation: leave the thread out of the OC_BUDGET_TOKENS census.
     const open = await asks(session).catch(() => null);
     const asksLine = open === null ? "open asks: unreadable" : open.length ? `open asks: ${open.length}` : "open asks: none";
     const model = `${row.model?.providerID ?? "?"}/${row.model?.id ?? "?"}`;
@@ -1404,8 +1405,8 @@ export default function (pi: ExtensionAPI) {
       const info = state.info.get(session);
       const label = info?.model ?? state.labels.get(session) ?? state.dirs.get(session)?.split("/").pop() ?? "-";
       const tok = info ? `  ${tokenK(threadTokens(info))} tok` : "";
-      const cost = info ? `  ${threadCost(info, modelCache.costs)}` : "";
-      return `${session}  ${Math.round((now - w.floor) / 1000)}s  left ${Math.max(0, Math.round((w.deadline - now) / 1000))}s  ${label}${tok}${cost}`;
+      const cost = info ? threadCost(info, modelCache.costs) : "";
+      return `${session}  ${Math.round((now - w.floor) / 1000)}s  left ${Math.max(0, Math.round((w.deadline - now) / 1000))}s  ${label}${tok}${cost ? `  ${cost}` : ""}`;
     });
     const count = rows.length;
     const meters = meterLine(limitsCache.value);
@@ -1691,7 +1692,8 @@ export default function (pi: ExtensionAPI) {
       async execute(_id, params) {
         await assertLocal(state, params.session);
         state.known.add(params.session);
-        state.delegated.add(params.session);
+        // The cap census counts threads this Pi session opened, so the gate runs before a first
+        // send to an adopted thread adds it. After this send it is delegated, and later sends count.
         const refusal = await budgetRefusal(state);
         if (refusal) {
           return {
@@ -1700,6 +1702,7 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
+        state.delegated.add(params.session);
         const compactAt = await sendPrompt(params.session, { text: params.text });
         if (state.armed.has(params.session)) paneCall(["add", params.session, state.dirs.get(params.session) ?? ROOT]);
         return {
@@ -2239,8 +2242,9 @@ export default function (pi: ExtensionAPI) {
         const provider = info?.providerID ?? String(row?.model?.providerID ?? "");
         const model = info?.model ?? String(row?.model?.id ?? "-");
         const variant = info?.variant ?? String(row?.model?.variant ?? "default");
+        const cost = threadCost(info, costs);
         return `${row.id}  ${provider ? `${provider}/` : ""}${model} ${variant}  ${
-          tokenK(threadTokens(info))} tok  ${threadCost(info, costs)}`;
+          tokenK(threadTokens(info))} tok${cost ? `  ${cost}` : ""}`;
       })
       : ["live threads: none"];
     const meters = meterLine(limitsCache.value) ?? "quota: unreadable";

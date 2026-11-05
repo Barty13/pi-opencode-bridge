@@ -216,14 +216,16 @@ The footer carries the meters and the armed count. Each HUD row carries the thre
 Thread numbers come from `Session.Info` on detail reads the bridge already makes, so a sweep adds no
 request. A cost the service reports prints as exact USD. When the service reports 0, the command
 prices the tokens with `GET /api/model` and marks the estimate with `~`, because the console and the
-model list disagree on some ids. Console `budgets[]` are exact and carry no `~`.
+model list disagree on some ids. With no model price row, the line keeps its token count and prints
+no dollar figure. Console `budgets[]` are exact and carry no `~`.
 
 Two ceilings, both off at `0`:
 
 - `OC_BUDGET_PCT` refuses `oc_open` and `oc_send` while the Go rolling meter is at or above the
   percent, and names `resetsAt`.
-- `OC_BUDGET_TOKENS` caps the tokens delegated by this Pi session. A send that would cross the cap
-  is refused and names the thread that crossed it.
+- `OC_BUDGET_TOKENS` caps the tokens of threads this Pi session opened. A send that would cross the
+  cap is refused and names the thread that crossed it. `oc_attach` does not add a thread's history
+  to the cap; `/oc-budget` still lists adopted live threads with their cost.
 
 ## Supervision
 
@@ -254,7 +256,7 @@ own. Without `OC_ROOT` the root is the working directory at start.
 | `OC_WAIT_MAX_S` | `300` | Ceiling for `oc_wait` |
 | `OC_COMPACT_TOKENS` | `500000` | Thread size in tokens above which a send orders a compaction first; `0` turns the gate off |
 | `OC_BUDGET_PCT` | `0` | Refuse `oc_open` and `oc_send` while the Go rolling meter is at or above this percent; `0` turns the ceiling off |
-| `OC_BUDGET_TOKENS` | `0` | Cap the tokens delegated by this Pi session; a send past it names the thread that crossed; `0` turns the cap off |
+| `OC_BUDGET_TOKENS` | `0` | Cap the tokens of threads this Pi session opened; a send past it names the thread that crossed; `0` turns the cap off |
 | `OC_SERVICE_FILE` | `~/.config/opencode/service.json` | Where to read the local service password |
 | `OC_RETENTION` | `{}` | Your own data-policy labels, JSON keyed by model id suffix, for example `{"<id>":"zero"}`. Display only. The bridge ships no model ids: read each policy from your provider and set it here. |
 

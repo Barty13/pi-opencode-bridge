@@ -10,7 +10,7 @@
  *   Session.Info carries cost and tokens{input,output,reasoning,cache{read,write}} on the detail
  *     fetch the bridge already makes; the sweep adds no request for the meter.
  *
- * Cases: ok, cache, poll, limited, ceiling, tokens, usd.
+ * Cases: ok, cache, poll, limited, ceiling, tokens, usd, noprice, attachcap.
  * Run:
  *   bun run checks/check-10-budget.ts
  *   BRIDGE=$PWD/.control-budget.ts bun run checks/check-10-budget.ts   # must fail
@@ -31,6 +31,7 @@ import { join } from "node:path";
 const PORT = 8741;
 const A = "ses_budgetaaaaaaaaaaaaaaaa";
 const B = "ses_budgetbbbbbbbbbbbbbbbb";
+const C = "ses_budgetcccccccccccccccc";
 const ROOT = realpathSync(mkdtempSync(join(tmpdir(), "oc-root-")));
 process.env.OC_ROOT = ROOT;
 
@@ -39,6 +40,8 @@ const A_BUSY = NOW - 3000;
 const A_IDLE = NOW - 5000;
 const B_BUSY = NOW - 20_000;
 const B_IDLE = NOW - 1000;
+const C_BUSY = NOW - 3000;
+const C_IDLE = NOW - 5000;
 const ROLLING_RESET = NOW + 3_600_000;
 const WEEKLY_RESET = NOW + 86_400_000;
 const MONTHLY_RESET = NOW + 30 * 86_400_000;
@@ -55,7 +58,7 @@ const aRow = () => ({
   projectID: "project_stub",
   model: { id: "deepseek-v4.1-flash", providerID: "opencode-go", variant: "max" },
   cost: 0,
-  tokens: tokens(9000),
+  tokens: tokens(6000),
   outcome: "succeeded",
   time: { created: NOW - 60_000, updated: NOW - 1000, busy: A_BUSY, idle: A_IDLE },
   title: "budget-a",
@@ -66,14 +69,29 @@ const bRow = () => ({
   projectID: "project_stub",
   model: { id: "deepseek-v4.1-flash", providerID: "opencode-go", variant: "max" },
   cost: 0,
-  tokens: tokens(8000),
+  tokens: tokens(10000),
   outcome: "succeeded",
   time: { created: NOW - 60_000, updated: B_IDLE, busy: B_BUSY, idle: B_IDLE },
   title: "budget-b",
   location: { directory: ROOT },
 });
+/** A heavy TUI thread: adopted, never opened by this Pi session, so outside the token census. */
+const cRow = () => ({
+  id: C,
+  projectID: "project_stub",
+  model: { id: "deepseek-v4.1-flash", providerID: "opencode-go", variant: "max" },
+  cost: 0,
+  tokens: tokens(50_000),
+  outcome: "succeeded",
+  time: { created: NOW - 600_000, updated: NOW - 1000, busy: C_BUSY, idle: C_IDLE },
+  title: "budget-tui",
+  location: { directory: ROOT },
+});
 
-const sessions = new Map<string, any>([[B, bRow()]]);
+const sessions = new Map<string, any>();
+let createSeq = 0;
+/** `/api/model` rows: `prices` for estimates, `none` for the no-price case. */
+let priceMode: "prices" | "none" = "prices";
 let meterSet = {
   rolling: { percent: 45, limited: false, resetsAt: ROLLING_RESET },
   weekly: { percent: 45, limited: false, resetsAt: WEEKLY_RESET },
@@ -117,7 +135,7 @@ Bun.serve({
     if (p === "/api/event") {
       return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
     }
-    if (p === "/api/model") return json([priceRow]);
+    if (p === "/api/model") return json(priceMode === "prices" ? [priceRow] : []);
     if (p === "/api/experimental/usage/limits") {
       limitsCalls++;
       return checked({
@@ -129,10 +147,13 @@ Bun.serve({
     if (req.method === "POST" && p === "/api/session") {
       const body = await req.json() as any;
       creates++;
+      const base = createSeq === 0 ? aRow() : bRow();
+      const id = createSeq === 0 ? A : B;
+      createSeq++;
       const created = {
-        ...aRow(),
-        id: A,
-        title: String(body?.title ?? "budget-a"),
+        ...base,
+        id,
+        title: String(body?.title ?? base.title),
         model: {
           id: String(body?.model?.id ?? "deepseek-v4.1-flash"),
           providerID: String(body?.model?.providerID ?? "opencode-go"),
@@ -140,11 +161,11 @@ Bun.serve({
         },
         location: { directory: String(body?.location?.directory ?? ROOT) },
       };
-      sessions.set(A, created);
+      sessions.set(id, created);
       return json(created);
     }
     if (req.method === "GET" && p === "/api/session") return json([...sessions.values()]);
-    if (req.method === "GET" && (p === `/api/session/${A}` || p === `/api/session/${B}`)) {
+    if (req.method === "GET" && (p === `/api/session/${A}` || p === `/api/session/${B}` || p === `/api/session/${C}`)) {
       detailCalls++;
       const row = sessions.get(p.split("/").pop()!);
       return row ? json(row) : json(null, 404);
@@ -249,7 +270,7 @@ check(
 );
 const hud = (widget ?? []).join("\n");
 check("ok hud thread", hud.includes(A) && (status ?? "").includes("1 thread running"), `${String(status)}\n${hud}`);
-check("ok hud tok", hud.includes("9k tok"), hud);
+check("ok hud tok", hud.includes("6k tok"), hud);
 check("ok hud cost", /~\$\d+\.\d{4}/.test(hud), hud);
 
 // cache: two sends inside 30 s reuse the open's meter read.
@@ -276,40 +297,24 @@ check("limited refresh", limitsCalls === meterBeforeLimited + 1, `${meterBeforeL
 check("limited notice", limitedText.includes("go rolling LIMITED") && !limitedText.includes("99%"), limitedText);
 check("limited footer", (status ?? "").includes("go rolling LIMITED") && !(status ?? "").includes("99%"), String(status));
 
-// ceiling: rolling 90 blocks at OC_BUDGET_PCT 80 and names the reset time.
-meterSet.rolling = { percent: 90, limited: false, resetsAt: ROLLING_RESET };
-meterSet.weekly = { percent: 10, limited: false, resetsAt: WEEKLY_RESET };
-await command("oc-budget").handler("", ctx);
-const reset = new Date(ROLLING_RESET).toTimeString().slice(0, 5);
-const createsBefore = creates;
-const ceilingOpen = await tool("oc_open").execute("t", {
-  model: "deepseek-v4.1-flash",
-  title: "blocked",
-  brief: "nope",
-});
-const ceilingOpenText = textOf(ceilingOpen);
-console.log("ceiling open ->", ceilingOpenText);
-check("ceiling open", ceilingOpen.isError === true && ceilingOpenText.includes("go rolling 90%"), ceilingOpenText);
-check("ceiling no create", creates === createsBefore, String(creates));
-const promptBeforeCeiling = promptCalls;
-const ceilingRes = await tool("oc_send").execute("t", { session: A, text: "blocked" });
-const ceilingText = textOf(ceilingRes);
-console.log("ceiling ->", ceilingText);
-check("ceiling refused", ceilingRes.isError === true, ceilingText);
-check("ceiling rolling", ceilingText.includes("go rolling 90%") && ceilingText.includes("OC_BUDGET_PCT 80"), ceilingText);
-check("ceiling reset", ceilingText.includes(`resets ${reset}`), ceilingText);
-check("ceiling no prompt", promptCalls === promptBeforeCeiling, String(promptCalls));
-
-// tokens: A holds 9k, B holds 8k, the cap is 15k; the second thread crosses it.
+// tokens: A holds 6k, B holds 10k, the cap is 15k; both were opened here, so B crosses it.
 meterSet.rolling = { percent: 45, limited: false, resetsAt: ROLLING_RESET };
 await command("oc-budget").handler("", ctx);
+const bOpen = await tool("oc_open").execute("t", {
+  model: "deepseek-v4.1-flash",
+  variant: "max",
+  title: "budget-b",
+});
+const bOpenText = textOf(bOpen);
+console.log("tokens open ->", bOpenText);
+check("tokens open", bOpen.isError !== true && bOpenText.includes(B), bOpenText);
 const promptBeforeTokens = promptCalls;
 const tokenRes = await tool("oc_send").execute("t", { session: B, text: "more" });
 const tokenText = textOf(tokenRes);
 console.log("tokens ->", tokenText);
 check("tokens refused", tokenRes.isError === true, tokenText);
 check("tokens names thread", tokenText.includes(B), tokenText);
-check("tokens cap", tokenText.includes("17k") && tokenText.includes("crossed it"), tokenText);
+check("tokens cap", tokenText.includes("16k") && tokenText.includes("crossed it"), tokenText);
 check("tokens no prompt", promptCalls === promptBeforeTokens, String(promptCalls));
 
 // usd: a thread priced from /api/model carries ~; console budgets carry exact USD.
@@ -340,11 +345,75 @@ check("usd model", usdText.includes("opencode-go/deepseek-v4.1-flash $0.40"), us
 const budgetLine = usdText.split("\n").find((line) => line.startsWith("budget ")) ?? "";
 check("usd exact", budgetLine !== "" && !budgetLine.includes("~"), budgetLine);
 
+// noprice: with no /api/model row the line keeps its tokens and has no dollar sign.
+priceMode = "none";
+budgets = [];
+await tool("oc_models").execute("t", {});
+await command("oc-budget").handler("", ctx);
+const noPriceText = notices.at(-1) ?? "";
+console.log("noprice ->", noPriceText);
+const noPriceLine = noPriceText.split("\n").find((line) => line.startsWith(A)) ?? "";
+check("noprice line", noPriceLine.includes("6k tok"), noPriceLine);
+check("noprice no dollar", !noPriceText.includes("$"), noPriceText);
+
+// ceiling: rolling 90 blocks at OC_BUDGET_PCT 80 and names the reset time. A fresh session keeps
+// the token census out of this case.
+await fire("session_shutdown")({}, ctx);
+await fire("session_start")({}, ctx);
+meterSet.rolling = { percent: 90, limited: false, resetsAt: ROLLING_RESET };
+meterSet.weekly = { percent: 10, limited: false, resetsAt: WEEKLY_RESET };
+await command("oc-budget").handler("", ctx);
+const reset = new Date(ROLLING_RESET).toTimeString().slice(0, 5);
+const createsBefore = creates;
+const ceilingOpen = await tool("oc_open").execute("t", {
+  model: "deepseek-v4.1-flash",
+  title: "blocked",
+  brief: "nope",
+});
+const ceilingOpenText = textOf(ceilingOpen);
+console.log("ceiling open ->", ceilingOpenText);
+check("ceiling open", ceilingOpen.isError === true && ceilingOpenText.includes("go rolling 90%"), ceilingOpenText);
+check("ceiling no create", creates === createsBefore, String(creates));
+const promptBeforeCeiling = promptCalls;
+const ceilingRes = await tool("oc_send").execute("t", { session: A, text: "blocked" });
+const ceilingText = textOf(ceilingRes);
+console.log("ceiling ->", ceilingText);
+check("ceiling refused", ceilingRes.isError === true, ceilingText);
+check("ceiling rolling", ceilingText.includes("go rolling 90%") && ceilingText.includes("OC_BUDGET_PCT 80"), ceilingText);
+check("ceiling reset", ceilingText.includes(`resets ${reset}`), ceilingText);
+check("ceiling no prompt", promptCalls === promptBeforeCeiling, String(promptCalls));
+
+// attachcap: adopting a heavy TUI thread is not delegation; its first send goes through.
+await fire("session_shutdown")({}, ctx);
+await fire("session_start")({}, ctx);
+meterSet.rolling = { percent: 45, limited: false, resetsAt: ROLLING_RESET };
+meterSet.weekly = { percent: 45, limited: false, resetsAt: WEEKLY_RESET };
+priceMode = "prices";
+await tool("oc_models").execute("t", {});
+await command("oc-budget").handler("", ctx);
+sessions.set(C, cRow());
+const attachText = textOf(await tool("oc_attach").execute("t", { session: C }));
+console.log("attachcap attach ->", attachText);
+check("attachcap attach", attachText.includes(C) && attachText.includes("50k tokens"), attachText);
+const promptBeforeAttach = promptCalls;
+const attachSend = await tool("oc_send").execute("t", { session: C, text: "go" });
+const attachSendText = textOf(attachSend);
+console.log("attachcap send ->", attachSendText);
+check("attachcap send", attachSend.isError !== true, attachSendText);
+check("attachcap prompt", promptCalls === promptBeforeAttach + 1, String(promptCalls));
+await command("oc-budget").handler("", ctx);
+const capText = notices.at(-1) ?? "";
+console.log("attachcap budget ->", capText);
+const cLine = capText.split("\n").find((line) => line.startsWith(C)) ?? "";
+check("attachcap listed", cLine !== "", capText);
+check("attachcap tok", cLine.includes("50k tok"), cLine);
+check("attachcap cost", /~\$\d+\.\d{4}/.test(cLine), cLine);
+
 await fire("session_shutdown")({}, ctx);
 
 if (failures.length) {
   console.log(`FAIL budget: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS budget: one cached meter read covers two sends, a sweep adds none, LIMITED replaces the percent, the rolling ceiling names the reset, the token cap names the crossing thread, and only the list-price estimate carries ~");
+console.log("PASS budget: one cached meter read covers two sends, a sweep adds none, LIMITED replaces the percent, the rolling ceiling names the reset, the token cap names the crossing thread, only the list-price estimate carries ~, no price row leaves no dollar sign, and an adopted thread stays out of the cap");
 process.exit(0);

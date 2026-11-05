@@ -122,7 +122,18 @@ control = control.replace(rewind_noui, '      throw new Error("supervised commit
 open('.control-rewind.ts','w').write(control)
 budget_meter = "  const meter = limits?.data?.go?.rolling;"
 assert budget_meter in src
-open('.control-budget.ts','w').write(src.replace(budget_meter, "  const meter = limits?.data?.go?.weekly;", 1))
+control = src.replace(budget_meter, "  const meter = limits?.data?.go?.weekly;", 1)
+budget_no_price = '  if (!price) return "";'
+assert budget_no_price in control
+control = control.replace(budget_no_price, '  if (!price) return "$0";', 1)
+budget_attach = """    state.known.add(session);
+    state.attached.add(session);
+    // Adopt is not delegation: leave the thread out of the OC_BUDGET_TOKENS census."""
+assert budget_attach in control
+control = control.replace(budget_attach, """    state.known.add(session);
+    state.attached.add(session);
+    state.delegated.add(session);""", 1)
+open('.control-budget.ts','w').write(control)
 PY
 ```
 
@@ -212,10 +223,12 @@ The control carries four defects: the stage ask after the stage (`ask`), the new
 | `poll` | backstop sweeps read session detail but add zero meter requests |
 | `limited` | `limited: true` prints `LIMITED` in place of the percent in the notice and the footer |
 | `ceiling` | rolling 90 refuses both `oc_open` and `oc_send` at `OC_BUDGET_PCT=80`, names the reset time, and posts no prompt |
-| `tokens` | with 9k on the first thread and 8k on the second, `OC_BUDGET_TOKENS=15000` refuses the second and names the thread that crossed |
+| `tokens` | with 6k on the first thread and 10k on the second, `OC_BUDGET_TOKENS=15000` refuses the second and names the thread that crossed |
 | `usd` | a thread priced from `/api/model` carries `~`; a console budget prints exact `spent/limit` and per-model spent without `~` |
+| `noprice` | with `/api/model` empty the line keeps `6k tok` and has no `$` at all |
+| `attachcap` | an adopted heavy thread stays out of the token census: its first send goes through, and `/oc-budget` still lists it with cost |
 
-The control reads `weekly` instead of `rolling` in the percent gate, so the `ceiling` case must fail.
+The control carries three defects: the weekly percent gate (`ceiling`), the `$0` no-price fallback (`noprice`), and the attached-thread census (`attachcap`).
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
