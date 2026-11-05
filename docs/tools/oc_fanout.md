@@ -7,7 +7,7 @@ then arms a watch. One composite report arrives when every member reports or exp
 
 Call:
 ```
-oc_fanout brief="Fix the parser and add a test." models=["opencode-go/glm-5.3-flash","opencode-go/deepseek-v4.1-flash"]
+oc_fanout brief="Fix the parser and add a test." models=["opencode-go/glm-5.3-flash","opencode-go/deepseek-v4.1-flash","opencode/an-example-free"] judge="opencode-go/glm-5.3-flash"
 ```
 Parameters: `brief` (string, required), `models` (string array, required; unique), `variant` (string,
 optional), `judge` (string, optional), `directory` (string, optional), `ttl_s` (number, optional).

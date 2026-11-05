@@ -65,7 +65,7 @@ served: opencode-go/…
 
 | Command | What it does |
 | --- | --- |
-| [`/oc`](docs/commands/oc.md) | Status: mode, service, live threads; adopted threads marked `attached`. |
+| [`/oc`](docs/commands/oc.md) | Status: mode, service, threads with their status; adopted threads marked `attached`. |
 | [`/oc-budget`](docs/commands/oc-budget.md) | Quota meters, live thread cost, and console budgets (`/oc_budget` also works). |
 | [`/oc-attach`](docs/commands/oc-attach.md) | Adopts an existing thread under `OC_ROOT`. |
 | [`/oc-auto`](docs/commands/oc-auto.md) | The model in this Pi session answers the asks. |
@@ -91,8 +91,9 @@ The long rules live on their own pages: [attach](docs/tools/oc_attach.md),
 5. A run already reported answers `already reported` instead of a second copy. `oc_wait` with
    `since` and `oc_read` read the record freely.
 
-A batch waits for you while you type, for a compaction, or after an escape. Print and JSON carry no
-wake-up; [lifecycle.md](docs/lifecycle.md) and [wake-up.md](docs/wake-up.md) give the full rules.
+A batch waits for a compaction to end, or for the next human-started run after an escape ends a run
+you dropped. Print and JSON carry no wake-up; [lifecycle.md](docs/lifecycle.md) and
+[wake-up.md](docs/wake-up.md) give the full rules.
 
 ## Environment
 
