@@ -15,8 +15,8 @@ turn with the answer. Your main session keeps working, and you keep the terminal
 Install from npm. For the newest work on `main`, install from git instead.
 
 ```sh
-$ pi install npm:@barty13/pi-opencode-bridge                  # 0.2.0
-$ pi install git:github.com/Barty13/pi-opencode-bridge         # main, ahead of npm
+$ pi install npm:@barty13/pi-opencode-bridge                  # latest release
+$ pi install git:github.com/Barty13/pi-opencode-bridge         # main, ahead of the release
 ```
 
 - **OpenCode already installed and signed in.** Free or licensed, your choice. Start the service
