@@ -258,7 +258,8 @@ skip.
 
 The member deadline is `OC_WATCH_TTL_S × N`, capped at `OC_WAIT_MAX_S × N`. `ttl_s` sets every
 member's deadline directly, still capped at `OC_WAIT_MAX_S × N`. A member that runs past its deadline
-holds an `expired` section instead of delaying the report forever.
+holds an `expired` section instead of delaying the report forever. A Pi reload during a fan-out drops
+the grouping, so the members settle as ordinary threads instead of one composite report.
 
 ## Supervision
 

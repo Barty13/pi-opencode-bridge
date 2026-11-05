@@ -198,6 +198,12 @@ fan_judge = """      if (fan.judgeModel) {
 """
 assert fan_judge in fan
 fan = fan.replace(fan_judge, "", 1)
+fan_seq = """    if (!Array.isArray(savedEntry) && typeof savedEntry?.fanSeq === "number") {
+      state.fanSeq = Math.max(0, Math.floor(savedEntry.fanSeq));
+    }
+"""
+assert fan_seq in fan
+fan = fan.replace(fan_seq, "", 1)
 open('.control-fanout.ts','w').write(fan)
 PY
 ```
@@ -301,14 +307,16 @@ The control carries three defects: the weekly percent gate (`ceiling`), the `$0`
 
 | Case | What it proves |
 | --- | --- |
+| `reload` | the counter rides in `oc-armed`: `fan_1`, shutdown, start, then `fan_2` |
 | `merge` | three staggered members give one wake-up, sections in caller order, with tokens, cost, digest, and answer |
 | `fail` | one failed member and one expired member keep their sections in the same single report |
 | `cap` | 30 live threads plus 3 new is refused with the count, before any create or prompt |
 | `quota` | rolling 90 at `OC_BUDGET_PCT=80` skips the Go member, still creates and prompts both free members, and names the skip |
 | `judge` | the judge thread receives all three answers, and its verdict joins the same report |
 
-The control carries four defects: the fan-out hold, so every member wakes alone (`merge`, `fail`); the
-live-thread cap (`cap`); the Go-member quota skip (`quota`); and the judge (`judge`).
+The control carries five defects: the fan-out hold, so every member wakes alone (`merge`, `fail`); the
+live-thread cap (`cap`); the Go-member quota skip (`quota`); the judge (`judge`); and the counter
+restore (`reload`).
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

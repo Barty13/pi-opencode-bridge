@@ -116,6 +116,20 @@ interface Watch {
   steers: number;
 }
 
+/** One armed watch saved in the `oc-armed` entry. */
+interface ArmedRow {
+  session: string;
+  floor: number;
+  steers?: number;
+  attached?: boolean;
+}
+
+/** The `oc-armed` entry: armed rows plus the fan-out counter. Older entries are a bare row array. */
+interface ArmedSave {
+  fanSeq?: number;
+  rows?: ArmedRow[];
+}
+
 /** The last Session.Info numbers for one thread; the HUD prints these without a request. */
 interface ThreadInfo {
   providerID: string;
@@ -1840,11 +1854,16 @@ export default function (pi: ExtensionAPI) {
     reset();
     const mine = state;
     // Restore armed floors from the last session; the deadline gets a fresh TTL.
-    const saved = (context.sessionManager.getEntries()
+    const savedEntry = (context.sessionManager.getEntries()
       .findLast((e: any) => e.type === "custom" && e.customType === "oc-armed") as
-      { data?: Array<{ session: string; floor: number; steers?: number; attached?: boolean }> } | undefined)?.data;
+      { data?: ArmedSave | ArmedRow[] } | undefined)?.data;
+    // Older entries are a bare row array; the current entry also carries the fan-out counter.
+    const saved = Array.isArray(savedEntry) ? savedEntry : savedEntry?.rows ?? [];
+    if (!Array.isArray(savedEntry) && typeof savedEntry?.fanSeq === "number") {
+      state.fanSeq = Math.max(0, Math.floor(savedEntry.fanSeq));
+    }
     // A thread that settled while Pi was down must not get a watch: it would expire into a false wake.
-    await Promise.all((saved ?? []).map(async (row) => {
+    await Promise.all(saved.map(async (row) => {
       if (mine !== state) return;
       if (row.attached) mine.attached.add(row.session);
       let current: any = null;
@@ -1885,14 +1904,19 @@ export default function (pi: ExtensionAPI) {
     stopBackstop();
     if (hudTimer) clearInterval(hudTimer);
     hudTimer = null;
-    // Save armed floors, steer counts, and attach markers; the next session_start restores them.
-    if (state.armed.size) pi.appendEntry("oc-armed",
-      [...state.armed].map(([session, w]) => ({
-        session,
-        floor: w.floor,
-        steers: w.steers,
-        attached: state.attached.has(session),
-      })));
+    // Save armed floors, steer counts, attach markers, and the fan-out counter; session_start restores them.
+    if (state.armed.size || state.fanSeq) {
+      const save: ArmedSave = {
+        fanSeq: state.fanSeq,
+        rows: [...state.armed].map(([session, w]) => ({
+          session,
+          floor: w.floor,
+          steers: w.steers,
+          attached: state.attached.has(session),
+        })),
+      };
+      pi.appendEntry("oc-armed", save);
+    }
     reset();
     panesOn = false;
   });

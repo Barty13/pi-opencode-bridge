@@ -7,8 +7,8 @@
  *   GET /api/session -> {data:Session.Info[], cursor:{…}}.
  *   GET /api/experimental/usage/limits and GET /api/model keep the stage 05 shapes.
  *
- * Cases: merge, fail, cap, quota, judge. The control removes the fan-out hold (per-member wake-up),
- * the cap, the Go-member skip, and the judge; every case must die.
+ * Cases: reload, merge, fail, cap, quota, judge. The control removes the fan-out hold (per-member
+ * wake-up), the cap, the Go-member skip, the judge, and the counter restore; every case must die.
  * Run:
  *   bun run checks/check-11-fanout.ts
  *   BRIDGE=$PWD/.control-fanout.ts bun run checks/check-11-fanout.ts   # must fail
@@ -162,6 +162,7 @@ const sent: string[] = [];
 const tools = new Map<string, any>();
 const commands = new Map<string, any>();
 const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+let entries: any[] = [];
 const piStub = {
   registerTool: (tool: any) => tools.set(tool.name, tool),
   registerCommand: (name: string, command: any) => commands.set(name, command),
@@ -169,14 +170,16 @@ const piStub = {
   on: (event: string, handler: any) => handlers.set(event, handler),
   getFlag: () => undefined,
   sendUserMessage: (text: string) => { sent.push(text); },
-  appendEntry: () => {},
+  appendEntry: (customType: string, data: unknown) => {
+    entries.push({ type: "custom", customType, data });
+  },
 };
 const ctx = {
   mode: "rpc",
   hasUI: false,
   isIdle: () => true,
   ui: { confirm: async () => true, notify: () => {}, setStatus: () => {}, setWidget: () => {} },
-  sessionManager: { getEntries: () => [] },
+  sessionManager: { getEntries: () => entries },
 };
 
 const tool = (name: string) => {
@@ -250,6 +253,29 @@ const settle = (id: string, answer: string, opts: { outcome?: string; error?: st
   ];
 };
 
+// reload: the fan-out counter rides in oc-armed, so the next Pi session keeps numbering.
+const reloadFirstCreates = created.length;
+const reloadFirst = await tool("oc_fanout").execute("t", { brief: "reload brief", models: [A] });
+const reloadFirstText = textOf(reloadFirst);
+console.log("reload first ->", reloadFirstText);
+check("reload first", reloadFirst.isError !== true && reloadFirstText.includes("fan_1"), reloadFirstText);
+const reloadFirstId = created[reloadFirstCreates]?.id ?? "";
+await fire("session_shutdown")({}, ctx);
+await fire("session_start")({}, ctx);
+const reloadSecondCreates = created.length;
+const reloadSecond = await tool("oc_fanout").execute("t", { brief: "reload brief again", models: [B] });
+const reloadSecondText = textOf(reloadSecond);
+console.log("reload second ->", reloadSecondText);
+check("reload counter", reloadSecond.isError !== true && reloadSecondText.includes("fan_2"), reloadSecondText);
+const reloadSecondId = created[reloadSecondCreates]?.id ?? "";
+// Drop the restored first watch; settle the second fan-out so no deadline lands in a later case.
+await tool("oc_stop").execute("t", { session: reloadFirstId, detach: true });
+const reloadBefore = sent.length;
+await wait(10);
+settle(reloadSecondId, "RELOAD-B");
+const reloadWake = await wake(reloadBefore);
+check("reload settles", (reloadWake?.includes("RELOAD-B") ?? false), reloadWake ?? "(none)");
+
 // merge: three members settle one at a time, but only the last one wakes the session.
 const mergeBefore = sent.length;
 const mergeCreates = created.length;
@@ -257,7 +283,7 @@ const mergeRes = await tool("oc_fanout").execute("t", { brief: "merge brief", mo
 const mergeText = textOf(mergeRes);
 console.log("merge receipt ->", mergeText);
 const mergeIds = created.slice(mergeCreates).map((entry) => entry.id);
-check("merge receipt", mergeRes.isError !== true && mergeText.includes("fan_1") && mergeIds.length === 3, mergeText);
+check("merge receipt", mergeRes.isError !== true && /fan_\d+/.test(mergeText) && mergeIds.length === 3, mergeText);
 // One tick past the arm floor: the settle window takes rows strictly newer than the floor.
 await wait(10);
 settle(mergeIds[0], "ALPHA");
@@ -412,5 +438,5 @@ if (failures.length) {
   console.log(`FAIL fanout: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS fanout: three staggered members give one ordered report, a failed and an expired member keep their sections, 30 live plus 3 new is refused before any create, the rolling meter skips only the Go member, and one judge thread ranks all three answers into the same report");
+console.log("PASS fanout: a reload keeps the counter at fan_2, three staggered members give one ordered report, a failed and an expired member keep their sections, 30 live plus 3 new is refused before any create, the rolling meter skips only the Go member, and one judge thread ranks all three answers into the same report");
 process.exit(0);
