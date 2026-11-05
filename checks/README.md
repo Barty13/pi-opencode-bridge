@@ -119,6 +119,14 @@ control = control.replace(rewind_ask, """        const stage = await revert("POS
 rewind_noui = '      throw new Error("the revert stays staged; the commit needs a decision in a Pi TUI");'
 assert rewind_noui in control
 control = control.replace(rewind_noui, '      throw new Error("supervised commit needs a terminal dialog; run /oc-auto for this session, then retry");', 1)
+rewind_nogit = """          if (!paths.length) {
+            if (named.length) {
+              return `no git history for this root, messages reverted, files untouched: ${named.join(", ")}`;
+            }
+            return "files restored: none";
+          }"""
+assert rewind_nogit in control
+control = control.replace(rewind_nogit, '          if (!paths.length) return "files restored: none";', 1)
 open('.control-rewind.ts','w').write(control)
 budget_meter = "  const meter = limits?.data?.go?.rolling;"
 assert budget_meter in src
@@ -299,7 +307,7 @@ The control carries four defects: the newest-row floor (`live`), the uncondition
 | `armed` | an armed watch refuses the rewind with zero service calls |
 | `noui` | no UI keeps the stage staged, says the commit needs a Pi TUI, and does not advise `/oc-auto` |
 
-The control carries four defects: the stage ask after the stage (`ask`), the newest-user-row target (`steered`), the untracked clear (`clear`), and the no-UI advice (`noui`).
+The control carries five defects: the stage ask after the stage (`ask`), the newest-user-row target (`steered`), the untracked clear (`clear`), the no-UI advice (`noui`), and the plain no-files line in place of the no-git wording (`nogitroot`).
 
 `check-10-budget.ts` runs the budget cases against a stub service:
 

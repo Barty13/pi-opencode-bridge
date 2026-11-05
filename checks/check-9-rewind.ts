@@ -13,8 +13,9 @@
  *   GET /message?order=desc&limit=200 carries user rows with their ids.
  *
  * Cases: stage, steered, window, clear, ask, commit, nogitroot, branch, armed, noui. The control
- * carries four defects: the stage ask after the stage (ask), the newest-user-row target (steered),
- * the untracked clear (clear), and the no-UI advice (noui).
+ * carries five defects: the stage ask after the stage (ask), the newest-user-row target (steered),
+ * the untracked clear (clear), the no-UI advice (noui), and the plain no-files line in place of the
+ * no-git wording (nogitroot).
  * Run:
  *   bun run checks/check-9-rewind.ts
  *   BRIDGE=$PWD/.control-rewind.ts bun run checks/check-9-rewind.ts   # must fail
@@ -327,7 +328,7 @@ const steeredCall = calls.filter((call) => call.path.endsWith("/revert/stage")).
 check(
   "steered target",
   steeredText.includes("rewound") && steeredText.includes("msg_rewind_user") && !steeredText.includes("msg_rewind_steer"),
-  steeredText,
+  steeredText.replace(/\n/g, " | "),
 );
 check("steered body", steeredCall?.body?.messageID === "msg_rewind_user", JSON.stringify(steeredCall));
 
@@ -468,7 +469,7 @@ check(
   noGitText.includes("no git history for this root")
     && noGitText.includes("files untouched: src/note.txt")
     && !noGitText.includes("files restored: none"),
-  noGitText,
+  noGitText.replace(/\n/g, " | "),
 );
 noGit = false;
 
