@@ -392,6 +392,20 @@ async function discover(): Promise<Service> {
   return { url, password };
 }
 
+/** In-flight discovery, so concurrent callers share one `opencode service status` spawn. */
+let discovering: Promise<Service> | null = null;
+
+/** The cached handle, or one shared discovery. A failed discovery leaves no handle behind. */
+function serviceHandle(): Promise<Service> {
+  if (service) return Promise.resolve(service);
+  discovering ??= discover()
+    .then((svc) => (service = svc))
+    .finally(() => {
+      discovering = null;
+    });
+  return discovering;
+}
+
 /** One retry after rediscovery: the port changes on restart, and a dead service can answer non-JSON. */
 async function api<T = any>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const send = async (svc: Service) => {
@@ -414,13 +428,16 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
     return (text.trim() ? JSON.parse(text) : {}) as T;
   };
   try {
-    return await send((service ??= await discover()));
+    return await send(await serviceHandle());
   } catch (error) {
-    service = null;
+    // A socket failure or a bad body means the handle is stale; an HTTP answer means the service
+    // is alive, so the handle stays even when the call itself failed.
+    const stale = error instanceof TypeError || error instanceof SyntaxError;
+    if (stale) service = null;
     // Replay GET only. A TypeError can follow a POST the service already accepted, and a replayed
     // prompt would run twice with nobody watching the second run.
-    if (method === "GET" && (error instanceof TypeError || error instanceof SyntaxError)) {
-      return send((service = await discover()));
+    if (method === "GET" && stale) {
+      return send(await serviceHandle());
     }
     throw error;
   }
@@ -1622,7 +1639,7 @@ export default function (pi: ExtensionAPI) {
   const watch = async (signal: AbortSignal) => {
     while (!signal.aborted) {
       try {
-        const svc = (service ??= await discover());
+        const svc = await serviceHandle();
         const types = [
           "permission.asked",
           "form.created",
@@ -1651,9 +1668,11 @@ export default function (pi: ExtensionAPI) {
         // The stream is volatile by contract, so even a clean end waits before reconnecting. The
         // sleep is unref'd and abort-aware, so a shutdown never waits on a reconnect pause.
         await sleep(1000, signal);
-      } catch {
+      } catch (error) {
         if (signal.aborted) return;
-        service = null;
+        // An HTTP answer means the service is alive, so keep the handle; a dead socket or a bad
+        // body clears it for the next pass.
+        if (error instanceof TypeError || error instanceof SyntaxError) service = null;
         await sleep(3000, signal);
       }
     }
@@ -2543,6 +2562,8 @@ export default function (pi: ExtensionAPI) {
         const mine = state;
         state.known.add(params.session);
         let w = mine.armed.get(params.session);
+        // A rejected arm at the watch ceiling still leaves a real floor: the idle of the busy row.
+        let ceilingFloor: number | undefined;
         // A Pi reload drops the watch, and print and JSON never had one. A thread that is still
         // running owes this call its settle, so take a floor behind its in-flight rows and wait.
         if (!w && params.since === undefined) {
@@ -2553,11 +2574,12 @@ export default function (pi: ExtensionAPI) {
               armThread(params.session, Number(row?.time?.idle ?? 0));
               w = mine.armed.get(params.session);
             } catch {
-              // At the watch ceiling: read the record below instead of waiting.
+              // At the watch ceiling: read from behind this run with no wake-up armed.
+              ceilingFloor = Number(row?.time?.idle ?? 0);
             }
           }
         }
-        const floor = params.since ?? w?.floor ?? 0;
+        const floor = params.since ?? w?.floor ?? ceilingFloor ?? 0;
         // A settle that already reached the batch is this call's answer: take it, do not wake twice.
         // A fan-out report covers several sessions, so match any run it names.
         const queued = mine.batch.findIndex((entry) =>
@@ -2606,16 +2628,17 @@ export default function (pi: ExtensionAPI) {
           };
         }
         // No idle row after that point means nothing settled yet: say so, and keep the watch armed
-        // for the settle that is coming.
-        if (settle === null && read.idleAt <= (params.since ?? 0)) {
+        // for the settle that is coming. At the ceiling no watch exists, so the tail says so.
+        if (settle === null && read.idleAt <= floor) {
+          const tail = ceilingFloor !== undefined
+            ? "the watch ceiling was reached; no wake-up is armed"
+            : mine.armed.has(params.session)
+              ? "the watch stays armed"
+              : "no watch is armed and no wake-up will come; oc_send starts the run";
           return {
             content: [{
               type: "text",
-              text: `no settle after ${params.since ?? floor}; ${
-                mine.armed.has(params.session)
-                  ? "the watch stays armed"
-                  : "no watch is armed and no wake-up will come; oc_send starts the run"
-              }`,
+              text: `no settle after ${params.since ?? floor}; ${tail}`,
             }],
             details: { session: params.session, settled: false, asks: read.asks },
           };
@@ -2814,7 +2837,7 @@ export default function (pi: ExtensionAPI) {
         context,
         [
           `mode: ${state.mode}`,
-          `service: ${(service ??= await discover()).url}`,
+          `service: ${(await serviceHandle()).url}`,
           `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
           `served: ${(await cheapModels()).ids.join(", ")}`,
           ...rows.map((row: any) =>

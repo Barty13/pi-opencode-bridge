@@ -252,7 +252,7 @@ PY
 Run from the package root. `BRIDGE` points a check at a control build.
 
 ```sh
-for c in 4xx nowatch expire stale dup; do CASE=$c bun run checks/check-3-unit.ts; done
+for c in 4xx nowatch expire stale dup ceiling handle; do CASE=$c bun run checks/check-3-unit.ts; done
 bun run checks/check-1-compact.ts
 BRIDGE=file://$PWD/.control-bridge.ts CASE=stale bun run checks/check-3-unit.ts   # must fail
 BRIDGE=file://$PWD/.control-bridge.ts CASE=dup bun run checks/check-3-unit.ts     # must fail
@@ -273,6 +273,7 @@ bun run checks/check-11-fanout.ts
 BRIDGE=$PWD/.control-fanout.ts bun run checks/check-11-fanout.ts                  # must fail
 bun run checks/check-12-docs.ts
 BRIDGE=$PWD/.control-docs.ts bun run checks/check-12-docs.ts                      # must fail
+bun run checks/check-13-panes.ts
 ```
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
@@ -383,3 +384,13 @@ and need a model, so they take `OC_CHECK_MODEL=<id from oc_models>`. They set `O
 temporary directory. `OC_PANES=0` keeps them out of Ghostty. Item 25 (pane columns only for armed
 threads) has no check: a fake `HOME` does not move `os.homedir()` in bun, so a stub pane script
 cannot be installed safely. Read the `oc_open` and `oc_send` bodies in `opencode-bridge.ts` instead.
+
+`check-13-panes.ts` runs the `oc-panes` input cases against a fake `osascript` on `PATH`:
+
+| Case | What it proves |
+| --- | --- |
+| `live` | a benign `add` reaches `osascript`, so a silent run below means a rejection |
+| `dir` | a directory with an apostrophe exits non-zero, prints one line, and calls no `osascript` |
+| `state` | a corrupt pane id in the state file is dropped by `rm`, which still exits 0 and calls no `osascript` |
+
+One run covers the three cases in that order, and the marker file is the only signal for whether `osascript` ran.
