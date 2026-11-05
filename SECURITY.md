@@ -8,8 +8,9 @@
   The password goes only to a loopback host (`127.0.0.1`, `localhost`, `::1`); any other service URL is refused.
 - Your OpenCode CLI, for two read-only calls: `opencode service status` and `opencode models`.
 
-The bridge installs nothing, and writes nothing to disk. Thread creation and deletion go through
-the service API. It reads no provider key and no model id list from you: it asks the service.
+The bridge installs nothing. It writes one `oc-armed` entry to the Pi session through Pi, and
+`oc-panes` writes `~/.pi/agent/state/oc-panes.tsv`. Thread creation and deletion go through the
+service API. It reads no provider key and no model id list from you: it asks the service.
 
 ## Where the risk sits
 

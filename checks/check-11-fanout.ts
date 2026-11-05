@@ -7,9 +7,11 @@
  *   GET /api/session -> {data:Session.Info[], cursor:{…}}.
  *   GET /api/experimental/usage/limits and GET /api/model keep the stage 05 shapes.
  *
- * Cases: reload, merge, fail, race, cap, parallel, quota, judge. The cap counts only active threads
- * under the root and counts the judge. The control removes the fan-out hold (per-member wake-up),
- * the cap, the Go-member skip, the judge, and the counter restore; every case must die.
+ * Cases: reload, merge, fail, race, cap, parallel, quota, judge, stop. The cap counts only active
+ * threads under the root and counts the judge. The stop case proves that a fan-out report naming a
+ * stopped member does not wake after the stop. The control removes the fan-out hold (per-member
+ * wake-up), the cap, the Go-member skip, the judge, the counter restore, the parallel start, and the
+ * judge truncation; every case must die.
  * Run:
  *   bun run checks/check-11-fanout.ts
  *   BRIDGE=$PWD/.control-fanout.ts bun run checks/check-11-fanout.ts   # must fail
@@ -156,6 +158,9 @@ Bun.serve({
       return json({ id: `msg_${prompts.length}`, accepted: true });
     }
     if (p.endsWith("/permission") || p.endsWith("/form")) return json([]);
+    if (req.method === "POST" && p.endsWith("/interrupt")) {
+      return new Response('{"interrupted":false}', { status: 200, headers: { "content-type": "application/json" } });
+    }
     return json(null, 404);
   },
 });
@@ -544,6 +549,29 @@ check(
   (judgeWake?.includes("RANK: B, A, C") && judgeWake?.includes(`judge ${JUDGE}`) && ALL.every((model) => judgeWake?.includes(model))) ?? false,
   judgeWake ?? "(none)",
 );
+
+// stop: a fan-out report that names a stopped member must not wake after the stop.
+await fire("agent_settled")({ aborted: true }, ctx);
+const stopBefore = sent.length;
+const stopCreates = created.length;
+const stopRes = await tool("oc_fanout").execute("t", { brief: "stop brief", models: [A, B], ttl_s: 0.15 });
+const stopText = textOf(stopRes);
+const stopIds = created.slice(stopCreates).map((entry) => entry.id);
+// The members expire into one composite report, and the held batch keeps it.
+await wait(800);
+check("stop receipt", stopRes.isError !== true && stopIds.length === 2, stopText);
+const stop = await tool("oc_stop").execute("t", { session: stopIds[0] });
+const stopCarry = textOf(stop);
+console.log("stop carry ->", stopCarry);
+await fire("input")({ source: "interactive" }, ctx);
+await fire("agent_settled")({ aborted: false }, ctx);
+await wait(400);
+check(
+  "stop carries fan report",
+  stopCarry.includes("The run had already settled") && stopCarry.includes("fan-out"),
+  stopCarry,
+);
+check("stop no late wake", sent.length === stopBefore, `${sent.length - stopBefore}`);
 
 await fire("session_shutdown")({}, ctx);
 

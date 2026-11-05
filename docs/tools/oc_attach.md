@@ -28,6 +28,6 @@ attached; idle, watch starts with your next oc_send
 
 React to `already armed: <session>`: the existing watch stays. An ask read failure prints
 `open asks: unreadable` instead of a count. `/oc` marks an adopted thread `attached`; a reload
-restores that mark.
+restores that mark only while the thread has an armed watch, because the save holds armed rows only.
 
 Limits: the tool fails when the thread is outside the root or the status read fails.

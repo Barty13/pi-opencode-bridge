@@ -22,7 +22,6 @@ set -uo pipefail
 
 STATE="${HOME}/.pi/agent/state/oc-panes.tsv"
 FONT="${OC_PANES_FONT:-13}"
-COLS="${OC_PANES_COLS:-0}"
 mkdir -p "$(dirname "$STATE")"
 
 # as runs AppleScript as one osascript -e per line. osascript takes a single line per -e.

@@ -121,7 +121,6 @@ const DEFAULTS: Record<string, DefaultContract> = {
     proof: 'process.env.OC_EXTENSION ?? join(import.meta.dirname, "opencode-bridge.ts")',
   },
   OC_PANES_FONT: { value: "13", file: "oc-panes", proof: "OC_PANES_FONT:-13" },
-  OC_PANES_COLS: { value: "0", file: "oc-panes", proof: "OC_PANES_COLS:-0" },
   OC_CHECK_MODEL: { value: "required", file: "checks/check-tui.sh", proof: "OC_CHECK_MODEL:?" },
   BRIDGE: { value: "the repo's opencode-bridge.ts", file: "checks/check-4-gate.ts", proof: "process.env.BRIDGE ??" },
 };

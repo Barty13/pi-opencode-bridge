@@ -6,253 +6,18 @@ a real model.
 Model-free checks run against a stub `pi` and a stub service. Each has a control: a build with the
 fix removed, which must fail. Generate the controls, then run.
 
+The controls are generated from `opencode-bridge.ts` by `checks/make-controls.ts`. Each control
+applies its named defects to the current source. A missing anchor stops the generator, and a control
+step skips when its file is absent.
+
 ```sh
-python3 - <<'PY'
-src = open('opencode-bridge.ts').read()
-pairs = [
- ("      if (mine.armed.get(session) !== w || mine.sending.has(session)) {\n        mine.claimed.delete(session);  // or detect/sweep skip it until the 30 min TTL (:701, :732)\n        continue;\n      }", "      if (mine.armed.get(session) !== w || mine.sending.has(session)) continue;"),
- ("      else if (/HTTP 4\\d\\d/.test(String(error))) dropThread(session);\n", ""),
- ('session, title: "", outcome: "unknown", error: null, answer: "", asks: [],\n          asksUnknown: true, idleAt: Date.now(), steers: w.steers, expired: true,', 'session, title: "", outcome: "running", error: null, answer: "", asks: [], idleAt: Date.now(), steers: w.steers, expired: true,'),
- ("      markReported(settle.asks);\n      for (const section of settle.fan ?? []) markReported(section.asks);\n      // This message is the report for these runs; a later oc_wait must not repeat them.\n      for (const run of settle.runs ?? [{ session: settle.session, idleAt: settle.idleAt }]) {\n        mine.reportedRun.set(run.session, run.idleAt);\n      }", "      markReported(settle.asks);\n      for (const section of settle.fan ?? []) markReported(section.asks);"),
-]
-out = src
-for pat, rep in pairs:
-    assert pat in out, pat[:40]
-    out = out.replace(pat, rep, 1)
-open('.control-bridge.ts','w').write(out)
-gate = "    if (mine.compacting) return;  // keep the batch; afterCompact re-arms the flush\n"
-assert gate in src
-open('.control-compact.ts','w').write(src.replace(gate, ""))
-ceiling = "const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);"
-assert ceiling in src
-open('.control-nogate.ts','w').write(src.replace(ceiling, "const COMPACT_TOKENS = 0;  // CONTROL: gate off"))
-digest = "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));"
-assert digest in src
-open('.control-digest.ts','w').write(src.replace(digest, "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);"))
-steer = "          // A steer must not re-arm: the watch floor, deadline, claim, and report stay.\n          await postPrompt(params.session, { text: params.text, delivery: \"steer\" });"
-assert steer in src
-busy = "  return Number(row?.time?.busy ?? 0) > Number(row?.time?.idle ?? 0);"
-assert busy in src
-control = src.replace(busy, "  return Boolean(row?.time?.busy) && !row?.time?.idle;")
-claimed = "        if (state.sending.has(params.session)) {"
-assert claimed in src
-control = control.replace(claimed, "        if (state.claimed.has(params.session)) {\n          return {\n            content: [{ type: \"text\", text: \"the run is settling; no steer sent\" }],\n            details: { session: params.session, steered: false },\n            isError: true,\n          };\n        }\n" + claimed)
-open('.control-steer.ts','w').write(control.replace(steer, "          armThread(params.session);\n" + steer))
-floor = """    const running = busy(row);
-    // `busy` marks the start of the run in flight; one ms behind it includes the answer row that
-    // carries the run. An idle thread's floor sits at its last idle and excludes the old run.
-    const floor = running ? Number(row?.time?.busy ?? 0) - 1 : Number(row?.time?.idle ?? 0);"""
-assert floor in src
-control = src.replace(floor, """    const running = busy(row);
-    const newest = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=1`)).data?.[0];
-    const floor = Number(newest?.time?.created ?? 0);""", 1)
-arm = "    if (running) armThread(session, floor);"
-assert arm in control
-control = control.replace(arm, "    armThread(session, floor);", 1)
-restore = """      if (mine !== state) return;
-      // A failed read may hide a live run, so keep the watch. Only a real idle row drops it.
-      if (!readFailed && !busy(current)) return;"""
-assert restore in control
-control = control.replace(restore, "      if (mine !== state || readFailed) return;", 1)
-open('.control-attach.ts','w').write(control)
-rewind_target = """        const current = (await api<any>("GET", `/api/session/${session}`)).data;
-        noteThread(state, current);
-        // The run opener is the oldest user row at or after busy; a steer writes a newer user row.
-        const floor = Number(current?.time?.busy ?? 0) - 1;
-        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
-        const at = rows.findLastIndex((row: any) =>
-          row.type === "user" && Number(row?.time?.created ?? 0) >= floor
-        );
-        if (at < 0) {
-          throw new Error(
-            `the opening user row of the last run sits older than the ${DIGEST_ROWS}-row window; fork with branch:true, or rewind a shorter run`,
-          );
-        }"""
-assert rewind_target in src
-control = src.replace(rewind_target, """        // The newest user row opens the last run; the rows newer than it carry that run's tools.
-        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
-        const at = rows.findIndex((row: any) => row.type === "user");
-        if (at < 0) throw new Error(`thread ${session} has no user message to rewind`);""", 1)
-rewind_clear = """        if (params.clear) {
-          // Only a stage this session made can be cleared; the service answers 204 even with nothing staged.
-          const tracked = state.staged.get(session);
-          if (!tracked) {
-            return {
-              content: [{ type: "text", text: "no rewind staged in this session; nothing cleared" }],
-              details: { session, rewound: false, target: "", branch: "", files: false },
-            };
-          }
-          await revert("DELETE", `/api/session/${session}/revert`);
-          state.staged.delete(session);
-          return {
-            content: [{ type: "text", text: `cleared the staged revert on ${session}; files are back at the run's state` }],
-            details: { session, rewound: false, target: "", branch: "", files: true },
-          };
-        }"""
-assert rewind_clear in control
-control = control.replace(rewind_clear, """        if (params.clear) {
-          await revert("DELETE", `/api/session/${session}/revert`);
-          return {
-            content: [{ type: "text", text: `cleared the staged revert on ${session}; files are back at the run's state` }],
-            details: { session, rewound: false, target: "", branch: "", files: true },
-          };
-        }""", 1)
-rewind_ask = """        // The stage rewrites files at once, so the human decision comes before the POST.
-        if (!kept && !(await confirmStage(session, target, digestLabel, params.commit === true))) {
-          return {
-            content: [{ type: "text", text: "stage refused; nothing changed." }],
-            details: { session, rewound: false, target: "", branch: "", files: false },
-            isError: true,
-          };
-        }
-        const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
-        const paths = pathsOf(stage);
-        state.staged.set(session, target);"""
-assert rewind_ask in control
-control = control.replace(rewind_ask, """        const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
-        const paths = pathsOf(stage);
-        state.staged.set(session, target);
-        if (!kept && !(await confirmStage(session, target, digestLabel, params.commit === true))) {
-          return {
-            content: [{ type: "text", text: "stage refused; nothing changed." }],
-            details: { session, rewound: false, target: "", branch: "", files: false },
-            isError: true,
-          };
-        }""", 1)
-rewind_noui = '      throw new Error("the revert stays staged; the commit needs a decision in a Pi TUI");'
-assert rewind_noui in control
-control = control.replace(rewind_noui, '      throw new Error("supervised commit needs a terminal dialog; run /oc-auto for this session, then retry");', 1)
-rewind_nogit = """          if (!paths.length) {
-            if (named.length) {
-              return `no git history for this root, messages reverted, files untouched: ${named.join(", ")}`;
-            }
-            return "files restored: none";
-          }"""
-assert rewind_nogit in control
-control = control.replace(rewind_nogit, '          if (!paths.length) return "files restored: none";', 1)
-open('.control-rewind.ts','w').write(control)
-budget_meter = "  const meter = limits?.data?.go?.rolling;"
-assert budget_meter in src
-control = src.replace(budget_meter, "  const meter = limits?.data?.go?.weekly;", 1)
-budget_no_price = '  if (!price) return "";'
-assert budget_no_price in control
-control = control.replace(budget_no_price, '  if (!price) return "$0";', 1)
-budget_attach = """    state.known.add(session);
-    state.attached.add(session);
-    // Adopt is not delegation: leave the thread out of the OC_BUDGET_TOKENS census."""
-assert budget_attach in control
-control = control.replace(budget_attach, """    state.known.add(session);
-    state.attached.add(session);
-    state.delegated.add(session);""", 1)
-open('.control-budget.ts','w').write(control)
-fan_hold = """    // A fan-out member is held until every member is terminal: one report per fan-out.
-    const fanId = mine.fanMember.get(settle.session);
-    if (fanId) {
-      const fan = mine.fanouts.get(fanId);
-      if (fan) {
-        await acceptFanout(mine, fan, settle);
-        return;
-      }
-    }
-"""
-assert fan_hold in src
-fan = src.replace(fan_hold, "", 1)
-fan_cap = """        const active = await api<any>("GET", "/api/session/active");
-        // Active runs and this bridge's own armed watches are both live; the larger count wins.
-        const live = Math.max(Object.keys(active?.data ?? {}).length, state.armed.size);
-        if (live + requested.length > MAX_THREADS) {
-          return {
-            content: [{
-              type: "text",
-              text: `fan-out refused: ${live} live threads + ${requested.length} new exceed ${MAX_THREADS}`,
-            }],
-            details: { fanout: "", sessions: [] as string[] },
-            isError: true,
-          };
-        }
-"""
-assert fan_cap in fan
-fan = fan.replace(fan_cap, "", 1)
-fan_skip = """          const skip = memberRefusal(limits, plan.providerID, plan.id);
-          const member: FanMember = {
-            session: "",
-            model,
-            variant,
-            settle: null,
-            skip: skip ? skip : null,
-            fail: null,
-            deadline: Date.now() + ttlMs,
-          };
-          fan.members.push(member);
-          if (skip) {
-            lines.push(`${model}  variant ${variant}  skipped: ${skip}`);
-            continue;
-          }
-"""
-assert fan_skip in fan
-fan = fan.replace(fan_skip, """          const member: FanMember = {
-            session: "",
-            model,
-            variant,
-            settle: null,
-            skip: null,
-            fail: null,
-            deadline: Date.now() + ttlMs,
-          };
-          fan.members.push(member);
-""", 1)
-fan_judge = """      if (fan.judgeModel) {
-        fan.phase = "judge";
-        await startJudge(mine, fan);
-        return;
-      }
-"""
-assert fan_judge in fan
-fan = fan.replace(fan_judge, "", 1)
-fan_seq = """    if (!Array.isArray(savedEntry) && typeof savedEntry?.fanSeq === "number") {
-      state.fanSeq = Math.max(0, Math.floor(savedEntry.fanSeq));
-    }
-"""
-assert fan_seq in fan
-fan = fan.replace(fan_seq, "", 1)
-open('.control-fanout.ts','w').write(fan)
-PY
-
-# Stage 12: the docs control carries two defects.
-python3 - <<'PY'
-import re
-from pathlib import Path
-
-pages = sorted(Path('docs').rglob('*.md'))
-parts = []
-for page in pages:
-    parts.append(f'@@ {page.as_posix()}\n')
-    parts.append(page.read_text())
-text = ''.join(parts)
-
-# Defect 1: remove the oc_fanout page and its index line.
-start = re.search(r'^@@ docs/tools/oc_fanout\.md$', text, re.M)
-assert start
-end = re.search(r'^@@ ', text[start.end():], re.M)
-text = text[:start.start()] + (text[start.end() + end.start():] if end else '')
-text = re.sub(r'^- \[oc_fanout\]\(tools/oc_fanout\.md\)[^\n]*\n', '', text, count=1, flags=re.M)
-
-# Defect 2: make the environment table disagree with the code.
-text, n = re.subn(
-    r'(?m)^(\| `OC_DEBOUNCE_MS` \| bridge \| `)[^`]+(` \|)',
-    r'\g<1>500\g<2>',
-    text,
-    count=1,
-)
-assert n == 1
-open('.control-docs.ts', 'w').write(text)
-PY
+bun run checks/make-controls.ts
 ```
 
 Run from the package root. `BRIDGE` points a check at a control build.
 
 ```sh
-for c in 4xx 5xx nowatch expire stale dup ceiling handle flush streamgap envparse perms loopback known askfail rootfile ceilenv abortlist panemode busyexp expirepane; do CASE=$c bun run checks/check-3-unit.ts; done
+for c in 4xx 5xx nowatch expire stale dup ceiling handle flush streamgap envparse perms loopback known askfail rootfile ceilenv abortlist panemode busyexp expirepane reply kill readbounds; do CASE=$c bun run checks/check-3-unit.ts; done
 bun run checks/check-1-compact.ts
 BRIDGE=file://$PWD/.control-bridge.ts CASE=stale bun run checks/check-3-unit.ts   # must fail
 BRIDGE=file://$PWD/.control-bridge.ts CASE=dup bun run checks/check-3-unit.ts     # must fail
@@ -301,6 +66,9 @@ bun run checks/check-13-panes.ts
 | `panemode` | a switch from TUI to print closes the old columns |
 | `busyexp` | a busy run keeps its watch past the TTL and reports its real settle once |
 | `expirepane` | an expired watch leaves its column open |
+| `reply` | `oc_reply` accepts a permission and refuses a form without `answerJson` |
+| `kill` | `/oc-kill` interrupts the thread and drops its watch |
+| `readbounds` | `oc_read` caps the limit at 25 and names an offset past the end |
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
 
@@ -339,9 +107,9 @@ The control restores three defects: the steer re-arm (`one`), the old `busy` pre
 | `escape` | a thread outside `OC_ROOT` is refused; nothing is armed; the command reports the failure |
 | `restore` | a reload restores a watch for a busy saved row only; an idle saved row gets none |
 | `readfail` | a failed status read during restore keeps the watch; `/oc` still counts it |
-| `clean` | `/oc-clean force` deletes an idle thread, keeps the adopted one, and names it in the receipt |
+| `clean` | a dry run lists the idle thread, keeps the busy and adopted ones, and `force` deletes only the idle thread |
 
-The control carries four defects: the newest-row floor (`live`), the unconditional arm (`idle`), the blind restore (`restore`), and the dropped watch on a failed read (`readfail`).
+The control carries five defects: the newest-row floor (`live`), the unconditional arm (`idle`), the blind restore (`restore`), the dropped watch on a failed read (`readfail`), and a restored run missing from the token census (`restore delegated`). It also deletes adopted threads in `/oc-clean` (`clean`).
 
 `check-9-rewind.ts` runs the rewind cases against a stub service:
 
@@ -357,7 +125,7 @@ The control carries four defects: the newest-row floor (`live`), the uncondition
 | `batch` | a settle waiting in the batch rides in the receipt and does not wake the model after the rewind |
 | `noui` | no UI keeps the stage staged, says the commit needs a Pi TUI, and does not advise `/oc-auto` |
 
-The control carries five defects: the stage ask after the stage (`ask`), the newest-user-row target (`steered`), the untracked clear (`clear`), the no-UI advice (`noui`), and the plain no-files line in place of the no-git wording (`nogitroot`).
+The control carries six defects: the stage ask after the stage (`ask`), the newest-user-row target (`steered`), the untracked clear (`clear`), the no-UI advice (`noui`), the plain no-files line in place of the no-git wording (`nogitroot`), and a dropped batched settle (`batch`).
 
 `check-10-budget.ts` runs the budget cases against a stub service:
 
@@ -386,8 +154,9 @@ The control carries three defects: the weekly percent gate (`ceiling`), the `$0`
 | `cap` | 30 live threads plus 3 new is refused with the count, before any create or prompt |
 | `quota` | rolling 90 at `OC_BUDGET_PCT=80` skips the Go member, still creates and prompts both free members, and names the skip |
 | `judge` | the judge thread receives all three answers, and its verdict joins the same report |
+| `stop` | a fan-out report that names a stopped member rides in the stop receipt and never wakes the model |
 
-The control carries five defects: the fan-out hold, so every member wakes alone (`merge`, `fail`); the live-thread cap (`cap`); the Go-member quota skip (`quota`); the judge (`judge`); and the counter restore (`reload`).
+The control carries seven defects: the fan-out hold, so every member wakes alone (`merge`, `fail`); the live-thread cap (`cap`); the Go-member quota skip (`quota`); the judge (`judge`); the counter restore (`reload`); a serial create loop (`parallel`); and an untruncated judge prompt (`judge prompt cap`).
 
 `check-12-docs.ts` runs the doc-rot cases against the `docs/` tree:
 
@@ -402,7 +171,7 @@ The control carries five defects: the fan-out hold, so every member wakes alone 
 
 The control carries two defects: the `oc_fanout` page is gone (`inventory`), and `OC_DEBOUNCE_MS` reads `500` (`env`). Both cases must fail. The stage-12 control is a docs bundle, not a build of the extension; `BRIDGE` names the bundle under test.
 
-The `env` case covers the twenty-two `OC_*` and `BRIDGE` names in the Environment table: fourteen for the bridge, four for `oc-rpc.ts`, two for `oc-panes`, and two for the check scripts. `CASE`, `PATH`, and other check-local selectors are out of scope on purpose.
+The `env` case covers the twenty-one `OC_*` and `BRIDGE` names in the Environment table: fourteen for the bridge, four for `oc-rpc.ts`, one for `oc-panes`, and two for the check scripts. `CASE`, `PATH`, and other check-local selectors are out of scope on purpose.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

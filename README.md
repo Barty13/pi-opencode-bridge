@@ -82,8 +82,9 @@ The long rules live on their own pages: [attach](docs/tools/oc_attach.md),
 ## How a thread finishes
 
 1. `oc_send` posts the prompt and returns. The thread is armed: the bridge now owes one wake-up.
-2. The OpenCode event stream reports `session.execution.{succeeded,failed,interrupted}`. One detail
-   request per armed thread every `OC_BACKSTOP_MS` covers dropped frames.
+2. The OpenCode event stream reports `session.execution.{succeeded,failed,interrupted}`. Four requests
+   per armed thread every `OC_BACKSTOP_MS` (one session GET, one message GET, two ask GETs) cover
+   dropped frames.
 3. Detect claims the thread once, snapshots the answer, and releases one debounced message per
    batch. Two settles produce one message.
 4. `oc_wait` waits on that same detector, so a collected answer never wakes the model twice.
@@ -111,7 +112,6 @@ you dropped. Print and JSON carry no wake-up; [lifecycle.md](docs/lifecycle.md) 
 | `OC_HUD` | `on` | `0` removes the footer and the thread table. |
 | `OC_PANES` | `oc-panes next to the extension` | Path to the pane script; `0` turns columns off. |
 | `OC_PANES_FONT` | `13` | Font size in a new pane. |
-| `OC_PANES_COLS` | `0` | Column width; `0` lets Ghostty split evenly. |
 
 [docs/environment.md](docs/environment.md) lists every variable, including the RPC and check names.
 

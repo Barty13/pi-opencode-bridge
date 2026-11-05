@@ -5,8 +5,9 @@ This page covers the watch lifecycle: the floor, the deadline, the backstop poll
 A watch is the bridge's promise of one wake-up. It holds a floor, a deadline, and a steer count. The
 bridge arms a watch before it posts a prompt, because a run can settle in milliseconds. The floor is
 the wall-clock time at the arm. The deadline is that time plus `OC_WATCH_TTL_S`. A new send replaces
-the watch and resets the steer count. The bridge holds a fixed watch ceiling; an arm at the ceiling
-throws `32 threads in flight; wait for one to settle with oc_wait.`
+the watch and resets the steer count. The bridge holds a watch ceiling from `OC_MAX_THREADS`; an arm
+at the ceiling throws `<n> threads in flight; wait for one to settle with oc_wait.`, where `<n>` is
+the configured value.
 
 `oc_attach` arms a running thread with a floor of `time.busy - 1`, so the answer row of the run in
 flight is inside the window. An idle thread gets no watch. `oc_wait` on a running thread with no

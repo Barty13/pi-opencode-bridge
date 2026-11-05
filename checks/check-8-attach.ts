@@ -9,7 +9,8 @@
  *   row drops the answer that the turn already wrote.
  *   GET /message?order=desc&limit=1 -> {data:[{id, time:{created}, type, ...}]}
  *
- * Cases: old, idle, live, detach, escape, restore, readfail, clean. The control carries four defects: a
+ * Cases: old, idle, live, detach, escape, restore, readfail, clean. The clean case checks a dry run,
+ * a busy thread kept, an adopted thread kept, and the force delete. The control carries four defects: a
  * newest-row floor (live), an unconditional arm (idle), a blind restore (restore), and a dropped
  * watch on a failed restore read (readfail).
  * Run:
@@ -354,8 +355,22 @@ idleRow = rowFor(IDLE_RESTORE, ROOT, cleanIdle - 1000, cleanIdle, cleanIdle - 20
 readFailRow = rowFor(READFAIL, ROOT, cleanIdle - 1000, cleanIdle, cleanIdle - 20_000);
 const cleanNotices = notices.length;
 const deletedBefore = deleted.length;
+// A dry run lists the idle thread, keeps the busy one, and names the adopted one.
+await command("oc-clean").handler("", ctx);
+const dryNotice = notices.slice(cleanNotices).join("\n");
+check(
+  "clean dry run",
+  dryNotice.includes("dry run") && dryNotice.includes(IDLE_RESTORE) && deleted.length === deletedBefore,
+  dryNotice,
+);
+check(
+  "clean busy and adopted kept",
+  dryNotice.includes("1 busy kept") && dryNotice.includes("because adopted") && dryNotice.includes(READFAIL),
+  dryNotice,
+);
+const forceNotices = notices.length;
 await command("oc-clean").handler("force", ctx);
-const cleanNotice = notices.slice(cleanNotices).join("\n");
+const cleanNotice = notices.slice(forceNotices).join("\n");
 console.log("clean ->", cleanNotice);
 check(
   "clean deletes idle",

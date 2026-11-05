@@ -33,6 +33,9 @@
  *   panemode item 24 — a switch from TUI to print closes the old columns.
  *   busyexp  item 32 — a busy run keeps its watch past the TTL and reports its real settle once.
  *   expirepane item 32 — an expired watch leaves its column open.
+ *   reply    item 30 — oc_reply accepts a permission and refuses a form without answerJson.
+ *   kill     item 30 — /oc-kill interrupts the thread and drops its watch.
+ *   readbounds item 30 — oc_read caps the limit at 25 and names an offset past the end.
  *
  * Run: CASE=expire bun run checks/check-3-unit.ts   (from the package root)
  */
@@ -85,6 +88,10 @@ let askReads = 0;
 let creates = 0;
 let detailGets = 0;
 let sessionGets = 0;
+let interrupts = 0;
+const messageLimits: number[] = [];
+const replies: string[] = [];
+const notices: string[] = [];
 // The busyexp case keeps the thread busy past one TTL, then settles it with a real answer.
 let busyAt = 0;
 let idleAt = 0;
@@ -132,7 +139,31 @@ Bun.serve({
         : json({ accepted: true });
     }
     if (p.endsWith("/diff")) return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
+    if (req.method === "POST" && p.endsWith("/permission/per_1/reply")) {
+      const body = await req.json() as { decision?: string };
+      replies.push(`permission:${body.decision}`);
+      return json({});
+    }
+    if (req.method === "POST" && p.endsWith("/form/frm_1/reply")) {
+      replies.push("form");
+      return json({});
+    }
+    if (req.method === "POST" && p.endsWith("/interrupt")) {
+      interrupts++;
+      return new Response('{"interrupted":true}', { status: 200, headers: { "content-type": "application/json" } });
+    }
     if (p.endsWith("/message")) {
+      messageLimits.push(Number(new URL(req.url).searchParams.get("limit") ?? 0));
+      if (CASE === "readbounds") {
+        return json(Array.from({ length: 40 }, (_, index) => ({
+          id: `msg_${index}`,
+          type: "assistant",
+          time: { created: 1000 + index },
+          content: [{ type: "text", text: `row ${index} ${"x".repeat(100)}` }],
+          tokens: {},
+          cost: 0,
+        })));
+      }
       if (CASE === "handle" && answerMode === "404") {
         return new Response('{"error":"gone"}', { status: 404, headers: { "content-type": "application/json" } });
       }
@@ -146,13 +177,24 @@ Bun.serve({
         ? json([{ type: "assistant", time: { created: realAt }, content: [{ type: "text", text: "REAL" }] }])
         : json([]);
     }
-    if (p.endsWith("/permission") || p.endsWith("/form")) {
+    if (p.endsWith("/permission")) {
       askReads++;
       // The askfail case settles a run but cannot read its asks, so the report says "unreadable".
       if (CASE === "askfail") {
         return new Response('{"error":"boom"}', { status: 500, headers: { "content-type": "application/json" } });
       }
-      return json([]);
+      return CASE === "reply"
+        ? json([{ id: "per_1", action: "bash", resources: ["ls"] }])
+        : json([]);
+    }
+    if (p.endsWith("/form")) {
+      askReads++;
+      if (CASE === "askfail") {
+        return new Response('{"error":"boom"}', { status: 500, headers: { "content-type": "application/json" } });
+      }
+      return CASE === "reply"
+        ? json([{ id: "frm_1", title: "Pick", fields: [{ key: "lane", type: "string", required: true }] }])
+        : json([]);
     }
     // idle 0 with completed set: not busy, and nothing newer than any `since` floor.
     if (/^\/api\/session\/ses_/.test(p)) {
@@ -215,10 +257,12 @@ if (CASE === "panemode" || CASE === "expirepane") process.env.OC_PANES = fakePan
 const sent: string[] = [];
 let sends = 0;
 const tools = new Map<string, any>();
+const commands = new Map<string, { handler: (args: string, context: unknown) => unknown }>();
 const handlers = new Map<string, (event: any, ctx: any) => unknown>();
 const piStub = {
   registerTool: (tool: any) => tools.set(tool.name, tool),
-  registerCommand: () => {},
+  registerCommand: (name: string, command: { handler: (args: string, context: unknown) => unknown }) =>
+    commands.set(name, command),
   registerFlag: () => {},
   on: (event: string, handler: any) => handlers.set(event, handler),
   getFlag: () => undefined,
@@ -235,7 +279,12 @@ const ctx = {
   mode: "rpc",
   hasUI: false,
   isIdle: () => true,
-  ui: { confirm: async () => true, notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+  ui: {
+    confirm: async () => true,
+    notify: (text: string) => notices.push(text),
+    setStatus: () => {},
+    setWidget: () => {},
+  },
   sessionManager: { getEntries: () => [] },
 };
 
@@ -258,6 +307,13 @@ const tool = (name: string) => {
 const fire = (name: string) => {
   const found = handlers.get(name);
   if (!found) throw new Error(`no handler ${name}`);
+  return found;
+};
+
+/** Registered slash commands; a miss means the bridge renamed the command. */
+const command = (name: string) => {
+  const found = commands.get(name);
+  if (!found) throw new Error(`no command ${name}`);
   return found;
 };
 
@@ -554,6 +610,44 @@ if (CASE === "4xx") {
   verdict = log.includes("add") && log.includes("rm")
     ? "PASS  item 24: a switch from TUI to print closed the old columns"
     : "FAIL  item 24: the mode switch left the old columns open";
+} else if (CASE === "reply") {
+  const accepted = await tool("oc_reply").execute("r1", { session: ID, id: "per_1", decision: "once" });
+  const acceptedText = accepted.content.map((part: any) => part.text).join(" ");
+  let wrong = "";
+  try {
+    await tool("oc_reply").execute("r2", { session: ID, id: "frm_1", decision: "once" });
+  } catch (error) {
+    wrong = String(error);
+  }
+  console.log("accepted ->", JSON.stringify(acceptedText), "replies", JSON.stringify(replies), "wrong ->", JSON.stringify(wrong));
+  verdict = acceptedText.includes("permission per_1 -> once")
+    && replies[0] === "permission:once"
+    && wrong.includes("needs answerJson")
+    ? "PASS  item 30: oc_reply accepted a permission and refused a form without answerJson"
+    : "FAIL  item 30: oc_reply accepted or refused the wrong ask";
+} else if (CASE === "kill") {
+  ctx.hasUI = true;
+  await tool("oc_send").execute("k", { session: ID, text: "run" });
+  const before = notices.length;
+  await command("oc-kill").handler(ID, ctx);
+  const notice = notices.slice(before).join("\n");
+  const probe = await tool("oc_wait").execute("k2", { session: ID, timeoutSec: 0 });
+  const probeText = probe.content.map((part: any) => part.text).join(" ");
+  ctx.hasUI = false;
+  console.log("kill ->", JSON.stringify(notice), "interrupts", interrupts, "probe ->", JSON.stringify(probeText));
+  verdict = notice.includes(`interrupted ${ID}`) && interrupts === 1 && probeText.includes("no watch is armed")
+    ? "PASS  item 30: /oc-kill interrupted the thread and dropped its watch"
+    : "FAIL  item 30: /oc-kill did not interrupt or did not drop the watch";
+} else if (CASE === "readbounds") {
+  const many = await tool("oc_read").execute("r1", { session: ID, limit: 100 });
+  const manyText = many.content.map((part: any) => part.text).join(" ");
+  const count = (manyText.match(/\[assistant/g) ?? []).length;
+  const offset = await tool("oc_read").execute("r2", { session: ID, limit: 1, offset: 999999 });
+  const offsetText = offset.content.map((part: any) => part.text).join(" ");
+  console.log(`message limits ${messageLimits.join(",")}; rows ${count}; offset ${JSON.stringify(offsetText.slice(0, 80))}`);
+  verdict = messageLimits[0] === 27 && count === 25 && offsetText.includes("no text past offset 999999")
+    ? "PASS  item 30: oc_read capped the limit at 25 and named an offset past the end"
+    : "FAIL  item 30: oc_read ignored the limit ceiling or the offset marker";
 } else if (CASE === "busyexp") {
   // A watch at its deadline must not expire a run that is still busy.
   busyAt = Date.now();

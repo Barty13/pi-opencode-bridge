@@ -3,7 +3,7 @@
 This page lists every environment variable that the bridge and its helper scripts read, with its
 reader, default, and effect.
 
-The bridge reads 14 of these variables. The other 8 belong to `oc-rpc.ts`, `oc-panes`, and the check
+The bridge reads 14 of these variables. The other 7 belong to `oc-rpc.ts`, `oc-panes`, and the check
 scripts. The reader column names the file that reads the variable.
 
 | Variable | Reader | Default | Effect |
@@ -27,7 +27,6 @@ scripts. The reader column names the file that reads the variable.
 | `OC_RPC_DEADLINE_MS` | oc-rpc | `240_000` | Deadline for the RPC check, in ms. |
 | `OC_EXTENSION` | oc-rpc | `opencode-bridge.ts next to oc-rpc.ts` | Extension file that the RPC check loads. |
 | `OC_PANES_FONT` | oc-panes | `13` | Font size in a new pane. |
-| `OC_PANES_COLS` | oc-panes | `0` | Column width. `0` lets Ghostty split evenly. |
 | `OC_CHECK_MODEL` | checks | `required` | Model id for `check-tui.sh` and `check-reload.sh`. |
 | `BRIDGE` | checks | `the repo's opencode-bridge.ts` | Build under test. The bridge checks import it; `check-12-docs` reads it as a docs bundle. |
 

@@ -371,6 +371,12 @@ function disarm(state: BridgeState, session: string, settle?: Settle): void {
 }
 
 let service: Service | null = null;
+/** The batch entry that names this thread directly or inside a fan-out report. */
+function batchIndexFor(state: BridgeState, session: string): number {
+  return state.batch.findIndex((entry) =>
+    entry.session === session || (entry.runs ?? []).some((run) => run.session === session)
+  );
+}
 let modelCache: {
   at: number;
   ids: string[];
@@ -1867,6 +1873,41 @@ export default function (pi: ExtensionAPI) {
     drawHud();
   };
 
+  /**
+   * Stop a thread, or only drop its watch when `detach` is set. The caller formats the receipt.
+   * A settle already in the batch rides in the result, because `unwatch` would erase it.
+   */
+  const stopThread = async (
+    session: string,
+    detach: boolean,
+  ): Promise<{ armed: boolean; hit: boolean; queued: Settle | null }> => {
+    await assertLocal(state, session);
+    if (detach) {
+      const armed = state.armed.has(session);
+      unwatch(state, session);
+      drawHud();
+      return { armed, hit: false, queued: null };
+    }
+    // Unwatch first: this call carries the result, so the interrupted event owes no turn. Waiters
+    // stay, because a failed interrupt leaves the run live for them.
+    const prior = state.armed.get(session);
+    // A settle the stream missed sits in the batch; unwatch would erase it, so this call carries it.
+    const queuedIndex = batchIndexFor(state, session);
+    const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
+    unwatch(state, session);
+    const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`).catch((error) => {
+      // The POST failed, so a run may still be going: the watch goes back.
+      if (prior) state.armed.set(session, prior);
+      if (queued) state.batch.push(queued);
+      drawHud();
+      throw error;
+    });
+    releaseWaiters(state, session);
+    const hit = result.interrupted === true;
+    paneCall(["rm", session]);
+    return { armed: prior !== undefined, hit, queued };
+  };
+
   /** Adopt a thread the bridge did not open: one watch while it runs, floor behind its in-flight rows. */
   const attach = async (session: string): Promise<string> => {
     const row = (await api<any>("GET", `/api/session/${session}`)).data;
@@ -2665,7 +2706,7 @@ export default function (pi: ExtensionAPI) {
         }
         // A settle the stream missed sits in the batch and names the run this rewind reverts.
         // Take it out, so a wake-up cannot report a run that is no longer there.
-        const queuedIndex = state.batch.findIndex((entry) => entry.session === session);
+        const queuedIndex = batchIndexFor(state, session);
         const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
         const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept })
           .catch((error) => {
@@ -2755,9 +2796,7 @@ export default function (pi: ExtensionAPI) {
         const floor = params.since ?? w?.floor ?? ceilingFloor ?? 0;
         // A settle that already reached the batch is this call's answer: take it, do not wake twice.
         // A fan-out report covers several sessions, so match any run it names.
-        const queued = mine.batch.findIndex((entry) =>
-          entry.session === params.session || (entry.runs ?? []).some((run) => run.session === params.session)
-        );
+        const queued = batchIndexFor(mine, params.session);
         let settle = queued >= 0 ? mine.batch.splice(queued, 1)[0] : null;
         // was: if (settle) mine.claimed.delete(...) — dead: every batch append clears the claim (:698).
         if (settle && !mine.batch.length) mine.batchWaited = false;
@@ -2956,36 +2995,16 @@ export default function (pi: ExtensionAPI) {
         detach: Type.Optional(Type.Boolean({ description: "Drop the watch only; the run keeps going" })),
       }),
       async execute(_id, params) {
-        await assertLocal(state, params.session);
+        const stop = await stopThread(params.session, params.detach === true);
         if (params.detach) {
-          const armed = state.armed.has(params.session);
-          unwatch(state, params.session);
-          drawHud();
           return {
-            content: [{ type: "text", text: armed ? "detached; the run keeps going" : "no watch to detach" }],
-            details: { session: params.session, detached: armed, interrupted: false },
+            content: [{ type: "text", text: stop.armed ? "detached; the run keeps going" : "no watch to detach" }],
+            details: { session: params.session, detached: stop.armed, interrupted: false },
           };
         }
-        // Unwatch first: this call carries the result, so the interrupted event owes no turn. Waiters
-        // stay, because a failed interrupt leaves the run live for them.
-        const prior = state.armed.get(params.session);
-        // A settle the stream missed sits in the batch; unwatch would erase it (:176), so this call carries it.
-        const queuedIndex = state.batch.findIndex((entry) => entry.session === params.session);
-        const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
-        unwatch(state, params.session);
-        const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${params.session}/interrupt`).catch((error) => {
-          // The POST failed, so a run may still be going: the watch goes back.
-          if (prior) state.armed.set(params.session, prior);
-          if (queued) state.batch.push(queued);
-          drawHud();
-          throw error;
-        });
-        releaseWaiters(state, params.session);
-        const hit = result.interrupted === true;
-        paneCall(["rm", params.session]);
         return {
-          content: [{ type: "text", text: `${hit ? "interrupted" : "no run to interrupt"}${queued ? `\n\nThe run had already settled:\n${settleText(queued)}` : ""}` }],
-          details: { session: params.session, detached: false, interrupted: hit },
+          content: [{ type: "text", text: `${stop.hit ? "interrupted" : "no run to interrupt"}${stop.queued ? `\n\nThe run had already settled:\n${settleText(stop.queued)}` : ""}` }],
+          details: { session: params.session, detached: false, interrupted: stop.hit },
         };
       },
     }),
@@ -3098,21 +3117,8 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, context) => {
       const session = args.trim();
       if (!session.startsWith("ses_")) return say(context, "usage: /oc-kill <ses_...>");
-      await assertLocal(state, session);
-      const prior = state.armed.get(session);
-      // A settle the stream missed sits in the batch; unwatch would erase it (:176), so this call carries it.
-      const queuedIndex = state.batch.findIndex((entry) => entry.session === session);
-      const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
-      unwatch(state, session);
-      const result = await api<{ interrupted?: boolean }>("POST", `/api/session/${session}/interrupt`).catch((error) => {
-        if (prior) state.armed.set(session, prior);
-        if (queued) state.batch.push(queued);
-        drawHud();
-        throw error;
-      });
-      releaseWaiters(state, session);
-      paneCall(["rm", session]);
-      say(context, `${result.interrupted === true ? `interrupted ${session}` : `no run to interrupt in ${session}`}${queued ? `\n\nThe run had already settled:\n${settleText(queued)}` : ""}`);
+      const stop = await stopThread(session, false);
+      say(context, `${stop.hit ? `interrupted ${session}` : `no run to interrupt in ${session}`}${stop.queued ? `\n\nThe run had already settled:\n${settleText(stop.queued)}` : ""}`);
     },
   });
 
