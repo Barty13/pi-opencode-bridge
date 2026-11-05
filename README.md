@@ -30,7 +30,10 @@ $ OC_ROOT=~/work/threads pi
 
 ```
 > /oc
-mode: supervised · service: http://127.0.0.1:… · threads: 0 armed
+mode: supervised
+service: http://127.0.0.1:…
+armed: 0
+served: opencode-go/…
 > oc_models
 > oc_open  model: <id from oc_models>  title: refactor-parser  brief: …
 ```
@@ -101,7 +104,9 @@ An update takes effect on the next restart or resume: a running pi keeps the cod
 A batch that lands while you type waits for you. A batch held by compaction waits for the compact
 to end. An escape (abort) holds the batch, so a wake-up cannot reopen a conversation you dropped.
 
-Print, JSON, and a Pi reload carry no wake-up. There `oc_wait` is the collector.
+Print and JSON carry no wake-up. A reload restores an armed watch from `oc-armed` while the thread
+still runs; a settle that landed while the thread went idle during the reload has no wake-up, and a
+queued batch is lost. There `oc_wait` is the collector.
 
 ## Attach
 
@@ -111,6 +116,7 @@ session left. It reports the title, model, variant, size, open asks, and `runnin
 ```
 attached ses_… "attach-probe"
 model: opencode-go/glm-5.3-flash variant default · 8k tokens · open asks: none · idle
+attached; idle, watch starts with your next oc_send
 ```
 
 A running thread gets one watch with the floor just behind its current run, so the answer it already
@@ -205,7 +211,7 @@ variant, tokens, cost), then the Go meters, then any console `budgets[]` as `spe
 per-model spent:
 
 ```
-ses_…  opencode-go/glm-5.3-flash max  1.4M tok  ~$0.85
+ses_…  opencode-go/glm-5.3-flash max  1400k tok  ~$0.8500
 go rolling 45% · resets 21:40 · weekly 45% · monthly 23%
 budget org_…: $1.25 / $10.00 · opencode-go/glm-5.3-flash $0.40
 ```
@@ -226,9 +232,10 @@ Two ceilings, both off at `0`:
 
 - `OC_BUDGET_PCT` refuses `oc_open` and `oc_send` while the Go rolling meter is at or above the
   percent, and names `resetsAt`.
-- `OC_BUDGET_TOKENS` caps the tokens of threads this Pi session opened. A send that would cross the
-  cap is refused and names the thread that crossed it. `oc_attach` does not add a thread's history
-  to the cap; `/oc-budget` still lists adopted live threads with their cost.
+- `OC_BUDGET_TOKENS` caps the tokens of threads this Pi session delegated to. `oc_open`, `oc_send`,
+  and `oc_fanout` refuse when the delegated total is at or above the cap, and the refusal names the
+  thread that crossed it. `oc_attach` does not add a thread's history to the cap; `/oc-budget` still
+  lists adopted live threads with their cost.
 
 ## Fan-out
 
@@ -318,7 +325,9 @@ $ OC_RPC_MODEL=<id from oc_models> bun run oc-rpc.ts   # wake-up path, costs tok
 
 - One OpenCode service per bridge, no remote host, no proxy.
 - Live columns need macOS plus Ghostty. They stay off in print, JSON, and RPC mode.
-- 32 open threads at most. A watch older than `OC_WATCH_TTL_S` expires and reports itself.
+- 32 armed watches at most. An `oc_open` without a brief creates an idle thread with no watch. A
+  fan-out refuses when the active runs or armed watches plus its new members exceed 32. A watch
+  older than `OC_WATCH_TTL_S` expires and reports itself.
 - Message bodies cap at 4000 characters per read; `offset` pages past the cap.
 - Deleting a thread outside the bridge does not cancel its armed watch, so its wake-up still fires.
   Clean up after the settle with `/oc-clean force`, not mid-run.

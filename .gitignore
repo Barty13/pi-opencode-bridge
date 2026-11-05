@@ -3,14 +3,7 @@ gallery/.vendor/
 *.bak-*
 pnpm-lock.yaml
 pnpm-workspace.yaml
+# Full bridge copies for the manual control runs. The gate controls are tracked.
 .control-bridge.ts
 .control-compact.ts
 .DS_Store
-.control-nogate.ts
-.control-digest.ts
-.control-steer.ts
-.control-attach.ts
-.control-rewind.ts
-.control-budget.ts
-.control-fanout.ts
-.control-manual.ts

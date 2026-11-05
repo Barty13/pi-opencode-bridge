@@ -343,6 +343,8 @@ restore (`reload`).
 
 The control carries two defects: the `oc_fanout` section is gone (`inventory`), and `OC_DEBOUNCE_MS` reads `500` (`env`). Both cases must fail. The stage-12 control is a copy of the manual, not a build of the extension; `BRIDGE` names the manual under test.
 
+The `env` case covers the twenty `OC_*` and `BRIDGE` names in the Environment table: twelve for the bridge, four for `oc-rpc.ts`, two for `oc-panes`, and two for the check scripts. `CASE`, `PATH`, and other check-local selectors are out of scope on purpose.
+
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
 compaction row precedes the reply and the size dropped. It prints `SKIP` when no thread qualifies.
