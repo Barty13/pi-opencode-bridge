@@ -17,7 +17,7 @@ bun run checks/make-controls.ts
 Run from the package root. `BRIDGE` points a check at a control build.
 
 ```sh
-for c in 4xx 5xx nowatch expire stale dup ceiling handle flush streamgap envparse perms loopback known askfail rootfile ceilenv abortlist panemode busyexp expirepane reply kill readbounds; do CASE=$c bun run checks/check-3-unit.ts; done
+for c in 4xx 5xx nowatch expire stale dup ceiling handle flush streamgap envparse perms loopback known askfail rootfile ceilenv abortlist panemode busyexp expirepane reply kill readbounds sparse; do CASE=$c bun run checks/check-3-unit.ts; done
 bun run checks/check-1-compact.ts
 BRIDGE=file://$PWD/.control-bridge.ts CASE=stale bun run checks/check-3-unit.ts   # must fail
 BRIDGE=file://$PWD/.control-bridge.ts CASE=dup bun run checks/check-3-unit.ts     # must fail
@@ -69,6 +69,7 @@ bun run checks/check-13-panes.ts
 | `reply` | `oc_reply` accepts a permission and refuses a form without `answerJson` |
 | `kill` | `/oc-kill` interrupts the thread and drops its watch |
 | `readbounds` | `oc_read` caps the limit at 25 and names an offset past the end |
+| `sparse` | a session row with no outcome, idle, or tokens reports `unknown` and invents no token number |
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
 

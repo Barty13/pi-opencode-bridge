@@ -83,8 +83,8 @@ const defects: Record<string, Defect[]> = {
       name: "the digest ignores the newest compaction",
       apply: (s) => patch(
         s,
-        "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));",
-        "  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > floor);",
+        "  const digestRows = fresh.filter((entry) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));",
+        "  const digestRows = fresh.filter((entry) => Number(entry?.time?.created ?? 0) > floor);",
       ),
     },
   ],
@@ -128,7 +128,7 @@ ${claimed}`);
     // carries the run. An idle thread's floor sits at its last idle and excludes the old run.
     const floor = running ? Number(row?.time?.busy ?? 0) - 1 : Number(row?.time?.idle ?? 0);`;
         return patch(s, floor, `    const running = busy(row);
-    const newest = (await api<any>("GET", \`/api/session/\${session}/message?order=desc&limit=1\`)).data?.[0];
+    const newest = (await api<ServiceReply<MessageRow[]>>("GET", \`/api/session/\${session}/message?order=desc&limit=1\`)).data?.[0];
     const floor = Number(newest?.time?.created ?? 0);`);
       },
     },
@@ -154,12 +154,12 @@ ${claimed}`);
       name: "an adopted thread is deleted by /oc-clean",
       apply: (s) => patch(
         s,
-        `      const adopted = rows.filter((row: any) => state.attached.has(row.id));
-      const kept = rows.filter((row: any) => busy(row) && !state.attached.has(row.id));
-      const done = rows.filter((row: any) => !busy(row) && !state.attached.has(row.id));`,
-        `      const adopted = rows.filter((row: any) => false);
-      const kept = rows.filter((row: any) => busy(row));
-      const done = rows.filter((row: any) => !busy(row));`,
+        `      const adopted = rows.filter((row) => state.attached.has(row.id));
+      const kept = rows.filter((row) => busy(row) && !state.attached.has(row.id));
+      const done = rows.filter((row) => !busy(row) && !state.attached.has(row.id));`,
+        `      const adopted = rows.filter((row) => false);
+      const kept = rows.filter((row) => busy(row));
+      const done = rows.filter((row) => !busy(row));`,
       ),
     },
   ],
@@ -168,12 +168,12 @@ ${claimed}`);
       name: "the newest user row becomes the target",
       apply: (s) => patch(
         s,
-        `        const current = (await api<any>("GET", \`/api/session/\${session}\`)).data;
+        `        const current = (await api<ServiceReply<SessionRow>>("GET", \`/api/session/\${session}\`)).data;
         noteThread(state, current);
         // The run opener is the oldest user row at or after busy; a steer writes a newer user row.
         const floor = Number(current?.time?.busy ?? 0) - 1;
-        const rows = (await api<any>("GET", \`/api/session/\${session}/message?order=desc&limit=\${DIGEST_ROWS}\`)).data ?? [];
-        const at = rows.findLastIndex((row: any) =>
+        const rows = (await api<ServiceReply<MessageRow[]>>("GET", \`/api/session/\${session}/message?order=desc&limit=\${DIGEST_ROWS}\`)).data ?? [];
+        const at = rows.findLastIndex((row) =>
           row.type === "user" && Number(row?.time?.created ?? 0) >= floor
         );
         if (at < 0) {
@@ -182,8 +182,8 @@ ${claimed}`);
           );
         }`,
         `        // The newest user row opens the last run; the rows newer than it carry that run's tools.
-        const rows = (await api<any>("GET", \`/api/session/\${session}/message?order=desc&limit=\${DIGEST_ROWS}\`)).data ?? [];
-        const at = rows.findIndex((row: any) => row.type === "user");
+        const rows = (await api<ServiceReply<MessageRow[]>>("GET", \`/api/session/\${session}/message?order=desc&limit=\${DIGEST_ROWS}\`)).data ?? [];
+        const at = rows.findIndex((row) => row.type === "user");
         if (at < 0) throw new Error(\`thread \${session} has no user message to rewind\`);`,
       ),
     },
@@ -312,10 +312,10 @@ ${claimed}`);
         `        // The cap runs before any create, so a refusal leaves the service untouched.
         // The active map carries no directory, so each active id gets one detail read and
         // \`underRoot\` filters out runs from other projects and other Pi sessions.
-        const active = await api<any>("GET", "/api/session/active");
+        const active = await api<ServiceReply<Record<string, unknown>>>("GET", "/api/session/active");
         const activeIds = Object.keys(active?.data ?? {});
         const activeRows = await Promise.all(activeIds.map((id) =>
-          api<any>("GET", \`/api/session/\${id}\`).then((res) => res?.data).catch(() => null)
+          api<ServiceReply<SessionRow>>("GET", \`/api/session/\${id}\`).then((res) => res?.data).catch(() => null)
         ));
         const activeLive = activeRows.filter(underRoot).length;
         // Active runs under the root and this bridge's own armed watches are both live; the larger count wins.

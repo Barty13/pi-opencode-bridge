@@ -36,6 +36,7 @@
  *   reply    item 30 — oc_reply accepts a permission and refuses a form without answerJson.
  *   kill     item 30 — /oc-kill interrupts the thread and drops its watch.
  *   readbounds item 30 — oc_read caps the limit at 25 and names an offset past the end.
+ *   sparse   item 28 — a session row with no outcome, idle, or tokens still reports the same text.
  *
  * Run: CASE=expire bun run checks/check-3-unit.ts   (from the package root)
  */
@@ -200,6 +201,10 @@ Bun.serve({
     if (/^\/api\/session\/ses_/.test(p)) {
       detailGets++;
       if (p === `/api/session/${ID}`) sessionGets++;
+      if (CASE === "sparse" && p === `/api/session/${ID}`) {
+        // No outcome, no tokens, no model: the report must still name only what arrived.
+        return json({ id: ID, title: "sparse", location: { directory: ROOT }, time: { idle: realAt } });
+      }
       if (CASE === "busyexp" && p === `/api/session/${ID}`) {
         return json({
           id: ID,
@@ -610,6 +615,18 @@ if (CASE === "4xx") {
   verdict = log.includes("add") && log.includes("rm")
     ? "PASS  item 24: a switch from TUI to print closed the old columns"
     : "FAIL  item 24: the mode switch left the old columns open";
+} else if (CASE === "sparse") {
+  realAt = Date.now() + 10;
+  const probe = await tool("oc_wait").execute("s", { session: ID, since: 1 });
+  const text = probe.content.map((part: any) => part.text).join(" ");
+  console.log("sparse ->", JSON.stringify(text));
+  verdict = text.includes("outcome: unknown")
+    && text.includes("answer:\nREAL")
+    && text.includes("open asks: none")
+    && !text.includes("tokens in/out")
+    && probe.details?.settled === true
+    ? "PASS  item 28: a sparse session row reports unknown and invents no token number"
+    : "FAIL  item 28: a sparse session row changed the report text";
 } else if (CASE === "reply") {
   const accepted = await tool("oc_reply").execute("r1", { session: ID, id: "per_1", decision: "once" });
   const acceptedText = accepted.content.map((part: any) => part.text).join(" ");

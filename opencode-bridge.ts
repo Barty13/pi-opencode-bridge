@@ -35,6 +35,7 @@ import { promisify } from "node:util";
 import { Type } from "@earendil-works/pi-ai";
 import {
   defineTool,
+  type CustomEntry,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -116,6 +117,146 @@ interface Ask {
   id: string;
   label: string;
   raw: unknown;
+}
+
+/** One token count block on a session or message row. A missing field reads as 0 today. */
+interface TokenCounts {
+  input?: number;
+  output?: number;
+  reasoning?: number;
+  cache?: { read?: number; write?: number };
+}
+
+/** An error block on a session, message, or tool state. */
+interface ServiceError {
+  message?: string;
+  retryAfterMs?: number;
+}
+
+/** Session.Info fields the bridge reads. The service lists every project, so `location` matters. */
+interface SessionRow {
+  id: string;
+  title?: string;
+  outcome?: string;
+  model?: { providerID?: string; id?: string; variant?: string };
+  tokens?: TokenCounts;
+  cost?: number;
+  time?: { busy?: number; idle?: number; updated?: number };
+  location?: { directory?: string };
+}
+
+/** One tool call state inside an assistant part. */
+interface ToolState {
+  status?: string;
+  input?: { path?: string; [key: string]: unknown };
+  content?: Array<{ text?: string }>;
+  error?: ServiceError;
+  metadata?: { exit?: number };
+}
+
+/** One content part on a message row. Parts the bridge does not read keep only their type. */
+interface MessagePart {
+  type?: string;
+  text?: string;
+  name?: string;
+  state?: ToolState;
+}
+
+/** One row from GET /api/session/:id/message. */
+interface MessageRow {
+  id?: string;
+  type: string;
+  time?: { created?: number };
+  outcome?: string;
+  error?: ServiceError | null;
+  text?: string;
+  name?: string;
+  skill?: string;
+  output?: { output?: string };
+  status?: string;
+  exit?: number;
+  command?: string;
+  summary?: string;
+  reason?: string;
+  content?: MessagePart[];
+  finish?: string;
+  tokens?: TokenCounts;
+  cost?: number;
+}
+
+/** One permission ask from GET /api/session/:id/permission. */
+interface PermissionAskRow {
+  id: string;
+  action?: string;
+  resources?: string[];
+}
+
+/** One option in a form field. */
+interface FormOptionRow {
+  value?: string;
+}
+
+/** One field in a form ask. */
+interface FormFieldRow {
+  key?: string;
+  type?: string;
+  required?: boolean;
+  title?: string;
+  description?: string;
+  default?: unknown;
+  options?: FormOptionRow[];
+}
+
+/** One form ask from GET /api/session/:id/form. */
+interface FormAskRow {
+  id: string;
+  title?: string;
+  fields?: FormFieldRow[];
+}
+
+/** One list price from GET /api/model. */
+interface ModelPrice {
+  input?: number;
+  output?: number;
+  cache?: { read?: number; write?: number };
+}
+
+/** One model row from GET /api/model; only the identity, ladder, and price are read. */
+interface ModelRow {
+  providerID: string;
+  modelID: string;
+  variants?: Array<{ id: string }>;
+  cost?: ModelPrice[];
+}
+
+/** A reply whose `data` may be absent, as on a read that a 404 ends. */
+interface ServiceReply<T> {
+  data?: T;
+}
+
+/** A reply whose `data` is always present on success, as on a create. */
+interface ServiceData<T> {
+  data: T;
+}
+
+/** One ask event on the stream; the form event wraps it in `data.form`. */
+interface AskEventData {
+  id: string;
+  sessionID?: string;
+  action?: string;
+  resources?: string[];
+  title?: string;
+}
+
+/** One stream frame the bridge reads. Other frame types keep only their name. */
+interface ServiceEvent {
+  type?: string;
+  data?: AskEventData & { form?: AskEventData };
+}
+
+/** The file list from POST /api/session/:id/revert/stage. */
+interface RevertStage {
+  files?: Array<{ file?: string }>;
 }
 
 /** A send whose settle has not reached the model yet. `floor` is set before the prompt POST. */
@@ -381,7 +522,7 @@ let modelCache: {
   at: number;
   ids: string[];
   variants: Map<string, string[]>;
-  costs: Map<string, any>;
+  costs: Map<string, ModelPrice>;
 } = {
   at: 0,
   ids: [],
@@ -439,7 +580,7 @@ function serviceHandle(): Promise<Service> {
 }
 
 /** One retry after rediscovery: the port changes on restart, and a dead service can answer non-JSON. */
-async function api<T = any>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function api<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const send = async (svc: Service) => {
     const res = await fetch(svc.url + path, {
       method,
@@ -480,7 +621,7 @@ async function api<T = any>(method: string, path: string, body?: unknown, signal
  * the list. exec runs async: a sync 5s call would freeze the TUI. */
 async function cheapModels(
   force = false,
-): Promise<{ ids: string[]; variants: Map<string, string[]>; costs: Map<string, any> }> {
+): Promise<{ ids: string[]; variants: Map<string, string[]>; costs: Map<string, ModelPrice> }> {
   if (!force && Date.now() - modelCache.at < 60_000) return modelCache;
   const { stdout } = await promisify(execFile)("opencode", ["models"], { encoding: "utf8", timeout: 5_000 });
   const ids = stdout
@@ -488,12 +629,13 @@ async function cheapModels(
     .map((line) => line.trim())
     .filter((line) => line.startsWith("opencode-go/") || line.endsWith("-free"));
   const variants = new Map<string, string[]>();
-  const costs = new Map<string, any>();
-  const rows = await api<any>("GET", "/api/model").catch(() => ({ data: [] as any[] }));
+  const costs = new Map<string, ModelPrice>();
+  const rows = await api<ServiceReply<ModelRow[]>>("GET", "/api/model").catch((): ServiceReply<ModelRow[]> => ({ data: [] }));
   for (const row of rows.data ?? []) {
     const key = `${row.providerID}/${row.modelID}`;
-    variants.set(key, (row.variants ?? []).map((v: any) => v.id));
-    costs.set(key, (row.cost ?? [])[0]);
+    variants.set(key, (row.variants ?? []).map((variant) => variant.id));
+    const price = (row.cost ?? [])[0];
+    if (price) costs.set(key, price);
   }
   modelCache = { at: Date.now(), ids, variants, costs };
   return modelCache;
@@ -590,7 +732,7 @@ function directory(input?: string): string {
  * thread in /tmp would otherwise read and take prompts through this bridge. */
 async function assertLocal(state: BridgeState, session: string): Promise<void> {
   if (state.local.has(session)) return;
-  const row = (await api<any>("GET", `/api/session/${session}`)).data;
+  const row = (await api<ServiceReply<SessionRow>>("GET", `/api/session/${session}`)).data;
   const reported = String(row?.location?.directory ?? "");
   // Compare real paths, so a symlink under the root cannot pass for a thread that lives outside it.
   let dir = reported;
@@ -627,11 +769,11 @@ function forget(state: BridgeState, session: string): void {
   disarm(state, session);
 }
 
-function textOf(parts: unknown): string {
+function textOf(parts: MessagePart[] | string | undefined): string {
   if (typeof parts === "string") return parts;
   if (!Array.isArray(parts)) return "";
   return parts
-    .map((part: any) => (part?.type === "text" ? String(part.text ?? "") : ""))
+    .map((part) => (part?.type === "text" ? String(part.text ?? "") : ""))
     .join("")
     .trim();
 }
@@ -649,12 +791,12 @@ function clip(text: string): string {
   return text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}…` : text;
 }
 
-async function recentRows(session: string, want = 8): Promise<any[]> {
-  return (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${want}`)).data ?? [];
+async function recentRows(session: string, want = 8): Promise<MessageRow[]> {
+  return (await api<ServiceReply<MessageRow[]>>("GET", `/api/session/${session}/message?order=desc&limit=${want}`)).data ?? [];
 }
 
 /** Thread size in tokens: input, cache, output, and reasoning. */
-function sizeOf(row: any): number {
+function sizeOf(row: { tokens?: TokenCounts }): number {
   const t = row?.tokens ?? {};
   return (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0);
 }
@@ -679,13 +821,13 @@ function clock(): string {
   return new Date().toTimeString().slice(0, 8);
 }
 
-function money(row: any): string {
+function money(row: MessageRow): string {
   const t = row?.tokens ?? {};
   return `tokens in/out/reasoning ${t.input ?? 0}/${t.output ?? 0}/${t.reasoning ?? 0}, cache ${t.cache?.read ?? 0}, cost ${row?.cost ?? 0}`;
 }
 
 /** Record the Session.Info numbers a read already carries; this function never fetches. */
-function noteThread(state: BridgeState, row: any): void {
+function noteThread(state: BridgeState, row: SessionRow | null | undefined): void {
   const id = String(row?.id ?? "");
   if (!id) return;
   const before = state.info.get(id);
@@ -710,7 +852,7 @@ function threadTokens(info?: ThreadInfo): number {
 
 /** Session.Info cost when the service reports one, else a `~` list-price estimate from /api/model.
  * With no price row there is no dollar figure at all, so the row keeps only its token count. */
-function threadCost(info: ThreadInfo | undefined, costs: Map<string, any>): string {
+function threadCost(info: ThreadInfo | undefined, costs: Map<string, ModelPrice>): string {
   if (!info) return "";
   if (info.cost > 0) return `$${info.cost.toFixed(4)}`;
   const price = costs.get(`${info.providerID}/${info.model}`);
@@ -766,18 +908,18 @@ function memberRefusal(limits: Limits | null, providerID: string, id: string): s
 }
 
 /** The service lists every project, and ?directory= is an exact match, so filter here. */
-function underRoot(row: any): boolean {
+function underRoot(row: SessionRow | null | undefined): boolean {
   const dir = String(row?.location?.directory ?? "");
   return dir === ROOT || dir.startsWith(ROOT + "/");
 }
 
 /** A run in flight must not be deleted out from under the model waiting on it. */
-function busy(row: any): boolean {
+function busy(row: Pick<SessionRow, "time"> | null | undefined): boolean {
   return Number(row?.time?.busy ?? 0) > Number(row?.time?.idle ?? 0);
 }
 
 /** Why a thread stopped. Quota and provider failures land here, not on an HTTP status. */
-function errorLine(row: any): string | null {
+function errorLine(row: { error?: ServiceError | null } | null | undefined): string | null {
   const err = row?.error;
   if (!err) return null;
   const wait = err.retryAfterMs ? `, retry after ${Math.ceil(Number(err.retryAfterMs) / 60000)} min` : "";
@@ -785,12 +927,12 @@ function errorLine(row: any): string | null {
 }
 
 /** Tool input and result can carry megabytes, so both cap before the row offset. */
-function partLine(part: any): string {
+function partLine(part: MessagePart): string {
   if (part.type === "text") return `[text] ${String(part.text ?? "")}`;
   if (part.type === "reasoning") return `[reasoning] ${String(part.text ?? "")}`;
   if (part.type === "tool") {
     const tool = part.state ?? {};
-    const result = (tool.content ?? []).map((entry: any) => String(entry.text ?? "")).join(" ");
+    const result = (tool.content ?? []).map((entry) => String(entry.text ?? "")).join(" ");
     // A failed tool keeps its reason in state.error, so a reader can tell why it broke.
     const error = tool.error?.message ? ` error=${clip(String(tool.error.message))}` : "";
     return `[tool ${part.name} ${tool.status ?? "?"}] input=${clip(JSON.stringify(tool.input ?? {}))} result=${clip(result)}${error}`;
@@ -810,7 +952,7 @@ function firstLine(text: unknown): string {
  * and the status at `state.status`; `executed` stays false on completed calls. Only the path
  * list shrinks, so the failure and ask sections survive the 400-char cap.
  */
-function digestLine(rows: any[], asks?: number): string {
+function digestLine(rows: MessageRow[], asks?: number): string {
   const tools = new Map<string, number>();
   const edits: string[] = [];
   const reads: string[] = [];
@@ -875,7 +1017,7 @@ function digestLine(rows: any[], asks?: number): string {
 }
 
 /** Paths the digest saw, in row order, for the stage question before any file changes. */
-function touchedPaths(rows: any[]): string[] {
+function touchedPaths(rows: MessageRow[]): string[] {
   const paths: string[] = [];
   for (const row of rows) {
     if (row?.type !== "assistant") continue;
@@ -889,7 +1031,7 @@ function touchedPaths(rows: any[]): string[] {
 }
 
 /** One message row; `at` skips into the body for oc_read offset. */
-function rowBlock(row: any, full: boolean, at: number): string {
+function rowBlock(row: MessageRow, full: boolean, at: number): string {
   if (row.type === "user") return `[user] ${truncate(String(row.text ?? ""), at)}`;
   if (row.type === "idle") return `[idle] ${row.outcome ?? ""}${errorLine(row) ? ` ${errorLine(row)}` : ""}`;
   if (row.type === "system") return `[system] ${truncate(String(row.text ?? ""), at)}`;
@@ -906,25 +1048,25 @@ function rowBlock(row: any, full: boolean, at: number): string {
     return `[compaction ${row.status ?? "?"} ${row.reason ?? ""}] ${truncate(body, at)}`;
   }
   if (row.type !== "assistant") return `[${row.type}] ${clip(JSON.stringify(row))}`;
-  const body = full ? (row.content ?? []).map((part: any) => partLine(part)).join("\n") : textOf(row.content);
+  const body = full ? (row.content ?? []).map((part) => partLine(part)).join("\n") : textOf(row.content);
   const err = errorLine(row);
   return `[assistant ${row.finish ?? ""}] ${money(row)}${err ? `\n${err}` : ""}\n${truncate(body, at)}`;
 }
 
 async function asks(session: string, signal?: AbortSignal): Promise<Ask[]> {
   const [perms, forms] = await Promise.all([
-    api<any>(`GET`, `/api/session/${session}/permission`, undefined, signal),
-    api<any>(`GET`, `/api/session/${session}/form`, undefined, signal),
+    api<ServiceReply<PermissionAskRow[]>>(`GET`, `/api/session/${session}/permission`, undefined, signal),
+    api<ServiceReply<FormAskRow[]>>(`GET`, `/api/session/${session}/form`, undefined, signal),
   ]);
   return [
-    ...(perms.data ?? []).map((row: any): Ask => ({
+    ...(perms.data ?? []).map((row): Ask => ({
       kind: "permission",
       session,
       id: row.id,
       label: `${row.action} ${row.resources?.join(", ") ?? ""}`.trim(),
       raw: row,
     })),
-    ...(forms.data ?? []).map((row: any): Ask => ({
+    ...(forms.data ?? []).map((row): Ask => ({
       kind: "form",
       session,
       id: row.id,
@@ -934,10 +1076,12 @@ async function asks(session: string, signal?: AbortSignal): Promise<Ask[]> {
   ];
 }
 
-/** Per-field caps keep a long description from pushing a required key off the line. */
-function formDetail(form: any): string {
-  const fields = (form?.fields ?? []).map((f: any) => {
-    const options = f.options ? ` {${f.options.map((o: any) => o.value).join("|")}}` : "";
+/** Per-field caps keep a long description from pushing a required key off the line.
+ * `raw` stays unknown on the ask, so this accessor is the one place that names the form shape. */
+function formDetail(raw: unknown): string {
+  const form = (typeof raw === "object" && raw !== null ? raw : {}) as FormAskRow;
+  const fields = (form?.fields ?? []).map((f) => {
+    const options = f.options ? ` {${f.options.map((o) => o.value).join("|")}}` : "";
     const detail = [f.title, f.description, f.default !== undefined ? `default ${f.default}` : ""]
       .filter((part) => part !== undefined && part !== "")
       .join(" — ");
@@ -969,9 +1113,9 @@ async function readSettle(
   want = 8,
   steers?: number,
 ): Promise<Read> {
-  let row: any;
+  let row: SessionRow | undefined;
   try {
-    row = (await api<any>("GET", `/api/session/${session}`)).data;
+    row = (await api<ServiceReply<SessionRow>>("GET", `/api/session/${session}`)).data;
   } catch (error) {
     return /HTTP 40[49]/.test(String(error)) ? "gone" : null;
   }
@@ -980,18 +1124,18 @@ async function readSettle(
   // A failed message read has no answer, so let the caller retry instead of reporting "(none)".
   const rows = await recentRows(session, want).catch(() => null);
   if (rows === null) return null;
-  const fresh = rows.filter((entry: any) => {
+  const fresh = rows.filter((entry) => {
     const at = Number(entry?.time?.created ?? 0);
     return at > floor && at <= idleAt + 1;
   });
-  const last = fresh.find((entry: any) => entry.type === "assistant") ?? null;
-  const cause = fresh.find((entry: any) => entry.error) ?? null;
+  const last = fresh.find((entry) => entry.type === "assistant") ?? null;
+  const cause = fresh.find((entry) => entry.error) ?? null;
   // A run's own idle row carries its outcome, and the session row can still hold the one before.
-  const idle = fresh.find((entry: any) => entry.type === "idle") ?? null;
+  const idle = fresh.find((entry) => entry.type === "idle") ?? null;
   const open = await asks(session).catch(() => null);
   // A compaction hides the context before it, so the ledger starts after the newest one.
-  const compactAt = Number(fresh.find((entry: any) => entry.type === "compaction")?.time?.created ?? 0);
-  const digestRows = fresh.filter((entry: any) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));
+  const compactAt = Number(fresh.find((entry) => entry.type === "compaction")?.time?.created ?? 0);
+  const digestRows = fresh.filter((entry) => Number(entry?.time?.created ?? 0) > Math.max(floor, compactAt));
   return {
     session,
     title: String(row?.title ?? ""),
@@ -1051,7 +1195,7 @@ function batchLine(s: Settle): string {
 async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promise<string> {
   if (ask.kind === "permission") {
     if (!decision) throw new Error("permission needs decision: once, always, or reject");
-    await api("POST", `/api/session/${ask.session}/permission/${ask.id}/reply`, { decision });
+    await api<unknown>("POST", `/api/session/${ask.session}/permission/${ask.id}/reply`, { decision });
     return `permission ${ask.id} -> ${decision}`;
   }
   if (!answerJson) throw new Error(`form ${ask.id} needs answerJson keyed by field names, for example {"lane":"a"}`);
@@ -1059,7 +1203,7 @@ async function replyTo(ask: Ask, decision?: string, answerJson?: string): Promis
   try { answer = JSON.parse(answerJson); } catch {
     throw new Error(`form ${ask.id}: answerJson is not valid JSON. Send one object keyed by field name, for example {"lane":"a"}.`);
   }
-  await api("POST", `/api/session/${ask.session}/form/${ask.id}/reply`, { answer });
+  await api<unknown>("POST", `/api/session/${ask.session}/form/${ask.id}/reply`, { answer });
   return `form ${ask.id} answered`;
 }
 
@@ -1399,7 +1543,7 @@ export default function (pi: ExtensionAPI) {
     const dir = fan.dir;
     let session = "";
     try {
-      const created = await api<any>("POST", "/api/session", {
+      const created = await api<ServiceData<SessionRow>>("POST", "/api/session", {
         title: `${fan.id} judge`,
         model: { id: plan.id, providerID: plan.providerID, ...(plan.variant ? { variant: plan.variant } : {}) },
         location: { directory: dir },
@@ -1548,10 +1692,10 @@ export default function (pi: ExtensionAPI) {
         // A watch at its deadline may outlive a run that is still working. One cheap detail read
         // decides: busy means the run is alive, so the watch gets a fresh TTL and no report.
         // An idle row, a gone thread, or a failed read expires exactly as before.
-        let row: any = null;
+        let row: SessionRow | undefined;
         let readFailed = false;
         try {
-          row = (await api<any>("GET", `/api/session/${session}`)).data;
+          row = (await api<ServiceReply<SessionRow>>("GET", `/api/session/${session}`)).data;
         } catch {
           readFailed = true;
         }
@@ -1640,7 +1784,7 @@ export default function (pi: ExtensionAPI) {
       else signal?.addEventListener("abort", drop, { once: true });
     });
 
-  const onEvent = (event: { type?: string; data?: any }) => {
+  const onEvent = (event: ServiceEvent) => {
     const type = event.type ?? "";
     // A settle only matters for a thread this session armed, and that check stays synchronous.
     if (type.startsWith("session.execution.")) {
@@ -1650,12 +1794,15 @@ export default function (pi: ExtensionAPI) {
     }
     if (type !== "permission.asked" && type !== "form.created") return;
     // form.created wraps its payload in data.form; permission.asked stays flat.
-    const payload: any = type === "form.created" ? (event.data?.form ?? event.data) : event.data;
+    const payload = type === "form.created" ? (event.data?.form ?? event.data) : event.data;
     // A form can sit on the service rather than on a thread, so a non-session id has no thread to offer.
-    if (!String(payload?.sessionID ?? "").startsWith("ses")) return;
+    // Coerce, because the type only claims what the service documents. A number here must skip, not throw.
+    const session = String(payload?.sessionID ?? "");
+    if (!session.startsWith("ses")) return;
+    if (!payload) return;
     gateAsk({
       kind: type === "form.created" ? "form" : "permission",
-      session: payload.sessionID,
+      session,
       id: payload.id,
       label: payload.action
         ? `${payload.action} ${payload.resources?.join(", ") ?? ""}`.trim()
@@ -1733,7 +1880,7 @@ export default function (pi: ExtensionAPI) {
             .join("\n");
           if (!data) continue;
           try {
-            onEvent(JSON.parse(data));
+            onEvent(JSON.parse(data) as ServiceEvent);
           } catch {
             // The buffer is already past this frame, so the frames behind it still arrive.
           }
@@ -1812,7 +1959,7 @@ export default function (pi: ExtensionAPI) {
 
   /** One prompt POST, shared by a send and a steer. */
   const postPrompt = async (session: string, body: Record<string, unknown>): Promise<void> => {
-    await api("POST", `/api/session/${session}/prompt`, body);
+    await api<unknown>("POST", `/api/session/${session}/prompt`, body);
   };
 
   /**
@@ -1831,7 +1978,7 @@ export default function (pi: ExtensionAPI) {
     const mine = state;
     const previous = mine.armed.get(session);
     const compactAt = size > COMPACT_TOKENS ? size : 0;
-    if (compactAt) await api("POST", `/api/session/${session}/compact`, { delivery: "steer" }).catch(() => {});
+    if (compactAt) await api<unknown>("POST", `/api/session/${session}/compact`, { delivery: "steer" }).catch(() => {});
     armThread(session, Date.now(), ttlMs);
     mine.sending.set(session, (mine.sending.get(session) ?? 0) + 1);
     try {
@@ -1910,7 +2057,7 @@ export default function (pi: ExtensionAPI) {
 
   /** Adopt a thread the bridge did not open: one watch while it runs, floor behind its in-flight rows. */
   const attach = async (session: string): Promise<string> => {
-    const row = (await api<any>("GET", `/api/session/${session}`)).data;
+    const row = (await api<ServiceData<SessionRow>>("GET", `/api/session/${session}`)).data;
     if (!underRoot(row)) {
       throw new Error(`Thread ${session} sits in ${row?.location?.directory ?? "an unknown directory"}, outside ${ROOT}.`);
     }
@@ -2032,10 +2179,11 @@ export default function (pi: ExtensionAPI) {
     const mine = state;
     // Restore armed floors from the last session; the deadline gets a fresh TTL.
     const savedEntry = (context.sessionManager.getEntries()
-      .findLast((e: any) => e.type === "custom" && e.customType === "oc-armed") as
-      { data?: ArmedSave | ArmedRow[] } | undefined)?.data;
+      .findLast((entry): entry is CustomEntry<ArmedSave | ArmedRow[]> =>
+        entry.type === "custom" && entry.customType === "oc-armed"
+      ))?.data;
     // Older entries are a bare row array; the current entry also carries the fan-out counter.
-    const saved = Array.isArray(savedEntry) ? savedEntry : savedEntry?.rows ?? [];
+    const saved: ArmedRow[] = Array.isArray(savedEntry) ? savedEntry : savedEntry?.rows ?? [];
     if (!Array.isArray(savedEntry) && typeof savedEntry?.fanSeq === "number") {
       state.fanSeq = Math.max(0, Math.floor(savedEntry.fanSeq));
     }
@@ -2043,10 +2191,10 @@ export default function (pi: ExtensionAPI) {
     await Promise.all(saved.map(async (row) => {
       if (mine !== state) return;
       if (row.attached) mine.attached.add(row.session);
-      let current: any = null;
+      let current: SessionRow | undefined;
       let readFailed = false;
       try {
-        current = (await api<any>("GET", `/api/session/${row.session}`)).data;
+        current = (await api<ServiceReply<SessionRow>>("GET", `/api/session/${row.session}`)).data;
       } catch {
         readFailed = true;
       }
@@ -2224,13 +2372,13 @@ export default function (pi: ExtensionAPI) {
         const model = await requireModel(params.model);
         const variant = pickVariant(params.variant, model.variants);
         const dir = directory(params.directory);
-        const created = await api("POST", "/api/session", {
+        const created = await api<ServiceData<SessionRow>>("POST", "/api/session", {
           title: params.title,
           model: { id: model.id, providerID: model.providerID, ...(variant ? { variant } : {}) },
           location: { directory: dir },
           ...(permissions !== undefined ? { permissions } : {}),
         });
-        const session = created.data.id as string;
+        const session = created.data.id;
         state.known.add(session);
         state.local.add(session);
         state.delegated.add(session);
@@ -2318,10 +2466,10 @@ export default function (pi: ExtensionAPI) {
         // The cap runs before any create, so a refusal leaves the service untouched.
         // The active map carries no directory, so each active id gets one detail read and
         // `underRoot` filters out runs from other projects and other Pi sessions.
-        const active = await api<any>("GET", "/api/session/active");
+        const active = await api<ServiceReply<Record<string, unknown>>>("GET", "/api/session/active");
         const activeIds = Object.keys(active?.data ?? {});
         const activeRows = await Promise.all(activeIds.map((id) =>
-          api<any>("GET", `/api/session/${id}`).then((res) => res?.data).catch(() => null)
+          api<ServiceReply<SessionRow>>("GET", `/api/session/${id}`).then((res) => res?.data).catch(() => null)
         ));
         const activeLive = activeRows.filter(underRoot).length;
         // Active runs under the root and this bridge's own armed watches are both live; the larger count wins.
@@ -2405,9 +2553,9 @@ export default function (pi: ExtensionAPI) {
           const model = member.model;
           const variant = member.variant;
           if (member.skip) return `${model}  variant ${variant}  skipped: ${member.skip}`;
-          let created: any;
+          let created: ServiceData<SessionRow>;
           try {
-            created = await api<any>("POST", "/api/session", {
+            created = await api<ServiceData<SessionRow>>("POST", "/api/session", {
               title: `${fan.id} · ${plan.id}`,
               model: { id: plan.id, providerID: plan.providerID, ...(plan.variant ? { variant: plan.variant } : {}) },
               location: { directory: dir },
@@ -2531,7 +2679,7 @@ export default function (pi: ExtensionAPI) {
         await assertLocal(state, params.session);
         state.delegated.add(params.session);
         // The armed map can be stale: a steer to an idle thread starts an unwatched run.
-        const row = (await api<any>("GET", `/api/session/${params.session}`)).data;
+        const row = (await api<ServiceReply<SessionRow>>("GET", `/api/session/${params.session}`)).data;
         noteThread(state, row);
         if (!busy(row)) {
           return {
@@ -2621,9 +2769,9 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-        const revert = async (method: string, path: string, body?: unknown): Promise<any> => {
+        const revert = async (method: string, path: string, body?: unknown): Promise<ServiceReply<RevertStage>> => {
           try {
-            return await api<any>(method, path, body);
+            return await api<ServiceReply<RevertStage>>(method, path, body);
           } catch (error) {
             // The service answers 409 while a run is live; say why the retry has to wait.
             if (/HTTP 409/.test(String(error))) {
@@ -2633,8 +2781,8 @@ export default function (pi: ExtensionAPI) {
           }
         };
         const kept = params.files === false;
-        const pathsOf = (stage: any): string[] =>
-          (stage?.data?.files ?? []).map((file: any) => String(file?.file ?? "")).filter(Boolean);
+        const pathsOf = (stage: ServiceReply<RevertStage>): string[] =>
+          (stage?.data?.files ?? []).map((file) => String(file?.file ?? "")).filter(Boolean);
         const fileLine = (paths: string[], named: string[]): string => {
           if (kept) return "files kept (files:false)";
           if (!paths.length) {
@@ -2662,12 +2810,12 @@ export default function (pi: ExtensionAPI) {
             details: { session, rewound: false, target: "", branch: "", files: true },
           };
         }
-        const current = (await api<any>("GET", `/api/session/${session}`)).data;
+        const current = (await api<ServiceReply<SessionRow>>("GET", `/api/session/${session}`)).data;
         noteThread(state, current);
         // The run opener is the oldest user row at or after busy; a steer writes a newer user row.
         const floor = Number(current?.time?.busy ?? 0) - 1;
-        const rows = (await api<any>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
-        const at = rows.findLastIndex((row: any) =>
+        const rows = (await api<ServiceReply<MessageRow[]>>("GET", `/api/session/${session}/message?order=desc&limit=${DIGEST_ROWS}`)).data ?? [];
+        const at = rows.findLastIndex((row) =>
           row.type === "user" && Number(row?.time?.created ?? 0) >= floor
         );
         if (at < 0) {
@@ -2678,14 +2826,14 @@ export default function (pi: ExtensionAPI) {
         const target = String(rows[at].id);
         const runRows = rows.slice(0, at);
         // A compaction hides the context before it, so the ledger starts after the newest one.
-        const compactAt = Number(runRows.find((row: any) => row.type === "compaction")?.time?.created ?? 0);
-        const digestRows = runRows.filter((row: any) => Number(row?.time?.created ?? 0) > compactAt);
+        const compactAt = Number(runRows.find((row) => row.type === "compaction")?.time?.created ?? 0);
+        const digestRows = runRows.filter((row) => Number(row?.time?.created ?? 0) > compactAt);
         const digest = digestLine(digestRows);
         const digestPaths = touchedPaths(digestRows);
         const digestLabel = digestPaths.length ? digestPaths.join(", ") : "none";
         if (params.branch) {
           // The only undo route: copy the history before the target and attach the child.
-          const forked = await api<any>("POST", `/api/session/${session}/fork`, { before: target });
+          const forked = await api<ServiceReply<{ id?: string }>>("POST", `/api/session/${session}/fork`, { before: target });
           const child = String(forked?.data?.id ?? "");
           if (!child) throw new Error("fork answered no session id");
           const attached = await attach(child).catch((error) =>
@@ -2781,7 +2929,7 @@ export default function (pi: ExtensionAPI) {
         // A Pi reload drops the watch, and print and JSON never had one. A thread that is still
         // running owes this call its settle, so take a floor behind its in-flight rows and wait.
         if (!w && params.since === undefined) {
-          const row = (await api<any>("GET", `/api/session/${params.session}`).catch(() => null))?.data;
+          const row = (await api<ServiceReply<SessionRow>>("GET", `/api/session/${params.session}`).catch(() => null))?.data;
           noteThread(state, row);
           if (busy(row)) {
             try {
@@ -2910,14 +3058,14 @@ export default function (pi: ExtensionAPI) {
         await assertLocal(state, params.session);
         const want = Math.min(Math.max(params.limit ?? 6, 1), 25);
         const rows =
-          (await api("GET", `/api/session/${params.session}/message?order=desc&limit=${want + 2}`)).data ?? [];
+          (await api<ServiceReply<MessageRow[]>>("GET", `/api/session/${params.session}/message?order=desc&limit=${want + 2}`)).data ?? [];
         // An idle row carries only a status, so it must not crowd out the answer.
-        const answer = rows.filter((row: any) => row.type !== "idle").slice(0, want);
+        const answer = rows.filter((row) => row.type !== "idle").slice(0, want);
         const shown = answer.length ? answer : rows.slice(0, want);
         // A read is not a watch: only an armed run or an ask adds the thread to the rescan list.
         const full = params.parts === "full";
         const at = Math.max(0, params.offset ?? 0);
-        const text = shown.map((row: any) => rowBlock(row, full, at)).join("\n\n");
+        const text = shown.map((row) => rowBlock(row, full, at)).join("\n\n");
         // Rows are capped each, so cap the whole result too: 25 long rows still overflow a context.
         const capped = text.length > 24_000 ? `${text.slice(0, 24_000)}\n… result capped; narrow limit or use offset` : text;
         return { content: [{ type: "text", text: capped || "empty" }], details: undefined };
@@ -2950,13 +3098,6 @@ export default function (pi: ExtensionAPI) {
         // "already settled" while the ask stays open.
         const open = await asks(params.session).catch(() => null);
         const ask = open?.find((entry) => entry.id === params.id);
-        if (open && !ask) {
-          return {
-            content: [{ type: "text", text: `${params.id} is not open on ${params.session}. oc_wait lists its open asks.` }],
-            details: { openAsks: open.map((entry) => `${entry.kind} ${entry.id}`) },
-            isError: true,
-          };
-        }
         // Without the ask list the kind is unknown, and a wrong kind reads back as "already settled".
         if (!open) {
           return {
@@ -2965,9 +3106,16 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
+        if (!ask) {
+          return {
+            content: [{ type: "text", text: `${params.id} is not open on ${params.session}. oc_wait lists its open asks.` }],
+            details: { openAsks: open.map((entry) => `${entry.kind} ${entry.id}`) },
+            isError: true,
+          };
+        }
         let text: string;
         try {
-          text = await replyTo(ask!,
+          text = await replyTo(ask,
             params.decision,
             params.answerJson,
           );
@@ -3021,10 +3169,10 @@ export default function (pi: ExtensionAPI) {
     description: "OpenCode bridge status: mode, service, threads",
     handler: async (_args, context) => {
       ctx = context;
-      const all = ((await api<any>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot);
+      const all = ((await api<ServiceReply<SessionRow[]>>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot);
       const rows = [
-        ...all.filter((row: any) => state.attached.has(row.id)),
-        ...all.filter((row: any) => !state.attached.has(row.id)),
+        ...all.filter((row) => state.attached.has(row.id)),
+        ...all.filter((row) => !state.attached.has(row.id)),
       ].slice(0, 8);
       say(
         context,
@@ -3033,7 +3181,7 @@ export default function (pi: ExtensionAPI) {
           `service: ${(await serviceHandle()).url}`,
           `armed: ${state.armed.size}${state.batch.length ? `, batched ${state.batch.length}` : ""}`,
           `served: ${(await cheapModels()).ids.join(", ")}`,
-          ...rows.map((row: any) =>
+          ...rows.map((row) =>
             `${row.id}  ${busy(row) ? "running" : (row.outcome ?? "-")}  ${row.model?.id ?? "-"}  ${row.title ?? ""}${
               state.attached.has(row.id) ? "  attached" : ""
             }`
@@ -3048,13 +3196,13 @@ export default function (pi: ExtensionAPI) {
   const showBudget = async (context: ExtensionContext) => {
     ctx = context;
     await budget(true);
-    const all = ((await api<any>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot);
+    const all = ((await api<ServiceReply<SessionRow[]>>("GET", "/api/session?limit=50")).data ?? []).filter(underRoot);
     for (const row of all) noteThread(state, row);
     const costs = (await cheapModels().catch(() => null))?.costs ?? modelCache.costs;
     drawHud();
     const live = all.filter(busy);
     const lines = live.length
-      ? live.map((row: any) => {
+      ? live.map((row) => {
         const info = state.info.get(row.id);
         const provider = info?.providerID ?? String(row?.model?.providerID ?? "");
         const model = info?.model ?? String(row?.model?.id ?? "-");
@@ -3127,15 +3275,15 @@ export default function (pi: ExtensionAPI) {
     description: "List finished threads under the root; force deletes",
     handler: async (args, context) => {
       ctx = context;
-      const rows = ((await api<any>("GET", "/api/session?limit=200")).data ?? []).filter(underRoot);
+      const rows = ((await api<ServiceReply<SessionRow[]>>("GET", "/api/session?limit=200")).data ?? []).filter(underRoot);
       // A thread the user adopted from the TUI must not die with the rest, so force keeps it.
-      const adopted = rows.filter((row: any) => state.attached.has(row.id));
-      const kept = rows.filter((row: any) => busy(row) && !state.attached.has(row.id));
-      const done = rows.filter((row: any) => !busy(row) && !state.attached.has(row.id));
+      const adopted = rows.filter((row) => state.attached.has(row.id));
+      const kept = rows.filter((row) => busy(row) && !state.attached.has(row.id));
+      const done = rows.filter((row) => !busy(row) && !state.attached.has(row.id));
       const adoptedLine = adopted.length
-        ? `kept ${adopted.length} because adopted: ${adopted.map((row: any) => row.id).join(", ")}`
+        ? `kept ${adopted.length} because adopted: ${adopted.map((row) => row.id).join(", ")}`
         : "";
-      const line = (row: any) =>
+      const line = (row: SessionRow) =>
         `${row.id}  ${row.model?.id ?? "-"}  ${row.outcome ?? "-"}  ${Math.round(
           (Date.now() - Number(row?.time?.updated ?? 0)) / 60_000,
         )}m  out ${(row.tokens?.output ?? 0) + (row.tokens?.reasoning ?? 0)}  ${row.title ?? ""}`;
@@ -3159,11 +3307,11 @@ export default function (pi: ExtensionAPI) {
       for (const row of done) {
         try {
           // A run can start between the list and the delete, so re-read before cutting.
-          if (busy((await api<any>("GET", `/api/session/${row.id}`)).data)) {
+          if (busy((await api<ServiceReply<SessionRow>>("GET", `/api/session/${row.id}`)).data)) {
             racing++;
             continue;
           }
-          await api("DELETE", `/api/session/${row.id}`);
+          await api<unknown>("DELETE", `/api/session/${row.id}`);
           paneCall(["rm", row.id]);
           forget(state, row.id);
           deleted++;
