@@ -44,6 +44,19 @@ as() {
 
 field() { [ -f "$STATE" ] && awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v}' "$STATE"; }
 
+# write_state: replace the state file through a unique temp file in the same directory, so two
+# detached calls cannot publish each other's half-written file.
+write_state() {
+  local tmp
+  tmp=$(mktemp "${STATE}.XXXXXX") || die "cannot create a temp file next to $STATE"
+  if cat > "$tmp"; then
+    mv "$tmp" "$STATE"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
 # Values reach AppleScript source and a pane shell, so reject anything outside the narrow shapes.
 # Escaping is not enough: the pane runs a shell, so a rejected value must never start osascript.
 die() { echo "oc-panes: $*" >&2; exit 2; }
@@ -59,16 +72,29 @@ need_ses() {
   esac
 }
 
-# need_num <label> <value>: a window, anchor, terminal, or font id, ASCII digits only.
-need_num() {
-  case "${2:-}" in
-    ''|*[!0123456789]*) die "$1 must match [0-9]+: ${2:-<empty>}" ;;
+# need_font <value>: the Ghostty font size, ASCII digits only.
+need_font() {
+  case "${1:-}" in
+    ''|*[!0123456789]*) die "font must match [0-9]+: ${1:-<empty>}" ;;
   esac
 }
 
-# safe_num <value>: true when the value is ASCII digits. Use it for ids read back from the state
+# need_id <label> <value>: a Ghostty window, pane, or anchor id. Ghostty 1.3+ uses opaque ids
+# such as tab-group-751dcdf660 and F6FA8635-226B-4635-8614-29744BCCE766, so letters, digits,
+# dot, underscore, and dash are allowed. The charset also rejects an empty value, quotes, a
+# backtick, a dollar sign, a backslash, whitespace, and every control character.
+need_id() {
+  case "${2:-}" in
+    ''|*[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*) die "$1 must match [A-Za-z0-9._-]+: ${2:-<empty>}" ;;
+  esac
+}
+
+# safe_id <value>: true when need_id would accept it. Use it for ids read back from the state
 # file: a corrupt line must skip its pane and still drop the line, never abort a cleanup.
-safe_num() { case "${1:-}" in ''|*[!0123456789]*) return 1 ;; esac; return 0; }
+safe_id() {
+  case "${1:-}" in ''|*[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*) return 1 ;; esac
+  return 0
+}
 
 # need_dir <value>: a directory with no character that can end a quote or start an expansion.
 need_dir() {
@@ -90,14 +116,30 @@ prune() {
   local f="$HOME/.local/state/opencode/latest/tui/tabs.json"
   [ -f "$f" ] || return 0
   python3 - "$f" <<'PYEOF' 2>/dev/null
-import json, os, sys, base64, urllib.request
+import json, os, sys, base64, tempfile, urllib.parse, urllib.request
+from urllib.parse import urlparse
 path = sys.argv[1]
 try:
-    pw = json.load(open(os.environ.get("OC_SERVICE_FILE", os.path.expanduser("~/.config/opencode/service.json"))))["password"]
     url = os.popen("opencode service status").read().strip()
+    host = urlparse(url).hostname
+    # The service password is a local secret: send it only to a loopback host.
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        sys.exit(0)
+    pw = json.load(open(os.environ.get("OC_SERVICE_FILE", os.path.expanduser("~/.config/opencode/service.json"))))["password"]
     auth = "Basic " + base64.b64encode(f"opencode:{pw}".encode()).decode()
-    req = urllib.request.Request(url + "/api/session?limit=200", headers={"authorization": auth})
-    live = {r["id"] for r in json.load(urllib.request.urlopen(req, timeout=20))["data"]}
+    # Read every page, so a session past the first 200 rows is not pruned as a ghost.
+    live = set()
+    cursor = None
+    for _ in range(1000):
+        query = {"limit": 200}
+        if cursor:
+            query["cursor"] = cursor
+        req = urllib.request.Request(url + "/api/session?" + urllib.parse.urlencode(query), headers={"authorization": auth})
+        page = json.load(urllib.request.urlopen(req, timeout=20))
+        live.update(r["id"] for r in page.get("data", []))
+        cursor = (page.get("cursor") or {}).get("next")
+        if not cursor:
+            break
 except Exception:
     sys.exit(0)
 data = json.load(open(path))
@@ -108,20 +150,28 @@ for scope in data.values() if isinstance(data, dict) else []:
     for entry in scope.values() if isinstance(scope, dict) else []:
         if not isinstance(entry, dict) or "tabs" not in entry:
             continue
-        keep = [t for t in entry["tabs"] if t.get("sessionID") in live]
+        # A tab with no session id is not a thread tab, so it stays.
+        keep = [t for t in entry["tabs"] if not t.get("sessionID") or t.get("sessionID") in live]
         dropped += len(entry["tabs"]) - len(keep)
         entry["tabs"] = keep
         if isinstance(entry.get("unread"), dict):
             entry["unread"] = {k: v for k, v in entry["unread"].items() if k in live}
 if dropped:
-    json.dump(data, open(path, "w"))
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="tabs.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(data, out)
+        os.replace(tmp, path)
+    except Exception:
+        os.unlink(tmp)
+        raise
 print(dropped)
 PYEOF
 }
 
 alive() {
   [ -n "${1:-}" ] || { echo dead; return; }
-  safe_num "$1" || { echo dead; return; }
+  safe_id "$1" || { echo dead; return; }
   local out
   out=$(as <<EOF
 try
@@ -138,14 +188,15 @@ EOF
 # adopt <window_id>: remember the window and the pane that anchors new splits.
 adopt() {
   local w="$1"
-  need_num "window id" "$w"
+  need_id "window id" "$w"
   local anchor
   anchor=$(as <<EOF
 set w to first window whose id is "$w"
 return id of (focused terminal of selected tab of w)
 EOF
 )
-  printf 'window\t%s\nanchor\t%s\n' "$w" "$anchor" > "$STATE"
+  need_id "anchor id" "$anchor"
+  printf 'window\t%s\nanchor\t%s\n' "$w" "$anchor" | write_state
   echo "$w"
 }
 
@@ -159,7 +210,7 @@ case "$cmd" in
         *) shift ;;
       esac
     done
-    [ -n "$w" ] && need_num "window id" "$w"
+    [ -n "$w" ] && need_id "window id" "$w"
     [ -z "$w" ] && w=$(as "return id of (first window)")
     [ -z "$w" ] && { echo "oc-panes: no Ghostty window to adopt" >&2; exit 1; }
     adopt "$w"
@@ -172,7 +223,7 @@ case "$cmd" in
         *) shift ;;
       esac
     done
-    need_num "font" "$FONT"
+    need_font "$FONT"
     w=$(as <<EOF
 set cfg to new surface configuration
 set font size of cfg to $FONT
@@ -189,7 +240,7 @@ EOF
     [ -z "$ses" ] && { echo "usage: oc-panes add <ses_id> [dir]" >&2; exit 2; }
     need_ses "$ses"
     need_dir "$dir"
-    need_num "font" "$FONT"
+    need_font "$FONT"
     w=$(field window)
     # Self-heal: a window closed by hand, or no viewer yet, falls back to the front window.
     if [ "$(alive "$w")" = dead ]; then
@@ -201,7 +252,7 @@ EOF
     # One column per session: a second question to a thread that still owns a column reuses it.
     have=$(awk -F'\t' -v s="$ses" '$1=="pane" && $2==s{print $3; exit}' "$STATE")
     if [ -n "$have" ]; then
-      safe_num "$have" || have=""
+      safe_id "$have" || have=""
     fi
     if [ -n "$have" ]; then
       ok=$(as <<EOF
@@ -214,13 +265,13 @@ end try
 EOF
 )
       if [ "$ok" = ok ]; then echo "$have"; exit 0; fi
-      awk -F'\t' -v s="$ses" '!($1=="pane" && $2==s)' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+      awk -F'\t' -v s="$ses" '!($1=="pane" && $2==s)' "$STATE" | write_state
     fi
     anchor=$(awk -F'\t' '$1=="pane"{t=$3} END{print t}' "$STATE")
     stored=$(field anchor)
     [ -n "$anchor" ] || anchor="$stored"
-    safe_num "$anchor" || anchor=""
-    safe_num "$stored" || stored=""
+    safe_id "$anchor" || anchor=""
+    safe_id "$stored" || stored=""
     # Grow right from the newest column. A stale anchor id falls back to the adopted anchor
     # pane, then to whatever pane the window focuses. Splitting is always safe: it never
     # types into the anchor.
@@ -248,7 +299,7 @@ EOF
     # width. Say so, because the column then silently becomes a tab.
     set -- $t
     t="$1"
-    need_num "pane id" "$t"
+    need_id "pane id" "$t"
     [ "${2:-0}" != "0" ] && echo "oc-panes: split became a tab, pane too narrow. Adopt a wider window: oc-panes open" >&2
     # Quote the values for the pane shell, then type the attach command into the new pane only.
     cmd=$(printf 'cd %q && opencode --session %q' "$dir" "$ses")
@@ -266,8 +317,8 @@ EOF
     [ -z "$ses" ] && { echo "usage: oc-panes rm <ses_id>" >&2; exit 2; }
     need_ses "$ses"
     w=$(field window); t=$(awk -F'\t' -v s="$ses" '$1=="pane" && $2==s{print $3; exit}' "$STATE")
-    safe_num "$t" || t=""
-    [ -f "$STATE" ] && grep -v -F "	$ses	" "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    safe_id "$t" || t=""
+    [ -f "$STATE" ] && grep -v -F "	$ses	" "$STATE" | write_state
     [ -z "$t" ] && exit 0
     [ "$(alive "$w")" = ok ] || exit 0
     # Two exits: opencode eats the first, the login shell takes the second, then Ghostty drops
@@ -311,7 +362,7 @@ EOF
     [ "$(alive "$w")" = ok ] || { rm -f "$STATE"; exit 0; }
     # Close only the columns Pi opened. The adopted anchor pane stays, so the window survives.
     while read -r _ ses t; do
-      safe_num "${t:-}" || continue
+      safe_id "${t:-}" || continue
       as <<EOF
 try
 set t to first terminal of (first window whose id is "$w") whose id is "$t"
@@ -323,7 +374,7 @@ send key "enter" to t
 end try
 EOF
     done < <(awk -F'\t' '$1=="pane"' "$STATE")
-    awk -F'\t' '$1!="pane"' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+    awk -F'\t' '$1!="pane"' "$STATE" | write_state
     ;;
 
   *)

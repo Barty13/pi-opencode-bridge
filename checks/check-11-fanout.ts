@@ -7,9 +7,9 @@
  *   GET /api/session -> {data:Session.Info[], cursor:{…}}.
  *   GET /api/experimental/usage/limits and GET /api/model keep the stage 05 shapes.
  *
- * Cases: reload, merge, fail, race, cap, quota, judge. The control removes the fan-out hold
- * (per-member wake-up), the cap, the Go-member skip, the judge, and the counter restore; every
- * case must die.
+ * Cases: reload, merge, fail, race, cap, parallel, quota, judge. The cap counts only active threads
+ * under the root and counts the judge. The control removes the fan-out hold (per-member wake-up),
+ * the cap, the Go-member skip, the judge, and the counter restore; every case must die.
  * Run:
  *   bun run checks/check-11-fanout.ts
  *   BRIDGE=$PWD/.control-fanout.ts bun run checks/check-11-fanout.ts   # must fail
@@ -54,8 +54,10 @@ interface SessionRow {
 
 const sessions = new Map<string, SessionRow>();
 /** Create order, so a fan-out's threads are the tail after the count taken before the call. */
-const created: Array<{ id: string; model: string; title: string }> = [];
+const created: Array<{ id: string; model: string; title: string; at: number }> = [];
 const prompts: Array<{ session: string; text: string }> = [];
+/** The parallel case delays each create, so a serial loop is visible as a wide spread. */
+let createDelayMs = 0;
 let active: Record<string, { type: "running" }> = {};
 /** The race case fails the first prompt of one model, so its member is terminal before the report. */
 let failFirstPrompt: string | null = null;
@@ -102,6 +104,7 @@ Bun.serve({
     }
     if (p === "/api/session/active") return json(active);
     if (req.method === "POST" && p === "/api/session") {
+      if (createDelayMs) await new Promise((done) => setTimeout(done, createDelayMs));
       const body = await req.json() as any;
       const seq = created.length;
       const id = `ses_fan${String(seq).padStart(18, "0")}`;
@@ -121,7 +124,7 @@ Bun.serve({
         rows: [],
       };
       sessions.set(id, row);
-      created.push({ id, model: `${model.providerID}/${model.id}`, title: row.title });
+      created.push({ id, model: `${model.providerID}/${model.id}`, title: row.title, at: Date.now() });
       return json(row);
     }
     if (req.method === "GET" && p === "/api/session") return json([...sessions.values()]);
@@ -386,10 +389,28 @@ check(
   raceReport ?? "(none)",
 );
 
-// cap: 30 live threads plus 3 new would pass 32, so no thread is created.
-active = Object.fromEntries(
-  Array.from({ length: 30 }, (_, index) => [`ses_live${String(index).padStart(18, "0")}`, { type: "running" as const }]),
-);
+// cap: 30 live threads under the root plus 3 new would pass 32, so no thread is created.
+// Two foreign live threads also exist; they must not count against this root.
+const seedSession = (id: string, dir: string) => {
+  sessions.set(id, {
+    id,
+    title: id,
+    model: { id: "seed", providerID: "opencode", variant: "default" },
+    location: { directory: dir },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    time: { created: Date.now(), updated: Date.now() },
+    rows: [],
+  });
+};
+const liveIds = Array.from({ length: 30 }, (_, index) => `ses_live${String(index).padStart(18, "0")}`);
+const foreignIds = ["ses_foreign10000000000000000", "ses_foreign20000000000000000"];
+for (const id of liveIds) seedSession(id, ROOT);
+for (const id of foreignIds) seedSession(id, tmpdir());
+active = Object.fromEntries([
+  ...liveIds.map((id) => [id, { type: "running" as const }]),
+  ...foreignIds.map((id) => [id, { type: "running" as const }]),
+]);
 const capCreates = created.length;
 const capPrompts = prompts.length;
 const capRes = await tool("oc_fanout").execute("t", { brief: "cap brief", models: ALL });
@@ -398,7 +419,47 @@ console.log("cap ->", capText);
 check("cap refused", capRes.isError === true && capText.includes("30") && capText.includes("3") && capText.includes("32"), capText);
 check("cap no create", created.length === capCreates, `${created.length - capCreates}`);
 check("cap no prompt", prompts.length === capPrompts, `${prompts.length - capPrompts}`);
+
+// cap judge: 29 live plus 3 members plus the judge would pass 32, so the judge counts first.
+const judgeLiveIds = liveIds.slice(0, 29);
+active = Object.fromEntries([
+  ...judgeLiveIds.map((id) => [id, { type: "running" as const }]),
+  ...foreignIds.map((id) => [id, { type: "running" as const }]),
+]);
+const judgeCapCreates = created.length;
+const judgeCapPrompts = prompts.length;
+const judgeCap = await tool("oc_fanout").execute("t", { brief: "judge cap brief", models: ALL, judge: JUDGE });
+const judgeCapText = textOf(judgeCap);
+console.log("judge cap ->", judgeCapText);
+check(
+  "judge cap refused",
+  judgeCap.isError === true
+    && judgeCapText.includes("29")
+    && judgeCapText.includes("4")
+    && judgeCapText.includes("judge counts as one")
+    && judgeCapText.includes("32"),
+  judgeCapText,
+);
+check("judge cap no create", created.length === judgeCapCreates, `${created.length - judgeCapCreates}`);
+check("judge cap no prompt", prompts.length === judgeCapPrompts, `${prompts.length - judgeCapPrompts}`);
+for (const id of [...liveIds, ...foreignIds]) sessions.delete(id);
 active = {};
+
+// parallel: every member starts together, so the create spread stays near one delay, not N × delay.
+createDelayMs = 120;
+const parBefore = sent.length;
+const parCreates = created.length;
+const parRes = await tool("oc_fanout").execute("t", { brief: "parallel brief", models: ALL });
+const parText = textOf(parRes);
+const parRows = created.slice(parCreates);
+createDelayMs = 0;
+const parSpread = (parRows.at(-1)?.at ?? 0) - (parRows[0]?.at ?? 0);
+console.log("parallel receipt ->", parText, `spread ${parSpread}ms`);
+check("parallel receipt", parRes.isError !== true && parRows.length === 3, parText);
+check("parallel start", parSpread < 150, `${parSpread}ms`);
+for (const [index, row] of parRows.entries()) settle(row.id, `PAR-${index}`);
+const parWake = await wake(parBefore);
+check("parallel report", parWake !== null && sent.length === parBefore + 1, `${sent.length - parBefore}`);
 
 // quota: the Go rolling meter skips the one Go member; both free members still run.
 meter.rolling = { percent: 90, limited: false, resetsAt: Date.now() + 3_600_000 };
@@ -452,7 +513,8 @@ const judgeText = textOf(judgeRes);
 console.log("judge receipt ->", judgeText);
 const judgeIds = created.slice(judgeCreates).map((entry) => entry.id);
 check("judge receipt", judgeRes.isError !== true && judgeIds.length === 3, judgeText);
-settle(judgeIds[0], "ANSWER-A");
+const longAnswer = `ANSWER-A ${"x".repeat(5000)}`;
+settle(judgeIds[0], longAnswer);
 settle(judgeIds[1], "ANSWER-B");
 settle(judgeIds[2], "ANSWER-C");
 const judgeDeadline = Date.now() + 3000;
@@ -466,6 +528,12 @@ check(
   ["ANSWER-A", "ANSWER-B", "ANSWER-C"].every((answer) => judgePrompt.includes(answer))
     && judgePrompt.toLowerCase().includes("rank"),
   judgePrompt,
+);
+// A long member answer must pass truncate before the judge POST, so the prompt stays bounded.
+check(
+  "judge prompt cap",
+  judgePrompt.includes("… truncated") && judgePrompt.length < 7000,
+  `prompt ${judgePrompt.length} chars`,
 );
 if (judgeSession) settle(judgeSession, "RANK: B, A, C");
 const judgeWake = await wake(judgeBefore, 5000);

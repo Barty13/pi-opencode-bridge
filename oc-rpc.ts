@@ -15,7 +15,7 @@
  * Exit: 0 pass, 1 extension failure, 2 provider failure.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -48,12 +48,19 @@ const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main(): Promise<number> {
   const dir = mkdtempSync(join(tmpdir(), "oc-rpc-"));
+  // The scratch directory holds only this run, so remove it on every exit path.
+  process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
   const child: ChildProcess = spawn(
     "pi",
     ["--mode", "rpc", "--no-session", "--no-extensions", "--extension", EXTENSION,
      "--tools", "read,oc_models,oc_open,oc_send,oc_wait,oc_read,oc_stop", "--approve"],
     { stdio: ["pipe", "pipe", "pipe"], cwd: dir },
   );
+  // A missing `pi` binary fires an error event, not an exit code; report it and stop here.
+  child.on("error", (error) => {
+    console.log(`oc-rpc: ${error.message}`);
+    process.exit(2);
+  });
 
   let buffer = "";
   const starts: number[] = [];
@@ -108,8 +115,21 @@ async function main(): Promise<number> {
     if (line) console.log(`${now()}ms stderr ${line.slice(0, 200)}`);
   });
 
+  // A closed pipe emits EPIPE on the stream; without a listener that error kills the harness.
+  child.stdin!.on("error", (error: Error) => {
+    console.log(`${now()}ms stdin error ${error.message}`);
+  });
+  /** One RPC event line. A write to a dead child reports and lets the deadline end the run. */
+  const write = (event: unknown): void => {
+    try {
+      child.stdin!.write(JSON.stringify(event) + "\n");
+    } catch (error) {
+      console.log(`oc-rpc: stdin write failed: ${error instanceof Error ? error.message : error}`);
+    }
+  };
+
   await wait(400);
-  child.stdin!.write(JSON.stringify({ type: "prompt", message: PROMPT }) + "\n");
+  write({ type: "prompt", message: PROMPT });
   console.log(`${now()}ms prompt sent`);
 
   const deadline = Date.now() + DEADLINE_MS;
@@ -126,10 +146,14 @@ async function main(): Promise<number> {
   const reply = text.join("");
   await wait(1000);
 
-  child.stdin!.write(JSON.stringify({ type: "abort" }) + "\n");
+  write({ type: "abort" });
   await wait(200);
   if (child.exitCode === null) {
-    child.stdin!.end();
+    try {
+      child.stdin!.end();
+    } catch (error) {
+      console.log(`oc-rpc: stdin close failed: ${error instanceof Error ? error.message : error}`);
+    }
     child.kill("SIGTERM");
   }
 

@@ -22,15 +22,36 @@
  *                      the previous run is not reported again and the text names the ceiling.
  *   handle   item 3  — an HTTP answer keeps the service handle, a socket or parse failure forces
  *                      one rediscovery, and concurrent callers share one discovery.
+ *   envparse item 10 — a non-numeric OC_BACKSTOP_MS falls back to 5000 ms, not a 1 ms interval.
+ *   perms    item 12 — a malformed permissionsJson returns the budget-gate refusal shape.
+ *   loopback item 14 — a non-loopback service URL is refused before any request and password.
+ *   known    item 15 — oc_read does not add a rescan target, and an empty rescan drops the thread.
+ *   askfail  item 18 — details.settled reports the run, and asksReadable reports the ask read.
+ *   rootfile item 19 — OC_ROOT at a file is refused as a directory.
+ *   ceilenv  item 11 — OC_MAX_THREADS replaces the hardcoded watch ceiling.
+ *   abortlist item 23 — a finished wait removes its abort listener.
+ *   panemode item 24 — a switch from TUI to print closes the old columns.
+ *   busyexp  item 32 — a busy run keeps its watch past the TTL and reports its real settle once.
+ *   expirepane item 32 — an expired watch leaves its column open.
  *
  * Run: CASE=expire bun run checks/check-3-unit.ts   (from the package root)
  */
 const CASE = process.env.CASE ?? "4xx";
-process.env.OC_WATCH_TTL_S = CASE === "stale" ? "4" : "2";
-process.env.OC_BACKSTOP_MS = CASE === "stale" ? "500" : CASE === "dup" || CASE === "flush" ? "300" : "1000";
+process.env.OC_WATCH_TTL_S = CASE === "envparse" ? "abc" : CASE === "stale" ? "4" : "2";
+process.env.OC_BACKSTOP_MS = CASE === "envparse"
+  ? "abc"
+  : CASE === "busyexp"
+    ? "300"
+    : CASE === "stale"
+      ? "500"
+      : CASE === "dup" || CASE === "flush"
+        ? "300"
+        : "1000";
 process.env.OC_DEBOUNCE_MS = CASE === "flush" ? "50" : "400";
 process.env.OC_STREAM_GAP_MS = CASE === "streamgap" ? "2000" : "90000";
 process.env.OC_HUD = "0";
+// The ceiling-env case proves that OC_MAX_THREADS replaces the old hardcoded 32.
+process.env.OC_MAX_THREADS = CASE === "ceilenv" ? "2" : "32";
 
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -41,7 +62,10 @@ const PORT = 8731;
 const ID = "ses_stub00000000000000000000";
 // assertLocal compares the thread directory against ROOT, so the stub must sit inside it.
 const ROOT = mkdtempSync(join(tmpdir(), "oc-root-"));
-process.env.OC_ROOT = ROOT;  // the bridge reads the root at load, so set it before the import
+// The rootfile case points OC_ROOT at a file, which must never reach the service as a directory.
+const ROOT_FILE = join(ROOT, "root-file");
+writeFileSync(ROOT_FILE, "not a directory");
+process.env.OC_ROOT = CASE === "rootfile" ? ROOT_FILE : ROOT;  // the bridge reads the root at load, so set it before the import
 // The send fails only in the 4xx case; elsewhere the prompt lands and the watch stays armed.
 const FAIL_PROMPT = CASE === "4xx";
 // The stale case holds the first sweep read, replaces its watch with oc_send, then releases it.
@@ -57,6 +81,13 @@ let answerMode: "ok" | "404" | "badjson" = "ok";
 // The streamgap case counts reconnects and ask reads, so a reconnect that skips the rescan fails.
 const streamOpens: number[] = [];
 let askReads = 0;
+// The other cases count the requests they must not make.
+let creates = 0;
+let detailGets = 0;
+let sessionGets = 0;
+// The busyexp case keeps the thread busy past one TTL, then settles it with a real answer.
+let busyAt = 0;
+let idleAt = 0;
 
 Bun.serve({
   hostname: "127.0.0.1",
@@ -88,7 +119,10 @@ Bun.serve({
         },
       }), { headers: { "content-type": "text/event-stream" } });
     }
-    if (req.method === "POST" && p === "/api/session") return json({ id: ID, title: "stub" });
+    if (req.method === "POST" && p === "/api/session") {
+      creates++;
+      return json({ id: ID, title: "stub" });
+    }
     if (req.method === "POST" && p.endsWith("/prompt")) {
       if (CASE === "5xx") {
         return new Response('{"error":"service failed"}', { status: 500, headers: { "content-type": "application/json" } });
@@ -114,10 +148,25 @@ Bun.serve({
     }
     if (p.endsWith("/permission") || p.endsWith("/form")) {
       askReads++;
+      // The askfail case settles a run but cannot read its asks, so the report says "unreadable".
+      if (CASE === "askfail") {
+        return new Response('{"error":"boom"}', { status: 500, headers: { "content-type": "application/json" } });
+      }
       return json([]);
     }
     // idle 0 with completed set: not busy, and nothing newer than any `since` floor.
     if (/^\/api\/session\/ses_/.test(p)) {
+      detailGets++;
+      if (p === `/api/session/${ID}`) sessionGets++;
+      if (CASE === "busyexp" && p === `/api/session/${ID}`) {
+        return json({
+          id: ID,
+          title: "stub",
+          outcome: idleAt ? "stop" : "running",
+          location: { directory: ROOT },
+          time: { busy: busyAt, idle: idleAt, completed: idleAt },
+        });
+      }
       if (CASE === "ceiling" && p === `/api/session/${CEIL_ID}`) {
         return json({
           id: CEIL_ID,
@@ -151,11 +200,17 @@ if [ "$1" = "models" ]; then echo stub/model-free; exit 0; fi
 echo status >> "${statusLog}"
 ${CASE === "handle" ? "sleep 0.15" : "true"}
 [ -f "${statusFail}" ] && exit 1
-echo http://127.0.0.1:${PORT}
+echo ${CASE === "loopback" ? `http://0.0.0.0:${PORT}` : `http://127.0.0.1:${PORT}`}
 `,
 );
 chmodSync(join(bin, "opencode"), 0o755);
 process.env.PATH = `${bin}:${process.env.PATH}`;
+// The panemode case watches paneCall: a fake script logs each add and rm it receives.
+const paneLog = join(bin, "pane.log");
+const fakePanes = join(bin, "fake-panes");
+writeFileSync(fakePanes, `#!/bin/sh\nprintf '%s\\n' "$1" >> "${paneLog}"\n`);
+chmodSync(fakePanes, 0o755);
+if (CASE === "panemode" || CASE === "expirepane") process.env.OC_PANES = fakePanes;
 
 const sent: string[] = [];
 let sends = 0;
@@ -380,6 +435,152 @@ if (CASE === "4xx") {
       && afterRetry === afterFail + 1
     ? "PASS  item 3: HTTP kept the handle, failures rediscovered once"
     : "FAIL  item 3: discovery count or failure mode is wrong, see above";
+} else if (CASE === "envparse") {
+  // OC_BACKSTOP_MS=abc must fall back to 5000 ms, not become a 1 ms interval.
+  await tool("oc_send").execute("e", { session: ID, text: "run" });
+  const base = detailGets;
+  await wait(700);
+  console.log(`detail reads after 700ms -> ${detailGets - base}`);
+  verdict = detailGets === base
+    ? "PASS  item 10: a non-numeric OC_BACKSTOP_MS fell back to the 5000 ms default"
+    : `FAIL  item 10: the bad interval polled ${detailGets - base} times in 700 ms`;
+} else if (CASE === "perms") {
+  let threw = "";
+  let res: { isError?: boolean; content: Array<{ text: string }> } | null = null;
+  try {
+    res = await tool("oc_open").execute("p", {
+      model: "stub/model-free",
+      title: "stub",
+      permissionsJson: "{not json",
+    });
+  } catch (error) {
+    threw = String(error);
+  }
+  const text = res ? res.content.map((part: any) => part.text).join(" ") : "";
+  console.log("oc_open ->", threw || JSON.stringify(text).slice(0, 160), `creates ${creates}`);
+  verdict = !threw && res?.isError === true && text.includes("permissionsJson") && creates === 0
+    ? "PASS  item 12: a malformed permissionsJson refused like the budget gate"
+    : `FAIL  item 12: malformed JSON escaped as ${threw || "a successful open"}`;
+} else if (CASE === "loopback") {
+  let threw = "";
+  try {
+    await tool("oc_read").execute("l", { session: ID });
+  } catch (error) {
+    threw = String(error);
+  }
+  console.log("oc_read ->", threw || "no error", `session GETs ${sessionGets}`);
+  verdict = threw.includes("not on loopback") && sessionGets === 0
+    ? "PASS  item 14: a non-loopback service URL was refused before any request"
+    : `FAIL  item 14: the password went to a non-loopback host (` + `${threw || "read succeeded"}, GETs ${sessionGets})`;
+} else if (CASE === "known") {
+  // A plain read must not add the thread; a rescan that finds no asks must drop it.
+  await tool("oc_read").execute("k", { session: ID });
+  const start = askReads;
+  await fire("input")({ source: "interactive" }, ctx);
+  await fire("agent_settled")({ aborted: false }, ctx);
+  await wait(200);
+  const afterRead = askReads;
+  await tool("oc_send").execute("k", { session: ID, text: "run" });
+  await fire("input")({ source: "interactive" }, ctx);
+  await fire("agent_settled")({ aborted: false }, ctx);
+  await wait(200);
+  const afterSend = askReads;
+  await fire("input")({ source: "interactive" }, ctx);
+  await fire("agent_settled")({ aborted: false }, ctx);
+  await wait(200);
+  const afterDrop = askReads;
+  console.log(`ask reads: start ${start}, after read ${afterRead}, after send ${afterSend}, after drop ${afterDrop}`);
+  verdict = afterRead === start && afterSend === afterRead + 2 && afterDrop === afterSend
+    ? "PASS  item 15: oc_read did not add a rescan target, and an empty rescan dropped the thread"
+    : "FAIL  item 15: a read added a known thread, or an empty rescan kept it";
+} else if (CASE === "askfail") {
+  realAt = Date.now() + 10;
+  const probe = await tool("oc_wait").execute("a", { session: ID, since: 1 });
+  const text = probe.content.map((part: any) => part.text).join(" ");
+  console.log("oc_wait ->", JSON.stringify(text).slice(0, 160), JSON.stringify(probe.details));
+  verdict = probe.details?.settled === true && probe.details?.asksReadable === false
+    ? "PASS  item 18: a settled run reports settled even when its asks are unreadable"
+    : "FAIL  item 18: details.settled still tracks ask readability";
+} else if (CASE === "rootfile") {
+  let threw = "";
+  try {
+    await tool("oc_open").execute("r", { model: "stub/model-free", title: "stub" });
+  } catch (error) {
+    threw = String(error);
+  }
+  console.log("oc_open ->", threw || "no error", `creates ${creates}`);
+  verdict = threw.includes("not a directory") && creates === 0
+    ? "PASS  item 19: OC_ROOT at a file was refused before the service saw a directory"
+    : `FAIL  item 19: a file root reached the service (${threw || "open succeeded"})`;
+} else if (CASE === "ceilenv") {
+  await tool("oc_send").execute("c1", { session: "ses_limit1", text: "one" });
+  await tool("oc_send").execute("c2", { session: "ses_limit2", text: "two" });
+  let threw = "";
+  try {
+    await tool("oc_send").execute("c3", { session: "ses_limit3", text: "three" });
+  } catch (error) {
+    threw = String(error);
+  }
+  console.log("third send ->", threw || "accepted");
+  verdict = threw.includes("2 threads in flight")
+    ? "PASS  item 11: OC_MAX_THREADS replaced the hardcoded ceiling"
+    : `FAIL  item 11: the ceiling still ignores OC_MAX_THREADS (${threw || "accepted"})`;
+} else if (CASE === "abortlist") {
+  await tool("oc_send").execute("t", { session: ID, text: "run" });
+  // A fake signal counts the listeners, so a leaked abort hook is visible.
+  const listeners = new Set<unknown>();
+  const fake = {
+    aborted: false,
+    addEventListener(_type: string, fn: unknown) { listeners.add(fn); },
+    removeEventListener(_type: string, fn: unknown) { listeners.delete(fn); },
+  };
+  const probe = await tool("oc_wait").execute("w", { session: ID, timeoutSec: 0 }, fake);
+  const text = probe.content.map((part: any) => part.text).join(" ");
+  console.log("oc_wait ->", JSON.stringify(text).slice(0, 120), `listeners ${listeners.size}`);
+  verdict = listeners.size === 0 && text.includes("still running")
+    ? "PASS  item 23: a finished wait removed its abort listener"
+    : `FAIL  item 23: the wait left ${listeners.size} abort listeners behind`;
+} else if (CASE === "panemode") {
+  // A TUI start opens columns; a switch to print must close them under the old mode.
+  ctx.mode = "tui";
+  await fire("session_start")({}, ctx);
+  await tool("oc_send").execute("t", { session: ID, text: "run" });
+  await wait(300);
+  ctx.mode = "print";
+  await fire("session_start")({}, ctx);
+  await wait(300);
+  const log = existsSync(paneLog) ? readFileSync(paneLog, "utf8") : "";
+  console.log("pane calls ->", JSON.stringify(log.trim()));
+  verdict = log.includes("add") && log.includes("rm")
+    ? "PASS  item 24: a switch from TUI to print closed the old columns"
+    : "FAIL  item 24: the mode switch left the old columns open";
+} else if (CASE === "busyexp") {
+  // A watch at its deadline must not expire a run that is still busy.
+  busyAt = Date.now();
+  await tool("oc_send").execute("b", { session: ID, text: "long run" });
+  await wait(2600);
+  const expiredEarly = sent.length;
+  // The run is still working: no expiry report. Now let it settle with a real answer.
+  idleAt = Date.now() + 10;
+  realAt = idleAt;
+  const deadline = Date.now() + 3000;
+  while (!sent.length && Date.now() < deadline) await wait(20);
+  const text = sent.join("\n");
+  console.log(`sent before settle ${expiredEarly}; sent after ${sent.length}:`, JSON.stringify(text).slice(0, 200));
+  verdict = expiredEarly === 0 && sent.length === 1 && text.includes("REAL") && !text.includes("watch expired")
+    ? "PASS  item 32: a busy run kept its watch past the TTL and reported its real settle once"
+    : `FAIL  item 32: the busy run expired or the settle was lost (early ${expiredEarly}, sent ${sent.length})`;
+} else if (CASE === "expirepane") {
+  // An expired watch is a guess, so its column must stay open; a real settle still closes it.
+  ctx.mode = "tui";
+  await fire("session_start")({}, ctx);
+  await tool("oc_send").execute("x", { session: ID, text: "run" });
+  await wait(3400);
+  const log = existsSync(paneLog) ? readFileSync(paneLog, "utf8") : "";
+  console.log("pane calls ->", JSON.stringify(log.trim()));
+  verdict = log.includes("add") && !log.includes("rm")
+    ? "PASS  item 32: an expired watch left its column open"
+    : "FAIL  item 32: an expired watch closed the column";
 } else {
   verdict = `FAIL  unknown CASE ${CASE}`;
 }

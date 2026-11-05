@@ -3,7 +3,7 @@
 This page lists every environment variable that the bridge and its helper scripts read, with its
 reader, default, and effect.
 
-The bridge reads 13 of these variables. The other 8 belong to `oc-rpc.ts`, `oc-panes`, and the check
+The bridge reads 14 of these variables. The other 8 belong to `oc-rpc.ts`, `oc-panes`, and the check
 scripts. The reader column names the file that reads the variable.
 
 | Variable | Reader | Default | Effect |
@@ -19,6 +19,7 @@ scripts. The reader column names the file that reads the variable.
 | `OC_COMPACT_TOKENS` | bridge | `500_000` | Thread size above which a send orders a compaction first. `0` turns the gate off. |
 | `OC_BUDGET_PCT` | bridge | `0` | Refuse open and send while the Go rolling meter is at or above this percent. `0` turns the ceiling off. |
 | `OC_BUDGET_TOKENS` | bridge | `0` | Cap the token total of delegated threads. `0` turns the cap off. |
+| `OC_MAX_THREADS` | bridge | `32` | Ceiling for in-flight watches and for a fan-out, judge included. |
 | `OC_HUD` | bridge | `on` | `0` removes the footer and the thread table. |
 | `OC_PANES` | bridge | `oc-panes next to the extension` | Path to the pane script. `0` turns columns off. |
 | `OC_RPC_MODEL` | oc-rpc | `""` | Model id for the RPC check. Set it to an id from `oc_models`. |

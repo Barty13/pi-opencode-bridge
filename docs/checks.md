@@ -252,7 +252,7 @@ PY
 Run from the package root. `BRIDGE` points a check at a control build.
 
 ```sh
-for c in 4xx 5xx nowatch expire stale dup ceiling handle flush streamgap; do CASE=$c bun run checks/check-3-unit.ts; done
+for c in 4xx 5xx nowatch expire stale dup ceiling handle flush streamgap envparse perms loopback known askfail rootfile ceilenv abortlist panemode busyexp expirepane; do CASE=$c bun run checks/check-3-unit.ts; done
 bun run checks/check-1-compact.ts
 BRIDGE=file://$PWD/.control-bridge.ts CASE=stale bun run checks/check-3-unit.ts   # must fail
 BRIDGE=file://$PWD/.control-bridge.ts CASE=dup bun run checks/check-3-unit.ts     # must fail
@@ -275,6 +275,32 @@ bun run checks/check-12-docs.ts
 BRIDGE=$PWD/.control-docs.ts bun run checks/check-12-docs.ts                      # must fail
 bun run checks/check-13-panes.ts
 ```
+
+`check-3-unit.ts` runs the bridge cases against a stub `pi` and a stub service; `CASE` picks one:
+
+| Case | What it proves |
+| --- | --- |
+| `4xx` | a send refused with HTTP 402 leaves no watch behind |
+| `5xx` | a send refused with HTTP 500 leaves no watch behind |
+| `flush` | a failed `pi.sendUserMessage` restores the batch and the retry carries the run |
+| `streamgap` | a full buffer and a silent stream both close the reader, which reconnects and rescans |
+| `expire` | an expired watch reports `outcome: unknown` and `open asks: unreadable` |
+| `nowatch` | `oc_wait` with `since` names the missing watch instead of inventing one |
+| `stale` | a sweep read that loses its watch releases the claim, so the next settle wakes the model |
+| `dup` | a run the batch already reported is not handed out again |
+| `ceiling` | `oc_wait` at the watch ceiling uses the busy row's idle as its floor |
+| `handle` | an HTTP answer keeps the service handle, and failures rediscover once |
+| `envparse` | a non-numeric `OC_BACKSTOP_MS` falls back to the 5000 ms default |
+| `perms` | a malformed `permissionsJson` returns the budget-gate refusal, not a `SyntaxError` |
+| `loopback` | a non-loopback service URL is refused before any request and any password |
+| `known` | `oc_read` does not add a rescan target, and an empty rescan drops the thread |
+| `askfail` | a settled run reports `settled: true` with `asksReadable: false` |
+| `rootfile` | `OC_ROOT` at a file is refused as a directory |
+| `ceilenv` | `OC_MAX_THREADS` replaces the hardcoded watch ceiling |
+| `abortlist` | a finished wait removes its abort listener |
+| `panemode` | a switch from TUI to print closes the old columns |
+| `busyexp` | a busy run keeps its watch past the TTL and reports its real settle once |
+| `expirepane` | an expired watch leaves its column open |
 
 `check-6-digest.ts` runs the settle ledger cases against a stub service:
 
@@ -376,7 +402,7 @@ The control carries five defects: the fan-out hold, so every member wakes alone 
 
 The control carries two defects: the `oc_fanout` page is gone (`inventory`), and `OC_DEBOUNCE_MS` reads `500` (`env`). Both cases must fail. The stage-12 control is a docs bundle, not a build of the extension; `BRIDGE` names the bundle under test.
 
-The `env` case covers the twenty-one `OC_*` and `BRIDGE` names in the Environment table: thirteen for the bridge, four for `oc-rpc.ts`, two for `oc-panes`, and two for the check scripts. `CASE`, `PATH`, and other check-local selectors are out of scope on purpose.
+The `env` case covers the twenty-two `OC_*` and `BRIDGE` names in the Environment table: fourteen for the bridge, four for `oc-rpc.ts`, two for `oc-panes`, and two for the check scripts. `CASE`, `PATH`, and other check-local selectors are out of scope on purpose.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the
@@ -395,5 +421,7 @@ cannot be installed safely. Read the `oc_open` and `oc_send` bodies in `opencode
 | `live` | a benign `add` reaches `osascript`, so a silent run below means a rejection |
 | `dir` | a directory with an apostrophe exits non-zero, prints one line, and calls no `osascript` |
 | `state` | a corrupt pane id in the state file is dropped by `rm`, which still exits 0 and calls no `osascript` |
+| `id` | a `tab-group-…` window id, a UUID anchor id, and a UUID pane id pass; an id with an apostrophe is refused before `osascript` |
+| `prune` | the live set spans every cursor page, a tab with no `sessionID` stays, and a non-loopback URL gets no request |
 
-One run covers the three cases in that order, and the marker file is the only signal for whether `osascript` ran.
+One run covers those cases in order, and the marker file is the only signal for whether `osascript` ran. The `prune` case starts a stub service; `PANES` points the run at a control script.

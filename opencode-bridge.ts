@@ -27,7 +27,7 @@
  * file. A send opens it, the settle closes it. Best effort, `OC_PANES=0` turns it off.
  */
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -66,21 +66,27 @@ const RETENTION: Array<[string, string]> = (() => {
     return [];  // a broken OC_RETENTION must not stop the load
   }
 })();
-const DEBOUNCE_MS = Number(process.env.OC_DEBOUNCE_MS ?? 400);
-const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
+/** Read one numeric environment variable. A missing, non-finite, or negative value falls back to
+ * the default, so a typo cannot turn a timer into a 1 ms loop or a TTL into no expiry. */
+function envNumber(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+const DEBOUNCE_MS = envNumber("OC_DEBOUNCE_MS", 400);
+const BACKSTOP_MS = envNumber("OC_BACKSTOP_MS", 5000);
 /** A silent stream for this long is half-open, so the reader closes it and reconnects. */
-const STREAM_GAP_MS = Number(process.env.OC_STREAM_GAP_MS ?? 90_000);
+const STREAM_GAP_MS = envNumber("OC_STREAM_GAP_MS", 90_000);
 /** A frame that never ends must not grow the buffer without bound. */
 const STREAM_MAX = 1024 * 1024;
-const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
-const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
-const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);
+const WATCH_TTL_MS = envNumber("OC_WATCH_TTL_S", 1800) * 1000;
+const WAIT_MAX_S = envNumber("OC_WAIT_MAX_S", 300);
+const COMPACT_TOKENS = envNumber("OC_COMPACT_TOKENS", 500_000);
 // Quota ceilings, 0 turns each off. The percent reads the rolling meter; the token cap counts
 // threads this Pi session delegated to.
-const BUDGET_PCT = Number(process.env.OC_BUDGET_PCT ?? 0);
-const BUDGET_TOKENS = Number(process.env.OC_BUDGET_TOKENS ?? 0);
+const BUDGET_PCT = envNumber("OC_BUDGET_PCT", 0);
+const BUDGET_TOKENS = envNumber("OC_BUDGET_TOKENS", 0);
 // Only in-flight sends are armed, so the ceiling bounds a runaway loop of sends, not real work.
-const MAX_THREADS = 32;
+const MAX_THREADS = envNumber("OC_MAX_THREADS", 32);
 // `OC_HUD=0` leaves the footer and the table alone.
 const HUD = process.env.OC_HUD !== "0";
 
@@ -379,10 +385,26 @@ let modelCache: {
 /** Quota meters cached for 30 s. The footer and the HUD read this; only budget() fills it. */
 let limitsCache: { at: number; value: Limits | null } = { at: 0, value: null };
 
+/** The service password is a local secret, so only a loopback host may receive it.
+ * `[::1]` is what `URL.hostname` reports for the bracketed IPv6 form. */
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+function loopback(url: string): boolean {
+  try {
+    return LOOPBACK.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
 /** Service url and password, read without blocking: a down service must not freeze the TUI. */
 async function discover(): Promise<Service> {
   const { stdout } = await promisify(execFile)("opencode", ["service", "status"], { encoding: "utf8", timeout: 5_000 });
   const url = stdout.trim();
+  if (!/^https?:\/\//.test(url)) throw new Error("OpenCode service not reachable");
+  // Check the host before the password read, so no other host ever sees the secret.
+  if (!loopback(url)) {
+    throw new Error(`OpenCode service ${url} is not on loopback; refusing to send the password`);
+  }
   const file = SERVICE_FILE;
   let password: unknown;
   try {
@@ -390,7 +412,7 @@ async function discover(): Promise<Service> {
   } catch (error) {
     throw new Error(`OpenCode service file ${file} is unreadable: ${error instanceof Error ? error.message : error}`);
   }
-  if (!/^https?:\/\//.test(url) || typeof password !== "string" || !password) {
+  if (typeof password !== "string" || !password) {
     throw new Error("OpenCode service not reachable");
   }
   return { url, password };
@@ -550,6 +572,8 @@ function directory(input?: string): string {
   const dir = input ? join(ROOT, input) : ROOT;
   if (dir !== ROOT && !dir.startsWith(ROOT + "/")) throw new Error(`Directory must sit under ${ROOT}`);
   if (!existsSync(dir)) throw new Error(`${dir} does not exist. Omit directory to work in ${ROOT}.`);
+  // A file passes existsSync but is not a working directory for a thread.
+  if (!statSync(dir).isDirectory()) throw new Error(`${dir} is not a directory. Omit directory to work in ${ROOT}.`);
   // A symlink under the root can point outside it, so check where the path really lands.
   const real = realpathSync(dir);
   if (real !== ROOT && !real.startsWith(ROOT + "/")) throw new Error(`${dir} resolves outside ${ROOT}`);
@@ -1133,12 +1157,16 @@ export default function (pi: ExtensionAPI) {
       });
   };
 
-  /** After an aborted run a delivered ask is invisible, so re-offer what the thread still holds. */
+  /** After an aborted run a delivered ask is invisible, so re-offer what the thread still holds.
+   * A rescan that finds no open asks drops the thread, so a long session does not pay two GETs per
+   * known thread on every human turn. A failed read keeps the entry for the next rescan. */
   const recoverAsks = async (mine: BridgeState) => {
-    for (const session of mine.known) {
+    for (const session of [...mine.known]) {
       try {
-        for (const ask of await asks(session)) {
-          if (mine !== state) return;
+        const open = await asks(session);
+        if (mine !== state) return;
+        if (!open.length) mine.known.delete(session);
+        for (const ask of open) {
           if (mine.reported.delete(ask.id)) offer(ask);
         }
       } catch {
@@ -1211,7 +1239,8 @@ export default function (pi: ExtensionAPI) {
     mine.claimed.delete(settle.session);
     // A settled thread with no open ask needs no rescan, so release it from the reconnect list.
     if (!settle.asks.length && !settle.asksUnknown) mine.known.delete(settle.session);
-    paneCall(["rm", settle.session]);
+    // An expired watch is a guess about a run that may still work, so its column stays open.
+    if (!settle.expired) paneCall(["rm", settle.session]);
     // A fan-out member is held until every member is terminal: one report per fan-out.
     const fanId = mine.fanMember.get(settle.session);
     if (fanId) {
@@ -1329,10 +1358,11 @@ export default function (pi: ExtensionAPI) {
     armFlush(mine);
   }
 
-  /** The judge prompt: every answer, labelled by model, with the brief to rank against. */
+  /** The judge prompt: every answer, labelled by model, with the brief to rank against.
+   * Each answer passes `truncate`, so one long member cannot grow the judge POST without bound. */
   function judgePrompt(fan: Fanout): string {
     const answers = fan.members.map((member) => {
-      const answer = member.settle?.answer ?? "(no answer)";
+      const answer = truncate(member.settle?.answer ?? "(no answer)");
       return `### ${member.model}\n${answer}`;
     });
     return [
@@ -1509,6 +1539,21 @@ export default function (pi: ExtensionAPI) {
     const reads: Array<{ session: string; w: Watch }> = [];
     for (const [session, w] of [...mine.armed]) {
       if (Date.now() > w.deadline) {
+        // A watch at its deadline may outlive a run that is still working. One cheap detail read
+        // decides: busy means the run is alive, so the watch gets a fresh TTL and no report.
+        // An idle row, a gone thread, or a failed read expires exactly as before.
+        let row: any = null;
+        let readFailed = false;
+        try {
+          row = (await api<any>("GET", `/api/session/${session}`)).data;
+        } catch {
+          readFailed = true;
+        }
+        if (mine !== state) return;
+        if (!readFailed && busy(row)) {
+          w.deadline = Date.now() + WATCH_TTL_MS;
+          continue;
+        }
         const expired: Settle = {
           // Nothing was read: the outcome and asks are unknown, not "running"/"none", and asksUnknown keeps the thread in `known` (:681) so a rescan re-checks it.
           session, title: "", outcome: "unknown", error: null, answer: "", asks: [],
@@ -1567,6 +1612,8 @@ export default function (pi: ExtensionAPI) {
     new Promise((resolve) => {
       const drop = () => {
         clearTimeout(timeout);
+        // The wait is over, so the listener must not stay on a signal that outlives it.
+        signal?.removeEventListener("abort", drop);
         const rest = (mine.waiters.get(session) ?? []).filter((fn) => fn !== done);
         if (rest.length) mine.waiters.set(session, rest);
         else mine.waiters.delete(session);
@@ -1574,6 +1621,7 @@ export default function (pi: ExtensionAPI) {
       };
       const done = (settle: Settle | null) => {
         clearTimeout(timeout);
+        signal?.removeEventListener("abort", drop);
         resolve(settle);
       };
       const list = mine.waiters.get(session) ?? [];
@@ -1746,6 +1794,11 @@ export default function (pi: ExtensionAPI) {
         signal.removeEventListener("abort", stop);
         done();
       };
+      // An abort that landed before this call would never fire a later listener.
+      if (signal.aborted) {
+        done();
+        return;
+      }
       const timer = setTimeout(stop, ms);
       timer.unref?.();
       signal.addEventListener("abort", stop, { once: true });
@@ -1930,9 +1983,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, context) => {
     ctx = context;
+    // Close the old columns under the old mode first: a switch from TUI to print would otherwise
+    // turn panesOn off before reset() can close them.
+    reset();
     // Panes need a terminal, so print, JSON, and RPC runs never open a column.
     panesOn = context.mode === "tui";
-    reset();
     const mine = state;
     // Restore armed floors from the last session; the deadline gets a fresh TTL.
     const savedEntry = (context.sessionManager.getEntries()
@@ -1959,6 +2014,10 @@ export default function (pi: ExtensionAPI) {
       if (!readFailed && !busy(current)) return;
       // The fetched row already carries the HUD numbers; do not ask again.
       noteThread(mine, current);
+      // A restored run owes the same rescan and token census as a fresh send. An attached row is
+      // not delegation, so it stays out of OC_BUDGET_TOKENS.
+      mine.known.add(row.session);
+      if (!row.attached) mine.delegated.add(row.session);
       mine.armed.set(row.session, {
         floor: row.floor,
         deadline: Date.now() + WATCH_TTL_MS,
@@ -2105,6 +2164,22 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
+        // A malformed ruleset is a refusal with the budget-gate shape, not an uncaught SyntaxError.
+        let permissions: unknown;
+        if (params.permissionsJson) {
+          try {
+            permissions = JSON.parse(params.permissionsJson);
+          } catch {
+            return {
+              content: [{
+                type: "text",
+                text: `permissionsJson is not valid JSON. Send a ruleset, for example [{"action":"*","resource":"*","effect":"ask"}].`,
+              }],
+              details: { session: "" },
+              isError: true,
+            };
+          }
+        }
         const model = await requireModel(params.model);
         const variant = pickVariant(params.variant, model.variants);
         const dir = directory(params.directory);
@@ -2112,7 +2187,7 @@ export default function (pi: ExtensionAPI) {
           title: params.title,
           model: { id: model.id, providerID: model.providerID, ...(variant ? { variant } : {}) },
           location: { directory: dir },
-          ...(params.permissionsJson ? { permissions: JSON.parse(params.permissionsJson) } : {}),
+          ...(permissions !== undefined ? { permissions } : {}),
         });
         const session = created.data.id as string;
         state.known.add(session);
@@ -2200,14 +2275,25 @@ export default function (pi: ExtensionAPI) {
         if (new Set(requested).size !== requested.length) throw new Error("oc_fanout models must be unique");
         const dir = directory(params.directory);
         // The cap runs before any create, so a refusal leaves the service untouched.
+        // The active map carries no directory, so each active id gets one detail read and
+        // `underRoot` filters out runs from other projects and other Pi sessions.
         const active = await api<any>("GET", "/api/session/active");
-        // Active runs and this bridge's own armed watches are both live; the larger count wins.
-        const live = Math.max(Object.keys(active?.data ?? {}).length, state.armed.size);
-        if (live + requested.length > MAX_THREADS) {
+        const activeIds = Object.keys(active?.data ?? {});
+        const activeRows = await Promise.all(activeIds.map((id) =>
+          api<any>("GET", `/api/session/${id}`).then((res) => res?.data).catch(() => null)
+        ));
+        const activeLive = activeRows.filter(underRoot).length;
+        // Active runs under the root and this bridge's own armed watches are both live; the larger count wins.
+        const live = Math.max(activeLive, state.armed.size);
+        // The judge opens one more thread after the members, so it counts before any create.
+        const adding = requested.length + (params.judge ? 1 : 0);
+        if (live + adding > MAX_THREADS) {
           return {
             content: [{
               type: "text",
-              text: `fan-out refused: ${live} live threads + ${requested.length} new exceed ${MAX_THREADS}`,
+              text: `fan-out refused: ${live} live threads + ${adding} new exceed ${MAX_THREADS}${
+                params.judge ? " (the judge counts as one)" : ""
+              }`,
             }],
             details: { fanout: "", sessions: [] as string[] },
             isError: true,
@@ -2259,25 +2345,25 @@ export default function (pi: ExtensionAPI) {
         };
         fan.title = fan.id;
         state.fanouts.set(fan.id, fan);
-        const lines: string[] = [];
-        for (const plan of plans) {
-          const model = `${plan.providerID}/${plan.id}`;
-          const variant = plan.variant ?? "default";
-          const skip = memberRefusal(limits, plan.providerID, plan.id);
-          const member: FanMember = {
-            session: "",
-            model,
-            variant,
-            settle: null,
-            skip: skip ? skip : null,
-            fail: null,
-            deadline: Date.now() + ttlMs,
-          };
-          fan.members.push(member);
-          if (skip) {
-            lines.push(`${model}  variant ${variant}  skipped: ${skip}`);
-            continue;
-          }
+        // Build every member in caller order first, so the report keeps that order whatever the
+        // create and prompt order turns out to be.
+        const members: FanMember[] = plans.map((plan) => ({
+          session: "",
+          model: `${plan.providerID}/${plan.id}`,
+          variant: plan.variant ?? "default",
+          settle: null,
+          skip: memberRefusal(limits, plan.providerID, plan.id),
+          fail: null,
+          deadline: Date.now() + ttlMs,
+        }));
+        fan.members.push(...members);
+        // Start every member together. Promise.allSettled keeps one broken member from stopping
+        // the rest; each task catches its own service error to keep the receipt specific.
+        const receipts = await Promise.allSettled(plans.map(async (plan, index) => {
+          const member = members[index];
+          const model = member.model;
+          const variant = member.variant;
+          if (member.skip) return `${model}  variant ${variant}  skipped: ${member.skip}`;
           let created: any;
           try {
             created = await api<any>("POST", "/api/session", {
@@ -2287,8 +2373,7 @@ export default function (pi: ExtensionAPI) {
             });
           } catch (error) {
             member.fail = error instanceof Error ? error.message : String(error);
-            lines.push(`${model}  variant ${variant}  failed: ${member.fail}`);
-            continue;
+            return `${model}  variant ${variant}  failed: ${member.fail}`;
           }
           const session = String(created.data.id);
           member.session = session;
@@ -2304,7 +2389,7 @@ export default function (pi: ExtensionAPI) {
           try {
             await sendPrompt(session, { text: brief }, ttlMs);
             if (state.armed.has(session)) paneCall(["add", session, dir]);
-            lines.push(`${session}  ${model}  variant ${variant}  brief sent`);
+            return `${session}  ${model}  variant ${variant}  brief sent`;
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             // A 4xx dropped the watch; a timeout may still run, so its deadline keeps the place.
@@ -2314,7 +2399,17 @@ export default function (pi: ExtensionAPI) {
               state.fanMember.delete(session);
               fan.waiting--;
             }
-            lines.push(`${session}  ${model}  variant ${variant}  brief failed: ${message}`);
+            return `${session}  ${model}  variant ${variant}  brief failed: ${message}`;
+          }
+        }));
+        const lines: string[] = [];
+        for (const [index, result] of receipts.entries()) {
+          if (result.status === "fulfilled") {
+            lines.push(result.value);
+          } else {
+            const member = members[index];
+            member.fail = result.reason instanceof Error ? result.reason.message : String(result.reason);
+            lines.push(`${member.model}  variant ${member.variant}  failed: ${member.fail}`);
           }
         }
         if (judgePlan) {
@@ -2680,7 +2775,7 @@ export default function (pi: ExtensionAPI) {
           }
           return {
             content: [{ type: "text", text: "wait cancelled; the settle stays queued" }],
-            details: { session: params.session, settled: false, asks: [] as Ask[] },
+            details: { session: params.session, settled: false, asksReadable: false, asks: [] as Ask[] },
           };
         }
         if (!settle && params.since === undefined && (mine.armed.has(params.session) || mine.fanMember.has(params.session))) {
@@ -2690,7 +2785,7 @@ export default function (pi: ExtensionAPI) {
             : "the watch stays armed";
           return {
             content: [{ type: "text", text: `still running after ${seconds}s; ${tail}` }],
-            details: { session: params.session, settled: false, asks: [] as Ask[] },
+            details: { session: params.session, settled: false, asksReadable: false, asks: [] as Ask[] },
           };
         }
         // No watch left: the thread was stopped or deleted, or this call reads the record on purpose.
@@ -2701,7 +2796,7 @@ export default function (pi: ExtensionAPI) {
           if (read === "gone") forget(state, params.session);
           return {
             content: [{ type: "text", text: read === "gone" ? "thread is gone" : "thread unreadable" }],
-            details: { session: params.session, settled: false, asks: [] as Ask[] },
+            details: { session: params.session, settled: false, asksReadable: false, asks: [] as Ask[] },
             isError: true,
           };
         }
@@ -2718,7 +2813,7 @@ export default function (pi: ExtensionAPI) {
               type: "text",
               text: `no settle after ${params.since ?? floor}; ${tail}`,
             }],
-            details: { session: params.session, settled: false, asks: read.asks },
+            details: { session: params.session, settled: false, asksReadable: !read.asksUnknown, asks: read.asks },
           };
         }
         // One run reaches the model once. The wake-up already carried this run, so point at it
@@ -2731,7 +2826,7 @@ export default function (pi: ExtensionAPI) {
               type: "text",
               text: `already reported: outcome ${read.outcome}, idle at ${read.idleAt}; no newer run. oc_read shows the record.`,
             }],
-            details: { session: params.session, settled: false, asks: read.asks },
+            details: { session: params.session, settled: false, asksReadable: !read.asksUnknown, asks: read.asks },
           };
         }
         // This call is the first report of these runs, so mark every one: the wake-up channel is spent.
@@ -2746,7 +2841,8 @@ export default function (pi: ExtensionAPI) {
         if (!read.expired && read.idleAt > floor && (!armedNow || read.idleAt > armedNow.floor)) dropThread(params.session);
         return {
           content: [{ type: "text", text: settleText(read) }],
-          details: { session: params.session, settled: !read.asksUnknown, asks: read.asks },
+          // `settled` says the run reached its idle; ask readability is a separate fact.
+          details: { session: params.session, settled: !read.expired, asksReadable: !read.asksUnknown, asks: read.asks },
         };
       },
     }),
@@ -2779,7 +2875,7 @@ export default function (pi: ExtensionAPI) {
         // An idle row carries only a status, so it must not crowd out the answer.
         const answer = rows.filter((row: any) => row.type !== "idle").slice(0, want);
         const shown = answer.length ? answer : rows.slice(0, want);
-        state.known.add(params.session);
+        // A read is not a watch: only an armed run or an ask adds the thread to the rescan list.
         const full = params.parts === "full";
         const at = Math.max(0, params.offset ?? 0);
         const text = shown.map((row: any) => rowBlock(row, full, at)).join("\n\n");

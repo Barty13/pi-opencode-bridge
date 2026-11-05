@@ -5,6 +5,7 @@
 - One local HTTP service, the port `opencode service status` prints. It sends no other request.
 - `~/.config/opencode/service.json`, read at runtime for that service password. The value goes in
   one `Authorization` header. It is never logged, printed, written, or sent elsewhere.
+  The password goes only to a loopback host (`127.0.0.1`, `localhost`, `::1`); any other service URL is refused.
 - Your OpenCode CLI, for two read-only calls: `opencode service status` and `opencode models`.
 
 The bridge installs nothing, and writes nothing to disk. Thread creation and deletion go through

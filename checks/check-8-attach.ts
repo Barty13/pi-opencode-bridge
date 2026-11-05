@@ -21,6 +21,8 @@ process.env.OC_DEBOUNCE_MS = "20";
 process.env.OC_BACKSTOP_MS = "100";
 process.env.OC_COMPACT_TOKENS = "0";
 process.env.OC_WATCH_TTL_S = "1";
+// The restore case proves a restored run joins the delegated census: each row carries 7535 tokens.
+process.env.OC_BUDGET_TOKENS = "7000";
 
 import { chmodSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,6 +47,8 @@ let rows: any[] = [];
 let idleRows: any[] = [];
 const interrupts: string[] = [];
 const deleted: string[] = [];
+/** Ask reads, so the restore case can prove which threads are in `known`. */
+let askReads = 0;
 
 const rowFor = (id: string, dir: string, busy: number, idle: number, created: number) => ({
   id,
@@ -87,7 +91,10 @@ Bun.serve({
       return new Response(null, { status: 204 });
     }
     if (req.method === "POST" && p.endsWith("/prompt")) return json({ accepted: true });
-    if (p.endsWith("/permission") || p.endsWith("/form")) return json([]);
+    if (p.endsWith("/permission") || p.endsWith("/form")) {
+      askReads++;
+      return json([]);
+    }
     if (p === "/api/event") {
       return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
     }
@@ -290,7 +297,7 @@ entries = [{
   type: "custom",
   customType: "oc-armed",
   data: [
-    { session: MAIN, floor: restoreIdle, steers: 0, attached: true },
+    { session: MAIN, floor: restoreIdle, steers: 0, attached: false },
     { session: IDLE_RESTORE, floor: restoreIdle, steers: 0, attached: true },
   ],
 }];
@@ -300,6 +307,19 @@ const restoreNotice = notices.at(-1) ?? "";
 console.log("restore ->", restoreNotice);
 check("restore one watch", restoreNotice.includes("armed: 1") && !restoreNotice.includes("armed: 2"), restoreNotice);
 check("restore attached", restoreNotice.includes(`${IDLE_RESTORE}`) && restoreNotice.includes("attached"), restoreNotice);
+// A restored busy row joins `known`, so a later rescan reads its asks.
+const knownBefore = askReads;
+await fire("input")({ source: "interactive" }, ctx);
+await fire("agent_settled")({ aborted: false }, ctx);
+await wait(200);
+check("restore known", askReads > knownBefore, `${askReads - knownBefore} ask reads`);
+// A restored non-attached run joins `delegated`: its 7535 tokens cross the 7000 cap.
+const restoreSend = await tool("oc_send").execute("t", { session: IDLE_RESTORE, text: "after restore" });
+check(
+  "restore delegated",
+  restoreSend.isError === true && textOf(restoreSend).includes("OC_BUDGET_TOKENS 7000") && textOf(restoreSend).includes(MAIN),
+  textOf(restoreSend),
+);
 const restoreDetach = await tool("oc_stop").execute("t", { session: MAIN, detach: true });
 check("restore detach", textOf(restoreDetach) === "detached; the run keeps going", textOf(restoreDetach));
 const restoreWake = sent.length;
@@ -321,6 +341,10 @@ const readfailNotice = notices.at(-1) ?? "";
 console.log("readfail ->", readfailNotice);
 check("readfail armed", readfailNotice.includes("armed: 1"), readfailNotice);
 check("readfail listed", readfailNotice.includes(READFAIL), readfailNotice);
+// The restored row carries `attached`, so it stays out of the delegated census and the gate passes.
+failDetail = false;
+const attachedSend = await tool("oc_send").execute("t", { session: READFAIL, text: "after restore" });
+check("restore attached not delegated", attachedSend.isError !== true, textOf(attachedSend));
 
 // clean: force deletes idle threads but keeps the adopted one and names it.
 failDetail = false;
