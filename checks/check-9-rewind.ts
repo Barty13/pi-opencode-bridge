@@ -12,7 +12,7 @@
  *   A stage, a commit, or a clear on a busy thread answers 409 SessionBusyError; fork answers 200.
  *   GET /message?order=desc&limit=200 carries user rows with their ids.
  *
- * Cases: stage, steered, window, clear, ask, commit, nogitroot, branch, armed, noui. The control
+ * Cases: stage, steered, window, clear, ask, commit, nogitroot, branch, armed, batch, noui. The control
  * carries five defects: the stage ask after the stage (ask), the newest-user-row target (steered),
  * the untracked clear (clear), the no-UI advice (noui), and the plain no-files line in place of the
  * no-git wording (nogitroot).
@@ -41,6 +41,8 @@ const NOW = Date.now();
 const IDLE_AT = NOW - 1000;
 const BUSY_AT = NOW - 4000;
 let busyAt = BUSY_AT;
+/** When set, the parent row carries a settled run at this idle time. */
+let live: { idleAt: number; busyAt: number } | null = null;
 /** Return no files from the stage, as a root without git history does. */
 let noGit = false;
 
@@ -106,7 +108,9 @@ const parentRow = () => ({
   cost: 0.0031,
   tokens: { input: 6181, output: 1308, reasoning: 46, cache: { read: 1200, write: 0 } },
   outcome: "succeeded",
-  time: { created: NOW - 60_000, updated: IDLE_AT, busy: busyAt, idle: IDLE_AT },
+  time: live
+    ? { created: NOW - 60_000, updated: live.idleAt, busy: live.busyAt, idle: live.idleAt }
+    : { created: NOW - 60_000, updated: IDLE_AT, busy: busyAt, idle: IDLE_AT },
   title: "rewind-probe",
   location: { directory: ROOT },
 });
@@ -131,6 +135,8 @@ const trace: string[] = [];
 const confirms: string[] = [];
 let confirmAnswer = true;
 let forks = 0;
+/** Push one SSE event, so the batch case can settle a thread without the backstop. */
+let pushEvent: (event: unknown) => void = () => {};
 
 Bun.serve({
   hostname: "127.0.0.1",
@@ -143,7 +149,12 @@ Bun.serve({
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify({ data }), { status, headers: { "content-type": "application/json" } });
     if (p === "/api/event") {
-      return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
+      return new Response(new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          pushEvent = (event) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
     }
     if (p === "/api/model") return json([]);
     if (req.method === "POST" && p === `/api/session/${ID}/revert/stage`) {
@@ -531,11 +542,42 @@ check("noui no advice", !nouiError.includes("/oc-auto"), nouiError);
 check("noui trace", trace.join(",") === "stage", trace.join(","));
 check("noui no commit", !trace.includes("commit"), trace.join(","));
 
+// batch: a settle the stream missed waits in the batch; the rewind must carry it, not wake the
+// model about a run that it just reverted.
+await fire("agent_settled")({ aborted: true }, ctx);
+const batchNow = Date.now();
+const settledIdle = batchNow + 100;
+live = { idleAt: settledIdle, busyAt: batchNow - 1000 };
+rows = [
+  { id: "msg_live_idle", type: "idle", outcome: "succeeded", time: { created: settledIdle } },
+  { id: "msg_live_answer", type: "assistant", time: { created: settledIdle - 20 }, content: [{ type: "text", text: "SETTLED-RUN" }] },
+  { id: "msg_live_user", type: "user", time: { created: settledIdle - 30 }, text: "live run" },
+  ...rows,
+];
+const batchBefore = sent.length;
+await tool("oc_send").execute("t", { session: ID, text: "live run" });
+pushEvent({ type: "session.execution.succeeded", data: { sessionID: ID } });
+await wait(300);
+resetTrace();
+confirmAnswer = true;
+const batchText = textOf(await tool("oc_rewind").execute("t", { session: ID }));
+console.log("batch rewind ->", batchText);
+check(
+  "batch rewind carries settle",
+  batchText.includes("The run had already settled") && batchText.includes("SETTLED-RUN"),
+  batchText.replace(/\n/g, " | "),
+);
+// Lift the hold: the batch is empty, so no wake-up may name the reverted run.
+await fire("input")({ source: "rpc" }, ctx);
+await fire("agent_settled")({}, ctx);
+await wait(300);
+check("batch no wake", sent.length === batchBefore, `${sent.length - batchBefore}`);
+
 await fire("session_shutdown")({}, ctx);
 
 if (failures.length) {
   console.log(`FAIL rewind: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS rewind: a file stage asks before the rewrite, a steer does not become the target, an old opener gets the window wording, clear tracks the stage, supervised commit asks before it commits, auto commits after the stage, a no-git stage names the untouched paths, branch forks before the target and attaches, an armed watch refuses with zero calls, no UI keeps the stage without auto advice");
+console.log("PASS rewind: a file stage asks before the rewrite, a steer does not become the target, an old opener gets the window wording, clear tracks the stage, supervised commit asks before it commits, auto commits after the stage, a no-git stage names the untouched paths, branch forks before the target and attaches, an armed watch refuses with zero calls, a batched settle rides in the receipt without a later wake, no UI keeps the stage without auto advice");
 process.exit(0);

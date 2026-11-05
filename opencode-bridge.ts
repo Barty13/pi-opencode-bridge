@@ -68,6 +68,10 @@ const RETENTION: Array<[string, string]> = (() => {
 })();
 const DEBOUNCE_MS = Number(process.env.OC_DEBOUNCE_MS ?? 400);
 const BACKSTOP_MS = Number(process.env.OC_BACKSTOP_MS ?? 5000);
+/** A silent stream for this long is half-open, so the reader closes it and reconnects. */
+const STREAM_GAP_MS = Number(process.env.OC_STREAM_GAP_MS ?? 90_000);
+/** A frame that never ends must not grow the buffer without bound. */
+const STREAM_MAX = 1024 * 1024;
 const WATCH_TTL_MS = Number(process.env.OC_WATCH_TTL_S ?? 1800) * 1000;
 const WAIT_MAX_S = Number(process.env.OC_WAIT_MAX_S ?? 300);
 const COMPACT_TOKENS = Number(process.env.OC_COMPACT_TOKENS ?? 500_000);
@@ -584,6 +588,8 @@ function forget(state: BridgeState, session: string): void {
   state.info.delete(session);
   state.delegated.delete(session);
   state.reportedRun.delete(session);
+  // A fan-out member that is gone owes no section or wait.
+  state.fanMember.delete(session);
   // A deleted thread's asks must stop occupying the queue and the reported set.
   const dropped = state.pendingAsks.filter((ask) => ask.session === session);
   state.pendingAsks = state.pendingAsks.filter((ask) => ask.session !== session);
@@ -1047,11 +1053,12 @@ export default function (pi: ExtensionAPI) {
     if (state.reported.has(ask.id)) return;
     // prompt() refuses during compaction and the refusal never reaches this code (agent-session.js:1648-1650, :2774-2782); queue for afterCompact.
     if (state.compacting) return queueAsk(ask);
-    state.reported.add(ask.id);
+    // Send first, then mark: a throw leaves the ask unclaimed, so a rescan can offer it again.
     // steer reaches a turn that is already running; followUp would wait for it to settle,
     // and an oc_wait holding that turn would then deadlock against the thread.
     // sendUserMessage returns void, so a failed send surfaces from Pi, not from here.
     pi.sendUserMessage(`[opencode] ${describe(ask)}`, { deliverAs: "steer" });
+    state.reported.add(ask.id);
   };
 
   // Drain the batch before delivering, so a re-queue cannot spin the loop. Re-read the thread:
@@ -1171,6 +1178,18 @@ export default function (pi: ExtensionAPI) {
       : `${batch.length} OpenCode threads`;
     const head = `${count}${waited ? " settled while the run was cancelled" : " settled"}:`;
     const text = `${head}\n${batch.map(batchLine).join("\n")}\n\nRead a thread with oc_read, then continue the task that started it.`;
+    // prompt() ignores deliverAs while idle and queues on it while busy (agent-session.js:1664-1677),
+    // so one call covers both states.
+    try {
+      pi.sendUserMessage(text, { deliverAs: "followUp" });
+    } catch {
+      // The send failed, so the batch is still unreported: put it back and retry after the debounce.
+      mine.batch = [...batch, ...mine.batch];
+      mine.batchWaited = waited;
+      armFlush(mine);
+      return;
+    }
+    // Mark after the send: a throw above must not spend the run.
     for (const settle of batch) {
       markReported(settle.asks);
       for (const section of settle.fan ?? []) markReported(section.asks);
@@ -1179,9 +1198,6 @@ export default function (pi: ExtensionAPI) {
         mine.reportedRun.set(run.session, run.idleAt);
       }
     }
-    // prompt() ignores deliverAs while idle and queues on it while busy (agent-session.js:1664-1677),
-    // so one call covers both states.
-    pi.sendUserMessage(text, { deliverAs: "followUp" });
   }
 
   /** A delivered text hands these asks to the model, so a rescan must not re-offer them (:605). */
@@ -1398,7 +1414,8 @@ export default function (pi: ExtensionAPI) {
     if (fan.phase === "done") return;
     const member = fan.members.find((entry) => entry.session === settle.session);
     if (member) {
-      if (member.settle) return;
+      // A failed member already took its place in the report, so a later run must not count again.
+      if (member.settle || member.fail) return;
       member.settle = settle;
       fan.waiting--;
     } else if (fan.judge && fan.judge.session === settle.session) {
@@ -1605,33 +1622,76 @@ export default function (pi: ExtensionAPI) {
     await sweep();
   };
 
-  /** Split one connection into frames; a bad frame must not drop the frames behind it. */
-  const readStream = async (body: NonNullable<Response["body"]>) => {
+  /** Split one connection into frames; a bad frame must not drop the frames behind it.
+   * A silent gap or an oversized buffer closes the body, so `watch` reconnects and rescans. */
+  const readStream = async (body: NonNullable<Response["body"]>, signal: AbortSignal) => {
     const decoder = new TextDecoder();
     let buffer = "";
-    for await (const chunk of body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      // Keep a trailing CR for one chunk, because its LF may open the next chunk.
-      const held = buffer.endsWith("\r");
-      buffer = (held ? buffer.slice(0, -1) : buffer).replace(/\r\n?/g, "\n") + (held ? "\r" : "");
-      let cut = buffer.indexOf("\n\n");
-      while (cut >= 0) {
-        const frame = buffer.slice(0, cut);
-        buffer = buffer.slice(cut + 2);
-        cut = buffer.indexOf("\n\n");
-        // One frame can carry its JSON on several data lines; join them first.
-        const data = frame
-          .split("\n")
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).replace(/^ /, ""))
-          .join("\n");
-        if (!data) continue;
-        try {
-          onEvent(JSON.parse(data));
-        } catch {
-          // The buffer is already past this frame, so the frames behind it still arrive.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let endGap: (() => void) | null = null;
+    const close = () => {
+      void body.cancel().catch(() => {});
+    };
+    // The timer is unref'd and abort-aware, so a shutdown never waits on a quiet stream.
+    const stop = () => {
+      if (timer) clearTimeout(timer);
+      endGap?.();
+      signal.removeEventListener("abort", stop);
+    };
+    if (signal.aborted) return;
+    signal.addEventListener("abort", stop, { once: true });
+    const iterator = body[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        if (signal.aborted) break;
+        // Race the next chunk against the gap, because a cancel alone may not wake a pending read.
+        const gap = new Promise<"gap">((resolve) => {
+          endGap = () => resolve("gap");
+          timer = setTimeout(endGap, STREAM_GAP_MS);
+          timer.unref?.();
+        });
+        const next = await Promise.race([iterator.next(), gap]);
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        endGap = null;
+        if (next === "gap") {
+          // A silent stream is half-open, so close it and let `watch` reconnect and rescan.
+          close();
+          break;
+        }
+        if (next.done) break;
+        buffer += decoder.decode(next.value, { stream: true });
+        // Keep a trailing CR for one chunk, because its LF may open the next chunk.
+        const held = buffer.endsWith("\r");
+        buffer = (held ? buffer.slice(0, -1) : buffer).replace(/\r\n?/g, "\n") + (held ? "\r" : "");
+        let cut = buffer.indexOf("\n\n");
+        while (cut >= 0) {
+          const frame = buffer.slice(0, cut);
+          buffer = buffer.slice(cut + 2);
+          cut = buffer.indexOf("\n\n");
+          // One frame can carry its JSON on several data lines; join them first.
+          const data = frame
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).replace(/^ /, ""))
+            .join("\n");
+          if (!data) continue;
+          try {
+            onEvent(JSON.parse(data));
+          } catch {
+            // The buffer is already past this frame, so the frames behind it still arrive.
+          }
+        }
+        // A frame that never ends must not grow the buffer without bound.
+        if (buffer.length > STREAM_MAX) {
+          close();
+          break;
         }
       }
+    } finally {
+      stop();
     }
   };
 
@@ -1664,7 +1724,7 @@ export default function (pi: ExtensionAPI) {
         // This stream carries only later events, so read the gap before taking new ones.
         await rescan();
         if (signal.aborted) return;
-        await readStream(res.body);
+        await readStream(res.body, signal);
         // The stream is volatile by contract, so even a clean end waits before reconnecting. The
         // sleep is unref'd and abort-aware, so a shutdown never waits on a reconnect pause.
         await sleep(1000, signal);
@@ -1698,8 +1758,8 @@ export default function (pi: ExtensionAPI) {
 
   /**
    * Arm before the POST: a run that fails in milliseconds writes time.idle before the POST
-   * returns. A definitive 4xx means the prompt never landed, so the watch goes with it; a timeout
-   * keeps the watch, because the service may be running that prompt.
+   * returns. A 4xx, a 5xx, or a socket failure means the prompt never landed, so the fresh watch
+   * goes with it. A timeout or an abort may still run, so that watch stays.
    */
   const sendPrompt = async (
     session: string,
@@ -1722,8 +1782,10 @@ export default function (pi: ExtensionAPI) {
     } catch (error) {
       if (/HTTP 404/.test(String(error))) dropThread(session);
       else if (previous) mine.armed.set(session, previous);
-      // No earlier watch: a 409 run is not one we armed, other 4xx mean the prompt never landed. Either way the fresh watch is a phantom the sweep would expire into a lie (:721-726).
-      else if (/HTTP 4\d\d/.test(String(error))) dropThread(session);
+      // No earlier watch: a 409 run is not one we armed, and other 4xx, 5xx, or a socket error
+      // mean the prompt never landed. Either way the fresh watch is a phantom the sweep would
+      // expire into a lie (:721-726).
+      else if (error instanceof TypeError || /HTTP [45]\d\d/.test(String(error))) dropThread(session);
       throw error;
     } finally {
       const left = (mine.sending.get(session) ?? 1) - 1;
@@ -2248,6 +2310,8 @@ export default function (pi: ExtensionAPI) {
             // A 4xx dropped the watch; a timeout may still run, so its deadline keeps the place.
             if (!state.armed.has(session)) {
               member.fail = message;
+              // A failed member is terminal, so a later send to this thread owes no second decrement.
+              state.fanMember.delete(session);
               fan.waiting--;
             }
             lines.push(`${session}  ${model}  variant ${variant}  brief failed: ${message}`);
@@ -2504,10 +2568,24 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-        const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept });
+        // A settle the stream missed sits in the batch and names the run this rewind reverts.
+        // Take it out, so a wake-up cannot report a run that is no longer there.
+        const queuedIndex = state.batch.findIndex((entry) => entry.session === session);
+        const queued = queuedIndex >= 0 ? state.batch.splice(queuedIndex, 1)[0] : null;
+        const stage = await revert("POST", `/api/session/${session}/revert/stage`, { messageID: target, files: !kept })
+          .catch((error) => {
+            // The stage failed, so the run still stands: put the settle back.
+            if (queued) state.batch.push(queued);
+            throw error;
+          });
         const paths = pathsOf(stage);
         state.staged.set(session, target);
-        const head = [`rewound ${session} to ${target}`, fileLine(paths, digestPaths), digest];
+        const head = [
+          `rewound ${session} to ${target}`,
+          fileLine(paths, digestPaths),
+          digest,
+          ...(queued ? [`The run had already settled:\n${settleText(queued)}`] : []),
+        ];
         if (!params.commit) {
           return {
             content: [{
@@ -2948,18 +3026,26 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, context) => {
       ctx = context;
       const rows = ((await api<any>("GET", "/api/session?limit=200")).data ?? []).filter(underRoot);
-      const kept = rows.filter(busy);
-      const done = rows.filter((row: any) => !busy(row));
+      // A thread the user adopted from the TUI must not die with the rest, so force keeps it.
+      const adopted = rows.filter((row: any) => state.attached.has(row.id));
+      const kept = rows.filter((row: any) => busy(row) && !state.attached.has(row.id));
+      const done = rows.filter((row: any) => !busy(row) && !state.attached.has(row.id));
+      const adoptedLine = adopted.length
+        ? `kept ${adopted.length} because adopted: ${adopted.map((row: any) => row.id).join(", ")}`
+        : "";
       const line = (row: any) =>
         `${row.id}  ${row.model?.id ?? "-"}  ${row.outcome ?? "-"}  ${Math.round(
           (Date.now() - Number(row?.time?.updated ?? 0)) / 60_000,
         )}m  out ${(row.tokens?.output ?? 0) + (row.tokens?.reasoning ?? 0)}  ${row.title ?? ""}`;
-      if (!done.length) return say(context, `oc-clean: nothing to delete, ${kept.length} busy kept`);
+      if (!done.length) {
+        return say(context, [`oc-clean: nothing to delete, ${kept.length} busy kept`, adoptedLine].filter(Boolean).join("\n"));
+      }
       if (args.trim() !== "force") {
         return say(
           context,
           [
             `dry run: ${done.length} under ${ROOT}, ${kept.length} busy kept`,
+            ...(adoptedLine ? [adoptedLine] : []),
             ...done.map(line),
             "run /oc-clean force to delete these",
           ].join("\n"),
@@ -2984,7 +3070,11 @@ export default function (pi: ExtensionAPI) {
         }
       }
       drawHud();
-      say(context, [`oc-clean: deleted ${deleted}, kept ${kept.length + racing} busy`, ...failed].join("\n"));
+      say(
+        context,
+        [`oc-clean: deleted ${deleted}, kept ${kept.length + racing} busy`, ...(adoptedLine ? [adoptedLine] : []), ...failed]
+          .join("\n"),
+      );
     },
   });
 

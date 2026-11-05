@@ -7,8 +7,9 @@
  *   GET /api/session -> {data:Session.Info[], cursor:{…}}.
  *   GET /api/experimental/usage/limits and GET /api/model keep the stage 05 shapes.
  *
- * Cases: reload, merge, fail, cap, quota, judge. The control removes the fan-out hold (per-member
- * wake-up), the cap, the Go-member skip, the judge, and the counter restore; every case must die.
+ * Cases: reload, merge, fail, race, cap, quota, judge. The control removes the fan-out hold
+ * (per-member wake-up), the cap, the Go-member skip, the judge, and the counter restore; every
+ * case must die.
  * Run:
  *   bun run checks/check-11-fanout.ts
  *   BRIDGE=$PWD/.control-fanout.ts bun run checks/check-11-fanout.ts   # must fail
@@ -56,6 +57,9 @@ const sessions = new Map<string, SessionRow>();
 const created: Array<{ id: string; model: string; title: string }> = [];
 const prompts: Array<{ session: string; text: string }> = [];
 let active: Record<string, { type: "running" }> = {};
+/** The race case fails the first prompt of one model, so its member is terminal before the report. */
+let failFirstPrompt: string | null = null;
+const failedPromptSessions = new Set<string>();
 let meter = {
   rolling: { percent: 10, limited: false, resetsAt: Date.now() + 3_600_000 },
   weekly: { percent: 50, limited: false, resetsAt: Date.now() + 86_400_000 },
@@ -138,6 +142,11 @@ Bun.serve({
       const row = sessions.get(prompt[1]);
       if (!row) return json(null, 404);
       const body = await req.json() as { text?: string };
+      const model = `${row.model.providerID}/${row.model.id}`;
+      if (failFirstPrompt === model && !failedPromptSessions.has(row.id)) {
+        failedPromptSessions.add(row.id);
+        return json(null, 500);
+      }
       prompts.push({ session: row.id, text: String(body.text ?? "") });
       row.time.busy = Date.now();
       row.time.updated = row.time.busy;
@@ -337,6 +346,46 @@ check(
 );
 check("fail expired", failWake?.includes("outcome: expired") ?? false, failWake ?? "(none)");
 
+// race: a failed member is terminal. A later send to its thread must not decrement again and
+// fire the report while another member still runs.
+failFirstPrompt = A;
+const raceBefore = sent.length;
+const raceCreates = created.length;
+const raceRes = await tool("oc_fanout").execute("t", {
+  brief: "race brief",
+  models: [A, B],
+  ttl_s: 20,
+});
+const raceText = textOf(raceRes);
+console.log("race receipt ->", raceText);
+const raceIds = created.slice(raceCreates).map((entry) => entry.id);
+check("race receipt", raceRes.isError !== true && raceIds.length === 2 && raceText.includes("brief failed"), raceText);
+failFirstPrompt = null;
+// A new run on the failed thread is not a member settle.
+await tool("oc_send").execute("t", { session: raceIds[0], text: "late start" });
+settle(raceIds[0], "LATE-A");
+const raceFirst = await wake(raceBefore);
+console.log("race first wake ->", raceFirst);
+check(
+  "race late run",
+  raceFirst !== null && !raceFirst.includes("outcome: fan-out") && raceFirst.includes("LATE-A"),
+  raceFirst ?? "(none)",
+);
+const raceSecondBefore = sent.length;
+settle(raceIds[1], "BETA-B");
+const raceReport = await wake(raceSecondBefore);
+console.log("race report ->", raceReport);
+check(
+  "race one report",
+  raceReport !== null && sent.length === raceSecondBefore + 1,
+  `${sent.length - raceSecondBefore}`,
+);
+check(
+  "race report content",
+  (raceReport?.includes("outcome: fan-out 2 models") && raceReport.includes("BETA-B") && raceReport.includes("outcome: failed")) ?? false,
+  raceReport ?? "(none)",
+);
+
 // cap: 30 live threads plus 3 new would pass 32, so no thread is created.
 active = Object.fromEntries(
   Array.from({ length: 30 }, (_, index) => [`ses_live${String(index).padStart(18, "0")}`, { type: "running" as const }]),
@@ -434,5 +483,5 @@ if (failures.length) {
   console.log(`FAIL fanout: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS fanout: a reload keeps the counter at fan_2, three staggered members give one ordered report, a failed and an expired member keep their sections, 30 live plus 3 new is refused before any create, the rolling meter skips only the Go member, and one judge thread ranks all three answers into the same report");
+console.log("PASS fanout: a reload keeps the counter at fan_2, three staggered members give one ordered report, a failed and an expired member keep their sections, a failed member's later run does not fire the report early, 30 live plus 3 new is refused before any create, the rolling meter skips only the Go member, and one judge thread ranks all three answers into the same report");
 process.exit(0);

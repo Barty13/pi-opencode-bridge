@@ -91,6 +91,11 @@ const DEFAULTS: Record<string, DefaultContract> = {
   OC_RETENTION: { value: "{}", file: "opencode-bridge.ts", proof: 'process.env.OC_RETENTION ?? "{}"' },
   OC_DEBOUNCE_MS: { value: "400", file: "opencode-bridge.ts", proof: "process.env.OC_DEBOUNCE_MS ?? 400" },
   OC_BACKSTOP_MS: { value: "5000", file: "opencode-bridge.ts", proof: "process.env.OC_BACKSTOP_MS ?? 5000" },
+  OC_STREAM_GAP_MS: {
+    value: "90000",
+    file: "opencode-bridge.ts",
+    proof: "process.env.OC_STREAM_GAP_MS ?? 90_000",
+  },
   OC_WATCH_TTL_S: { value: "1800", file: "opencode-bridge.ts", proof: "process.env.OC_WATCH_TTL_S ?? 1800" },
   OC_WAIT_MAX_S: { value: "300", file: "opencode-bridge.ts", proof: "process.env.OC_WAIT_MAX_S ?? 300" },
   OC_COMPACT_TOKENS: {

@@ -252,7 +252,7 @@ PY
 Run from the package root. `BRIDGE` points a check at a control build.
 
 ```sh
-for c in 4xx nowatch expire stale dup ceiling handle; do CASE=$c bun run checks/check-3-unit.ts; done
+for c in 4xx 5xx nowatch expire stale dup ceiling handle flush streamgap; do CASE=$c bun run checks/check-3-unit.ts; done
 bun run checks/check-1-compact.ts
 BRIDGE=file://$PWD/.control-bridge.ts CASE=stale bun run checks/check-3-unit.ts   # must fail
 BRIDGE=file://$PWD/.control-bridge.ts CASE=dup bun run checks/check-3-unit.ts     # must fail
@@ -313,6 +313,7 @@ The control restores three defects: the steer re-arm (`one`), the old `busy` pre
 | `escape` | a thread outside `OC_ROOT` is refused; nothing is armed; the command reports the failure |
 | `restore` | a reload restores a watch for a busy saved row only; an idle saved row gets none |
 | `readfail` | a failed status read during restore keeps the watch; `/oc` still counts it |
+| `clean` | `/oc-clean force` deletes an idle thread, keeps the adopted one, and names it in the receipt |
 
 The control carries four defects: the newest-row floor (`live`), the unconditional arm (`idle`), the blind restore (`restore`), and the dropped watch on a failed read (`readfail`).
 
@@ -327,6 +328,7 @@ The control carries four defects: the newest-row floor (`live`), the uncondition
 | `commit` | auto mode posts stage then commit, in that order, with no ask |
 | `branch` | the fork body carries `before`, the child is attached, and `/oc` marks it |
 | `armed` | an armed watch refuses the rewind with zero service calls |
+| `batch` | a settle waiting in the batch rides in the receipt and does not wake the model after the rewind |
 | `noui` | no UI keeps the stage staged, says the commit needs a Pi TUI, and does not advise `/oc-auto` |
 
 The control carries five defects: the stage ask after the stage (`ask`), the newest-user-row target (`steered`), the untracked clear (`clear`), the no-UI advice (`noui`), and the plain no-files line in place of the no-git wording (`nogitroot`).
@@ -354,6 +356,7 @@ The control carries three defects: the weekly percent gate (`ceiling`), the `$0`
 | `reload` | the counter rides in `oc-armed`: `fan_1`, shutdown, start, then `fan_2` |
 | `merge` | three staggered members give one wake-up, sections in caller order, with tokens, cost, digest, and answer |
 | `fail` | one failed member and one expired member keep their sections in the same single report |
+| `race` | a failed member's later run settles alone; the fan-out report still waits for the other member |
 | `cap` | 30 live threads plus 3 new is refused with the count, before any create or prompt |
 | `quota` | rolling 90 at `OC_BUDGET_PCT=80` skips the Go member, still creates and prompts both free members, and names the skip |
 | `judge` | the judge thread receives all three answers, and its verdict joins the same report |
@@ -373,7 +376,7 @@ The control carries five defects: the fan-out hold, so every member wakes alone 
 
 The control carries two defects: the `oc_fanout` page is gone (`inventory`), and `OC_DEBOUNCE_MS` reads `500` (`env`). Both cases must fail. The stage-12 control is a docs bundle, not a build of the extension; `BRIDGE` names the bundle under test.
 
-The `env` case covers the twenty `OC_*` and `BRIDGE` names in the Environment table: twelve for the bridge, four for `oc-rpc.ts`, two for `oc-panes`, and two for the check scripts. `CASE`, `PATH`, and other check-local selectors are out of scope on purpose.
+The `env` case covers the twenty-one `OC_*` and `BRIDGE` names in the Environment table: thirteen for the bridge, four for `oc-rpc.ts`, two for `oc-panes`, and two for the check scripts. `CASE`, `PATH`, and other check-local selectors are out of scope on purpose.
 
 `check-5-live.ts` costs one real turn on a free model. It finds the largest idle thread above
 `OC_COMPACT_TOKENS`, sends one short instruction through the bridge, and proves on the wire that the

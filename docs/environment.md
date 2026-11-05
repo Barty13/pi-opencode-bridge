@@ -3,7 +3,7 @@
 This page lists every environment variable that the bridge and its helper scripts read, with its
 reader, default, and effect.
 
-The bridge reads 12 of these variables. The other 8 belong to `oc-rpc.ts`, `oc-panes`, and the check
+The bridge reads 13 of these variables. The other 8 belong to `oc-rpc.ts`, `oc-panes`, and the check
 scripts. The reader column names the file that reads the variable.
 
 | Variable | Reader | Default | Effect |
@@ -13,6 +13,7 @@ scripts. The reader column names the file that reads the variable.
 | `OC_RETENTION` | bridge | `{}` | JSON map from a model id suffix to a display label. `oc_models` shows the label. A broken value gives no labels. |
 | `OC_DEBOUNCE_MS` | bridge | `400` | Batch window for wake-ups, in ms. |
 | `OC_BACKSTOP_MS` | bridge | `5000` | Gap between backstop polls, in ms. |
+| `OC_STREAM_GAP_MS` | bridge | `90000` | Silent stream gap before the reader reconnects, in ms. |
 | `OC_WATCH_TTL_S` | bridge | `1800` | Watch life, in seconds. |
 | `OC_WAIT_MAX_S` | bridge | `300` | Ceiling for `oc_wait`, in seconds. |
 | `OC_COMPACT_TOKENS` | bridge | `500_000` | Thread size above which a send orders a compaction first. `0` turns the gate off. |

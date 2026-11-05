@@ -9,7 +9,7 @@
  *   row drops the answer that the turn already wrote.
  *   GET /message?order=desc&limit=1 -> {data:[{id, time:{created}, type, ...}]}
  *
- * Cases: old, idle, live, detach, escape, restore, readfail. The control carries four defects: a
+ * Cases: old, idle, live, detach, escape, restore, readfail, clean. The control carries four defects: a
  * newest-row floor (live), an unconditional arm (idle), a blind restore (restore), and a dropped
  * watch on a failed restore read (readfail).
  * Run:
@@ -39,9 +39,12 @@ let mainRow: any = {};
 let outsideRow: any = {};
 let idleRow: any = {};
 let readFailRow: any = {};
+/** The readfail case needs a 500; the clean case needs the same row readable. */
+let failDetail = true;
 let rows: any[] = [];
 let idleRows: any[] = [];
 const interrupts: string[] = [];
+const deleted: string[] = [];
 
 const rowFor = (id: string, dir: string, busy: number, idle: number, created: number) => ({
   id,
@@ -67,7 +70,9 @@ Bun.serve({
     if (req.method === "GET" && p === `/api/session/${MAIN}`) return json(mainRow);
     if (req.method === "GET" && p === `/api/session/${OUTSIDE}`) return json(outsideRow);
     if (req.method === "GET" && p === `/api/session/${IDLE_RESTORE}`) return json(idleRow);
-    if (req.method === "GET" && p === `/api/session/${READFAIL}`) return json(null, 500);
+    if (req.method === "GET" && p === `/api/session/${READFAIL}`) {
+      return failDetail ? json(null, 500) : json(readFailRow);
+    }
     if (p.endsWith("/message")) {
       const list = p.startsWith(`/api/session/${IDLE_RESTORE}`) ? idleRows : rows;
       const limit = Number(new URL(req.url).searchParams.get("limit") ?? 0);
@@ -76,6 +81,10 @@ Bun.serve({
     if (req.method === "POST" && p.endsWith("/interrupt")) {
       interrupts.push(p);
       return json({ interrupted: true });
+    }
+    if (req.method === "DELETE" && p.startsWith("/api/session/")) {
+      deleted.push(p.slice("/api/session/".length));
+      return new Response(null, { status: 204 });
     }
     if (req.method === "POST" && p.endsWith("/prompt")) return json({ accepted: true });
     if (p.endsWith("/permission") || p.endsWith("/form")) return json([]);
@@ -313,11 +322,33 @@ console.log("readfail ->", readfailNotice);
 check("readfail armed", readfailNotice.includes("armed: 1"), readfailNotice);
 check("readfail listed", readfailNotice.includes(READFAIL), readfailNotice);
 
+// clean: force deletes idle threads but keeps the adopted one and names it.
+failDetail = false;
+const cleanIdle = Date.now() - 1000;
+mainRow = rowFor(MAIN, ROOT, Date.now() - 100, cleanIdle - 5000, cleanIdle - 20_000);
+idleRow = rowFor(IDLE_RESTORE, ROOT, cleanIdle - 1000, cleanIdle, cleanIdle - 20_000);
+readFailRow = rowFor(READFAIL, ROOT, cleanIdle - 1000, cleanIdle, cleanIdle - 20_000);
+const cleanNotices = notices.length;
+const deletedBefore = deleted.length;
+await command("oc-clean").handler("force", ctx);
+const cleanNotice = notices.slice(cleanNotices).join("\n");
+console.log("clean ->", cleanNotice);
+check(
+  "clean deletes idle",
+  deleted.slice(deletedBefore).join(",") === IDLE_RESTORE,
+  deleted.slice(deletedBefore).join(","),
+);
+check(
+  "clean keeps adopted",
+  !deleted.includes(READFAIL) && cleanNotice.includes("because adopted") && cleanNotice.includes(READFAIL),
+  cleanNotice,
+);
+
 await fire("session_shutdown")({}, ctx);
 
 if (failures.length) {
   console.log(`FAIL attach: ${failures.join("; ")}`);
   process.exit(1);
 }
-console.log("PASS attach: idle is silent, live keeps the at-floor answer, escape refuses, detach keeps the run, restore arms only busy rows, a failed read keeps the watch");
+console.log("PASS attach: idle is silent, live keeps the at-floor answer, escape refuses, detach keeps the run, restore arms only busy rows, a failed read keeps the watch, clean force keeps the adopted thread");
 process.exit(0);

@@ -3,6 +3,12 @@
  * Cases, picked with CASE (default 4xx):
  *   4xx      item 3  — a send refused with HTTP 402 must leave no watch behind. TTL is 2s, so a
  *                      phantom would fire through pi.sendUserMessage inside the window. Zero calls pass.
+ *   5xx      item 4  — a send refused with HTTP 500 means the prompt never landed, so the fresh
+ *                      watch must go; a phantom would expire into a false report.
+ *   flush    item 7  — a send that throws must not spend the batch: the bridge retries after the
+ *                      debounce, so one wake-up still carries the run.
+ *   streamgap item 6 — a full buffer and a silent stream both close the reader, so it reconnects
+ *                      and rescans instead of losing asks for the rest of the run.
  *   expire   item 4  — an expired watch must report unknown facts, not invented ones:
  *                      "outcome: unknown (watch expired; restart oc_send to read the record)" and
  *                      "open asks: unreadable".
@@ -21,7 +27,9 @@
  */
 const CASE = process.env.CASE ?? "4xx";
 process.env.OC_WATCH_TTL_S = CASE === "stale" ? "4" : "2";
-process.env.OC_BACKSTOP_MS = CASE === "stale" ? "500" : CASE === "dup" ? "300" : "1000";
+process.env.OC_BACKSTOP_MS = CASE === "stale" ? "500" : CASE === "dup" || CASE === "flush" ? "300" : "1000";
+process.env.OC_DEBOUNCE_MS = CASE === "flush" ? "50" : "400";
+process.env.OC_STREAM_GAP_MS = CASE === "streamgap" ? "2000" : "90000";
 process.env.OC_HUD = "0";
 
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -46,6 +54,9 @@ const CEIL_ID = "ses_ceiling0000000000000000";
 const OLD_IDLE = Date.now() - 60_000;
 // The handle case sets one answer shape at a time, so each failure mode is isolated.
 let answerMode: "ok" | "404" | "badjson" = "ok";
+// The streamgap case counts reconnects and ask reads, so a reconnect that skips the rescan fails.
+const streamOpens: number[] = [];
+let askReads = 0;
 
 Bun.serve({
   hostname: "127.0.0.1",
@@ -59,8 +70,29 @@ Bun.serve({
       sessionHeld = true;
       await sessionGate;
     }
+    // The first stream carries one huge frame with no end; the next two stay silent.
+    if (CASE === "streamgap" && p === "/api/event") {
+      streamOpens.push(Date.now());
+      if (streamOpens.length === 1) {
+        const big = "x".repeat(1024 * 1024 + 10);
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`data: ${big}`));
+          },
+        }), { headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(new ReadableStream({
+        start(controller) {
+          // A comment frame opens the response, then the stream stays silent.
+          controller.enqueue(new TextEncoder().encode(": ping\n\n"));
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+    }
     if (req.method === "POST" && p === "/api/session") return json({ id: ID, title: "stub" });
     if (req.method === "POST" && p.endsWith("/prompt")) {
+      if (CASE === "5xx") {
+        return new Response('{"error":"service failed"}', { status: 500, headers: { "content-type": "application/json" } });
+      }
       return FAIL_PROMPT
         ? new Response('{"error":"credit exhausted"}', { status: 402, headers: { "content-type": "application/json" } })
         : json({ accepted: true });
@@ -80,7 +112,10 @@ Bun.serve({
         ? json([{ type: "assistant", time: { created: realAt }, content: [{ type: "text", text: "REAL" }] }])
         : json([]);
     }
-    if (p.endsWith("/permission") || p.endsWith("/form")) return json([]);
+    if (p.endsWith("/permission") || p.endsWith("/form")) {
+      askReads++;
+      return json([]);
+    }
     // idle 0 with completed set: not busy, and nothing newer than any `since` floor.
     if (/^\/api\/session\/ses_/.test(p)) {
       if (CASE === "ceiling" && p === `/api/session/${CEIL_ID}`) {
@@ -123,6 +158,7 @@ chmodSync(join(bin, "opencode"), 0o755);
 process.env.PATH = `${bin}:${process.env.PATH}`;
 
 const sent: string[] = [];
+let sends = 0;
 const tools = new Map<string, any>();
 const handlers = new Map<string, (event: any, ctx: any) => unknown>();
 const piStub = {
@@ -131,7 +167,12 @@ const piStub = {
   registerFlag: () => {},
   on: (event: string, handler: any) => handlers.set(event, handler),
   getFlag: () => undefined,
-  sendUserMessage: (text: string) => { sent.push(text); },
+  sendUserMessage: (text: string) => {
+    // The flush case fails the first send, so the batch must survive for the retry.
+    sends++;
+    if (CASE === "flush" && sends === 1) throw new Error("pi send failed");
+    sent.push(text);
+  },
   appendEntry: () => {},
 };
 const ctx = {
@@ -142,6 +183,14 @@ const ctx = {
   ui: { confirm: async () => true, notify: () => {}, setStatus: () => {}, setWidget: () => {} },
   sessionManager: { getEntries: () => [] },
 };
+
+// Without the flush guard a timer throw kills the process before a verdict prints, so name it.
+if (CASE === "flush") {
+  process.on("uncaughtException", (error) => {
+    console.log(`FAIL item 7: the flush timer threw and lost the batch: ${String(error)}`);
+    process.exit(1);
+  });
+}
 
 /** The tool map holds only what the extension registered, so a miss is a broken check. */
 const tool = (name: string) => {
@@ -180,6 +229,16 @@ if (CASE === "4xx") {
   verdict = text.includes("no watch is armed")
     ? "PASS  item 3: the refused send left no watch behind"
     : `FAIL  item 3: a phantom watch stayed armed: ${text.slice(0, 120)}`;
+} else if (CASE === "5xx") {
+  const res = await open();
+  console.log("oc_open ->", JSON.stringify(res).slice(0, 140));
+  // A 5xx means the prompt never landed, so a fresh watch would be a phantom.
+  const probe = await tool("oc_wait").execute("t2", { session: ID, since: 1 });
+  const text = probe.content.map((part: any) => part.text).join(" ");
+  console.log("oc_wait ->", JSON.stringify(text).slice(0, 160));
+  verdict = text.includes("no watch is armed")
+    ? "PASS  item 4: the 5xx send left no watch behind"
+    : `FAIL  item 4: a phantom watch survived the 5xx: ${text.slice(0, 120)}`;
 } else if (CASE === "expire") {
   await open();
   await wait(8000);
@@ -197,6 +256,31 @@ if (CASE === "4xx") {
   verdict = text.includes("no watch is armed and no wake-up will come")
     ? "PASS  item 10: honest wording, no invented watch"
     : "FAIL  wording unchanged, see oc_wait above";
+} else if (CASE === "flush") {
+  await open();
+  realAt = Date.now() + 50;
+  const deadline = Date.now() + 6000;
+  while (sent.length === 0 && Date.now() < deadline) await wait(20);
+  const text = sent.join("\n");
+  console.log(`sends attempted -> ${sends}; sent ->`, JSON.stringify(text).slice(0, 240));
+  verdict = sends === 2 && sent.length === 1 && text.includes("REAL") && text.includes("settled")
+    ? "PASS  item 7: a failed send restored the batch and the retry carried the run"
+    : `FAIL  item 7: the batch did not survive a failed send (attempts ${sends}, sent ${sent.length})`;
+} else if (CASE === "streamgap") {
+  const waited = Date.now() + 3000;
+  while (streamOpens.length < 1 && Date.now() < waited) await wait(20);
+  // Put one thread in `known`, so a reconnect rescan has an ask to read.
+  await tool("oc_wait").execute("t8", { session: ID, since: 1 });
+  const readsBefore = askReads;
+  const deadline = Date.now() + 7000;
+  while (streamOpens.length < 3 && Date.now() < deadline) await wait(20);
+  await wait(100);
+  const firstGap = (streamOpens[1] ?? 0) - (streamOpens[0] ?? 0);
+  const opened = streamOpens.length;
+  console.log(`stream opens -> ${opened}; first gap ${firstGap}ms; ask reads ${readsBefore} -> ${askReads}`);
+  verdict = opened >= 3 && firstGap > 0 && firstGap < 1800 && askReads > readsBefore
+    ? "PASS  item 6: the buffer cap and the frame gap both forced a reconnect and rescan"
+    : `FAIL  item 6: the reader did not recover (opens ${opened}, first gap ${firstGap}ms, reads ${askReads - readsBefore})`;
 } else if (CASE === "stale") {
   await open();
   const deadline = Date.now() + 3000;
