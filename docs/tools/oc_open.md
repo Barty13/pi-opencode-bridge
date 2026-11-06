@@ -40,5 +40,5 @@ result.
 
 Limits: the tool fails when the model is not on the list, the id is ambiguous, the variant is not on
 the ladder, the directory is missing or outside the root, the budget ceiling refuses the open, the
-watch ceiling refuses the arm, or the brief POST fails. Invalid `permissionsJson` throws before the
-create.
+watch ceiling refuses the arm, or the brief POST fails. Invalid `permissionsJson` returns a refusal
+before the create.

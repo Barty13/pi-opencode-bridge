@@ -30,8 +30,10 @@ on a real settle. A backstop poll reads each armed thread every `OC_BACKSTOP_MS`
 dropped frame. A read that finishes after a new send or a stop does not spend the new watch. A
 thread with no settle in the window keeps the watch.
 
-A watch that passes its deadline settles as unknown. It does not report a running outcome or an
-empty ask list. The report is:
+A watch that reaches its deadline reads the thread once. A thread still working gets a fresh
+deadline and no report. A thread that answers idle, answers gone, or fails the read settles as
+unknown. It does not report a running outcome or an empty ask list, and it leaves any pane column
+open, because the run may still work. The report is:
 
 ```
 outcome: unknown (watch expired; restart with oc_send to read the record)

@@ -3,7 +3,7 @@
 This page lists every environment variable that the bridge and its helper scripts read, with its
 reader, default, and effect.
 
-The bridge reads 14 of these variables. The other 7 belong to `oc-rpc.ts`, `oc-panes`, and the check
+The bridge reads 14 of these variables. The rest belong to `oc-rpc.ts`, `oc-panes`, and the check
 scripts. The reader column names the file that reads the variable.
 
 | Variable | Reader | Default | Effect |

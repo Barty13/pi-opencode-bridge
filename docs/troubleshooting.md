@@ -5,7 +5,7 @@ This page maps each common symptom to its cause and its fix.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | No wake-up arrives. | Print or JSON mode has no active turn; a reload dropped the batch; an aborted run holds the batch; a compaction holds it; a 4xx prompt dropped the watch. | Use `oc_wait` or `oc_read`. Send a new instruction with `oc_send` to arm a new run. Wait for the compaction to end. Send a human message to release a held batch. |
-| `outcome: unknown (watch expired; restart with oc_send to read the record)` | The run passed `OC_WATCH_TTL_S` with no settle. | Read the record with `oc_read`. Raise `OC_WATCH_TTL_S` and restart Pi for long runs. Use `oc_send` to start a new run with a new watch. |
+| `outcome: unknown (watch expired; restart with oc_send to read the record)` | The thread stopped answering, or every read failed, for `OC_WATCH_TTL_S`. A run that stays busy renews its deadline instead. | Read the record with `oc_read`. Raise `OC_WATCH_TTL_S` and restart Pi for long runs. Use `oc_send` to start a new run with a new watch. |
 | `run already settled; oc_send starts a new one` | `oc_steer` found `busy <= idle`; the run is over. | Use `oc_send` for a new run. Use `oc_read` for the answer. |
 | `already armed: ses_…` | `oc_attach` found a live watch. | Use the watch with `oc_read` or `oc_wait`. To replace it, run `oc_stop detach: true`, then attach again. |
 | `no git history for this root, messages reverted, files untouched: <paths>` | The root is not a git repository, so the stage returned no files. | Make the root a git repository before the run. The messages are already reverted. |
